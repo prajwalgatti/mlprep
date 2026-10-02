@@ -1,0 +1,493 @@
+id: sys.roofline
+area: applied
+title: "The roofline model and arithmetic intensity"
+summary: How to bound an operation's time from first principles on a GPU. Compute vs memory time, arithmetic intensity and the ridge point, the intensity of elementwise ops and matmuls, how batch size, fusion and precision move an op on the roofline, and the same logic for communication.
+order: 110
+level: core
+tags: [systems, roofline, performance, gpu, arithmetic-intensity, matmul]
+prereqs: [sys.gpu-basics]
+
+explainer:
+  - title: "The problem: what is the fastest an op can run?"
+    body: |
+      In a profile of a transformer layer on an H100, a large matmul may run at 70% of the GPU's quoted FLOP/s while the LayerNorm next to it runs below 1%. Is the LayerNorm badly written? Before optimising anything we want a **best possible time** for each operation, and to know which hardware limit sets it.
+
+      **Refresher** (from `sys.gpu-basics`). Matmuls run on the **Tensor Cores** (H100: $C \approx 989$ TFLOP/s dense bf16). All data starts in off-chip **HBM**, which streams to the SMs at $W \approx 3.35$ TB/s. On-chip memory (SMEM, registers) is far faster but tiny.
+
+      **Three resources.** An operation needs FLOPs (compute rate $C$), bytes moved to and from HBM (bandwidth $W$), and, across GPUs, bytes over a link (NVLink, InfiniBand). Memory *capacity* is a separate yes/no constraint (does it fit?), not a rate.
+
+      **Two lower bounds.** No operation can finish faster than either
+
+      $$T_{math} = \frac{\text{FLOPs}}{C}, \qquad T_{mem} = \frac{\text{bytes}}{W}.$$
+
+      GPUs overlap the two: while the Tensor Cores work on one tile, the next is loading. So the true time $T$ satisfies
+
+      $$\max(T_{math}, T_{mem}) \le T \le T_{math} + T_{mem}.$$
+
+      The upper bound is at most twice the lower one, since the smaller term is at most the larger. Well-written kernels get close to the max. The op is **compute-bound** if $T_{math}$ is the larger and **memory-bound** if $T_{mem}$ is. A third, fixed cost, launch and dispatch overhead of microseconds per kernel, matters only for tiny ops (`sys.gpu-basics`).
+
+      **First example.** A bf16 residual add $y = a + b$ over a $[16384, 4096]$ activation ($6.7\times10^7$ elements). It reads 2 bytes from each input and writes 2: 6 bytes and 1 FLOP per element.
+      - $T_{mem} = 6 \times 6.7\times10^7 / 3.35\times10^{12} \approx 120$ µs.
+      - $T_{math} \approx 1$ µs even on the slower CUDA cores (67 TFLOP/s).
+
+      Memory-bound by two orders of magnitude: the add's time *is* the time to stream the data. The next card turns this comparison into one number per operation.
+    source: 'Scaling Book Part 1 §"Where Does the Time Go?"; NVIDIA GPU Performance Background §4; He 2022 §"Bandwidth", §"Overhead"'
+
+  - title: "Arithmetic intensity and the ridge point"
+    body: |
+      Ask when $T_{math} > T_{mem}$, and move the operation's quantities to one side and the hardware's to the other:
+
+      $$\begin{aligned} \frac{\text{FLOPs}}{C} &> \frac{\text{bytes}}{W} \\ \iff \frac{\text{FLOPs}}{\text{bytes}} &> \frac{C}{W}. \end{aligned}$$
+
+      The left side is the operation's **arithmetic intensity** $I$: FLOPs per byte of HBM traffic. The right side is the hardware's **ridge point** $I^* = C/W$: FLOPs the chip can do in the time it moves one byte. **An op is compute-bound iff $I > I^*$.**
+
+      Ridge points (dense peak / HBM bandwidth):
+      - H100 bf16: $989\text{e}12/3.35\text{e}12 \approx 295$.
+      - H100 fp8: $1.98\text{e}15/3.35\text{e}12 \approx 591$.
+      - A100 bf16: $312\text{e}12/2.0\text{e}12 = 156$.
+
+      Newer chips gain FLOPs faster than bandwidth, so the ridge drifts right and more ops end up memory-bound.
+
+      **The roofline.** What FLOP rate can an op of intensity $I$ reach? If memory-bound, it does $I$ FLOPs per byte at $W$ bytes/s. If compute-bound, it gets $C$:
+
+      $$P(I) = \min(C,\; I\cdot W).$$
+
+      On log–log axes, $\log P = \log I + \log W$ is a line of slope 1, meeting the flat "roof" $C$ at $I^*$. Below the ridge, the fraction of peak is $I/I^*$.
+
+      ![H100 rooflines (bf16 solid, fp8 dashed) with ops at their intensities. Elementwise ops sit far down the slope; a 7B-class MLP matmul climbs it as the token count grows. The dotted line is the ceiling for code that avoids the Tensor Cores.](sys.roofline/roofline-h100)
+
+      **Reading the plot.** An op's x-position comes from the algorithm and its implementation (FLOPs and bytes). The lines are the hardware's. Two ways to go faster: move right (raise $I$) or raise the line you're under (more bandwidth below the ridge, more FLOP/s above it). Below the ridge, extra FLOP/s does nothing; above it, extra bandwidth does nothing.
+
+      The roofline (Williams, Waterman & Patterson 2009) is an *upper bound*. Real kernels sit somewhere below their point, which is why it's useful: the gap tells you how much there is left to gain.
+    source: 'Williams, Waterman & Patterson 2009 §3; Scaling Book Part 1 §"Where Does the Time Go?", §"Visualizing rooflines"; Scaling Book Part 12 §"Summary of GPU specs", Quiz 1 Q3; NVIDIA GPU Performance Background §4'
+
+  - title: "Elementwise ops and reductions: always memory-bound"
+    body: |
+      Count FLOPs and bytes per element, for inputs **and** outputs, assuming each is read or written once (bf16 = 2 bytes):
+      - **Residual add** $a + b$: 1 FLOP over $2 + 2 + 2 = 6$ bytes, so $I = 1/6$.
+      - **ReLU** $\max(0, x)$: 1 FLOP over $2 + 2$ bytes, so $I = 1/4$ (NVIDIA's table gives the same 0.25).
+      - **LayerNorm** over the hidden dimension: mean, variance, normalise, scale and shift is roughly 8 FLOPs per element over 4 bytes, so $I \approx 2$ (NVIDIA: "< 10"). The exact count is convention-dependent but a small constant.
+      - **Softmax**: max, subtract, exponentiate, sum, divide. Again a handful of operations per element read and written, so $I$ of order 1.
+
+      **The pattern.** Each element is touched a constant number of times, so $I$ is a constant independent of tensor size. Making the tensor bigger never makes these ops compute-bound. Even against the CUDA cores' lower ridge ($67\text{e}12/3.35\text{e}12 \approx 20$) they fall short 10–100×.
+
+      **What "1% of peak" means.** At $I = 2$, the roofline allows $2 \times 3.35 = 6.7$ TFLOP/s, about 0.7% of the Tensor Core peak. A LayerNorm at 6 TFLOP/s is therefore *excellent*: it is streaming at about 90% of HBM bandwidth. For memory-bound ops, measure **achieved bandwidth** (bytes / time) against $W$, not FLOP/s against $C$.
+
+      **Fusion raises intensity.** Run $k$ elementwise ops as separate kernels and each one reads and writes the full tensor: about $k$ times the traffic of one op. Fused into a single kernel, the data is read once, transformed $k$ times in registers, and written once. Traffic falls about $k$-fold and $I$ rises about $k$-fold for the same FLOPs. Fusing an activation into the preceding matmul's epilogue (the kernel's last step, before each output tile is written) removes its HBM traffic entirely, because the tile is still in registers. This is why compilers fuse aggressively (`sys.fusion-codegen`).
+    source: 'NVIDIA GPU Performance Background §4 (Table 1), §5.1–5.2; He 2022 §"Bandwidth"; Scaling Book Part 12 Quiz 1 Q7'
+
+  - title: "The intensity of a matmul"
+    body: |
+      Take $Y = XW$ with $X \in [B, D]$, $W \in [D, F]$, all bf16. Think of $X$ as $B$ token activations and $W$ as a weight matrix.
+
+      **FLOPs.** Each of the $BF$ outputs is a length-$D$ dot product: $D$ multiplies and about $D$ adds, so $2BDF$ in total.
+
+      **Bytes.** Read $X$ and $W$, write $Y$, each once: $2(BD + DF + BF)$. The Tensor Cores accumulate in fp32, but the output is rounded to bf16 before it is written.
+
+      $$I = \frac{2BDF}{2(BD + DF + BF)} = \frac{BDF}{BD + DF + BF}.$$
+
+      Dividing numerator and denominator by $BDF$ gives a form that is easier to read:
+
+      $$\frac{1}{I} = \frac{1}{B} + \frac{1}{D} + \frac{1}{F}.$$
+
+      Like resistors in parallel, **the smallest dimension dominates**:
+      - If $B \ll D, F$ (a few hundred tokens against weight dimensions in the thousands), $I \approx B$. Each weight loaded from HBM is reused once per token, at 2 FLOPs per reuse, and weights dominate the bytes.
+      - For a square $n\times n$ product, $1/I = 3/n$, so $I = n/3$: 85 for $n = 256$, 341 for $n = 1024$, 1365 for $n = 4096$.
+      - However large $B$ gets, $I$ can never exceed $DF/(D + F)$. A small weight matrix can stay memory-bound at any batch size.
+
+      **$B$ counts tokens.** A linear layer treats every row of $X$ independently, so 4 sequences of 1024 tokens give $B = 4096$, same as 1 sequence of 4096.
+
+      **The backward pass has the same intensity.** Training needs $\partial L/\partial X = (\partial L/\partial Y)W^\top$, shapes $[B,F]\times[F,D]$, and $\partial L/\partial W = X^\top(\partial L/\partial Y)$, shapes $[D,B]\times[B,F]$. Both involve the same three dimensions $B, D, F$, so both have the same $1/I = 1/B + 1/D + 1/F$. One condition covers all three training matmuls.
+
+      **Matrix–vector products** ($B = 1$) have $I \approx 1$: memory-bound on every GPU. This is the situation in small-batch decoding, covered in `llm.kv-cache`.
+    source: 'NVIDIA Matrix Multiplication Background §2; Scaling Book Part 1 §"Matrix multiplication"; Scaling Book Part 4 §"Forward and reverse FLOPs"'
+
+  - title: "Worked example: a 7B-class MLP matmul"
+    body: |
+      The up-projection of a 7B-class model has $D = 4096$, $F = 11008$. Its weights are $2DF \approx 90$ MB in bf16. On an H100 ($I^* \approx 295$):
+      - $B = 1$: $I \approx 1.0$. $T_{mem} \approx 27$ µs, $T_{math} \approx 0.09$ µs. 0.3% of peak.
+      - $B = 16$: $I \approx 15.9$. $T_{mem} \approx 27.1$ µs. About 5% of peak.
+      - $B = 128$: $I \approx 123$. $T_{mem} \approx 28.1$ µs vs $T_{math} \approx 11.7$ µs. About 42%.
+      - $B = 4096$: $I \approx 1727$. $T_{math} \approx 373$ µs vs $T_{mem} \approx 64$ µs. Compute-bound.
+
+      **Crossover.** Set $I = I^*$ and solve:
+
+      $$\begin{aligned} \frac{1}{B^*} &= \frac{1}{295} - \frac{1}{4096} - \frac{1}{11008} \\ B^* &\approx 328 \text{ tokens}. \end{aligned}$$
+
+      The approximation $I \approx B$ says 295. The exact answer is about 11% higher because activations and outputs are not free.
+
+      ![Time and throughput of this matmul against token count. Below about 328 tokens the time is just reading the 90 MB of weights, so it barely changes and throughput grows in proportion to B. Above it the time grows with B and throughput is flat.](sys.roofline/batch-sweep)
+
+      **Reading a throughput sweep.** The Tuning Playbook advises measuring examples/s at increasing batch sizes: throughput should double with each doubling of the batch until the accelerator saturates. The roofline says why. While matmuls are memory-bound, time per step is set by weight reads and barely moves, so the extra tokens are nearly free (64 → 128 tokens adds about 2% to the time here). Past the crossover, time grows in proportion to $B$ and throughput flattens. If throughput stops growing *before* the matmuls should be compute-bound, look for another bottleneck: launch overhead, the input pipeline, communication. Choosing the batch size itself is covered in `sys.tuning-batch-size`.
+
+      **Scope.** These are bounds for one matmul in isolation, assuming each operand crosses HBM once, at peak $C$ and $W$. A real kernel reaches perhaps 80–85% of $C$ and some fraction of $W$, so the crossover is approximate.
+    source: 'Scaling Book Part 1 §"Matrix multiplication"; Tuning Playbook §"Determining the feasible batch sizes and estimating training throughput"; NVIDIA GPU Performance Background §4'
+
+  - title: "Moving an operation on the roofline"
+    body: |
+      Every speed-up is one of three moves.
+
+      **1. Raise intensity (move right).**
+      - *More tokens per weight load*: bigger per-GPU batch or longer sequences for matmuls.
+      - *Fusion*: keep intermediates in registers or SMEM instead of round-tripping to HBM.
+      - *Tiling and reuse inside the kernel* (`sys.gpu-basics`). FlashAttention is the famous case: it never writes the $s\times s$ attention matrix to HBM.
+
+      **2. Raise the roof (above the ridge).**
+      - Use Tensor Cores at all: code on CUDA cores alone sits under a ceiling 15× lower.
+      - Use lower precision math: fp8 doubles $C$ on H100.
+
+      **3. Raise the bandwidth line (below the ridge).** Faster memory, or serving data from on-chip memory or L2 instead of HBM.
+
+      **Precision moves both $I$ and $I^*$.** Take the matmul above in fp8.
+      - *fp8 math, bf16 storage.* Bytes are unchanged, the ridge doubles to 591, and the crossover becomes $1/B^* = 1/591 - 1/4096 - 1/11008$, i.e. $B^* \approx 736$. (With the $I \approx B$ shortcut it would be ≈ 591, the figure the Scaling Book lessons quote; counting activation and output bytes for this $4096\times11008$ shape raises it to ≈ 736.) Compute-bound matmuls get up to 2× faster; memory-bound ones gain nothing.
+      - *fp8 storage too.* Bytes halve, so $I$ doubles. Since the ridge also doubled, the crossover stays at about 328. Memory-bound ops get up to 2× faster because they move half the bytes.
+
+      **Corollary for elementwise ops.** Lower precision helps them only by shrinking the bytes stored and moved. Doing the arithmetic in lower precision while reading and writing the same bf16 tensors changes nothing.
+
+      **What does not help.** A kernel already close to its roofline point cannot be fixed by tuning instructions; only a change of intensity or hardware moves it. Williams et al. recommend raising intensity before other optimisations, since it can move an op into a different regime.
+    source: 'Williams, Waterman & Patterson 2009 §3–4; Scaling Book Part 1 §"Visualizing rooflines"; Scaling Book Part 12 Quiz 1 Q3 (fp8 ridge); He 2022 §"Bandwidth"; Dao et al. 2022 §3.1'
+
+  - title: "Communication rooflines"
+    body: |
+      The same comparison applies to traffic *between* GPUs, with $W$ now the link bandwidth: compute-bound means the communication can hide behind the computation.
+
+      **Data parallelism.** Each of the $P$ GPUs holds a full copy of the $N$ parameters and processes $B_{gpu}$ tokens per step. After the backward pass the gradients are summed across GPUs by an **all-reduce**. Assume:
+      - Gradients are bf16, so $2N$ bytes per GPU.
+      - A ring all-reduce makes each GPU send (and receive) about twice its buffer, $\approx 2\cdot 2N = 4N$ bytes. That is a reduce-scatter plus an all-gather, each moving about one buffer; `sys.collectives` derives it.
+      - Gradient communication can only overlap with the **backward** pass, which costs $4N$ FLOPs per token: the two backward matmuls of the matmul card, $2BDF$ each, i.e. 4 FLOPs per parameter per token.
+
+      $$\begin{aligned} T_{math} &= \frac{4N\,B_{gpu}}{C}, \quad T_{comm} = \frac{4N}{W} \\ T_{math} > T_{comm} &\iff B_{gpu} > \frac{C}{W}. \end{aligned}$$
+
+      $N$ cancels: the condition depends only on tokens per GPU. For H100 bf16:
+      - Within a node over NVLink ($W = 450$ GB/s per GPU per direction): $B_{gpu} > 989\text{e}12/450\text{e}9 \approx 2200$ tokens.
+      - Across nodes, where the effective all-reduce bandwidth is the node's 400 GB/s InfiniBand egress: $B_{gpu} > 989\text{e}12/400\text{e}9 \approx 2470$ tokens (the Scaling Book rounds $C$ to 990e12 and quotes 2475).
+
+      **Scope.** This assumes perfect overlap and peak FLOP/s, and no in-network reduction (switch-side reduction, SHARP, roughly halves it in theory). With fp32 gradients, as under standard `torch.autocast` + DDP, the bytes double and so do the thresholds (≈ 4400 and ≈ 4940). For an MoE with $E$ experts and $k$ active per token, gradient bytes scale with all $E$ experts but FLOPs only with $k$, so the threshold grows by $E/k$.
+
+      The same move gives the other parallelism conditions (`sys.ddp`, `sys.tensor-parallel`). For tensor parallelism over $t$ GPUs, each GPU's matmul FLOPs scale as $B h^2/t$ while the activations it all-reduces scale as $Bh$; the batch cancels and the condition is on $h/t$, the width per GPU. Each is "FLOPs per byte communicated must exceed $C / W_{link}$".
+    source: 'Scaling Book Part 12 §"Rooflines for LLM Scaling on GPUs" › "Data Parallelism"; Scaling Book Part 1 §"Network communication rooflines"'
+
+  - title: "Beyond the simple model"
+    body: |
+      The roofline is a first-order bound. Here is what it leaves out, roughly in order of how often it matters.
+
+      - **Achieved vs peak.** Large matmuls on H100 typically reach about 80–85% of the dense peak. HBM likewise delivers somewhat below its spec. Draw the roof at what a microbenchmark achieves when you want realistic targets.
+      - **Which bytes count.** Williams et al. define intensity using traffic to DRAM *after* the caches. If a kernel re-reads an input three times from HBM, its effective intensity is a third of the algorithm's. If L2 serves repeated tile loads, effective intensity is higher than a naive count. A profiler's measured DRAM bytes give the true x-position.
+      - **Ceilings.** Below the roof sit lower ceilings you cannot break through without a specific optimisation: Tensor Cores vs CUDA cores, coalesced vs scattered access, enough parallelism to keep every SM busy.
+      - **Shapes.** Tile and wave quantisation (`sys.gpu-basics`) waste work when dimensions don't divide the tile or the SM count. Multiples of 64/128 are safest.
+      - **Too little parallelism, latency and overhead.** NVIDIA's example: one thread that loads 16 bytes and does 16,000 FLOPs has $I = 1000$ yet is nowhere near peak, because one thread uses a sliver of the GPU. Small kernels are limited by latency and launch overhead, not by either roof.
+      - **Mixed phases.** A real layer is a sequence of kernels with different intensities. The layer's time is the sum of each kernel's bound, not the bound at the layer's average intensity: a few memory-bound ops can eat a large share of step time while doing almost none of the FLOPs.
+
+      **The workflow.** Compute $I$ for each significant kernel, place it against the ridge, compare achieved FLOP/s or bandwidth with its roofline value, and spend effort where the gap or the time share is largest. `sys.profiling` turns this into a procedure.
+    source: 'Williams, Waterman & Patterson 2009 §2–4; NVIDIA GPU Performance Background §4, §6; NVIDIA Matrix Multiplication Background §3; Scaling Book Part 1 §"Where Does the Time Go?" (80–85% side-note)'
+
+  - title: "What interviewers probe"
+    body: |
+      - *Is this op compute- or memory-bound on an H100?* Count FLOPs and bytes (inputs and outputs), form $I$, compare with 295 (bf16) or 591 (fp8).
+      - *Draw a roofline.* Log–log, slope-1 bandwidth line, flat compute roof, ridge at $C/W$. Elementwise ops near $I \approx 0.1$–$2$; matmuls at $I \approx$ tokens.
+      - *What token count makes a matmul compute-bound?* $1/I = 1/B + 1/D + 1/F > 1/295$. Roughly $B > 300$; about 328 for $D = 4096$, $F = 11008$.
+      - *Why does fusion help?* Unfused elementwise chains pay a full HBM read and write per op. Fusion keeps data on chip, raising $I$ about $k$-fold for a $k$-op chain.
+      - *Your LayerNorm runs at 1% of peak FLOP/s; is that bad?* Compute achieved bandwidth instead. At $I \approx 2$ the roofline is 0.7% of peak, so 1% is impossible and something close to it is excellent.
+      - *Will fp8 speed this up?* Compute-bound matmul: up to 2×. Memory-bound op: only if the stored bytes shrink.
+      - *Does the backward pass change the regime?* No. Both backward matmuls have the same $B$, $D$, $F$ and the same intensity.
+      - *When does data-parallel communication hide behind compute?* When tokens per GPU exceed $C/W_{link}$: about 2200 within an H100 node, ≈ 2470 across nodes (bf16 gradients).
+    source: 'Scaling Book Part 1; Scaling Book Part 12 §"Rooflines for LLM Scaling on GPUs"; NVIDIA GPU Performance Background §4; He 2022 §"Bandwidth"'
+
+  - title: "Key results"
+    body: |
+      $$T_{math} = \frac{\text{FLOPs}}{C}, \quad T_{mem} = \frac{\text{bytes}}{W}$$
+
+      $$\max(T_{math}, T_{mem}) \le T \le T_{math} + T_{mem}$$
+
+      $$I = \frac{\text{FLOPs}}{\text{bytes}}, \quad I^* = \frac{C}{W}, \quad P = \min(C, IW)$$
+
+      $$\frac{1}{I_{matmul}} = \frac{1}{B} + \frac{1}{D} + \frac{1}{F}$$
+
+      - Ridge: H100 bf16 ≈ 295, fp8 ≈ 591; A100 bf16 = 156 FLOPs/byte.
+      - bf16 elementwise: add 1/6, ReLU 1/4, LayerNorm ≈ 2. Always memory-bound; judge them by achieved bandwidth.
+      - Matmul: $I \approx B$ (tokens) when $B \ll D, F$; square $n/3$; capped at $DF/(D+F)$; backward matmuls have the same $I$.
+      - Data parallel compute-bound iff tokens/GPU $> C/W_{link}$: ≈ 2200 (NVLink), ≈ 2470 (cross-node), bf16 gradients.
+      - Faster: raise $I$ (batch, fuse, tile), raise $C$ (Tensor Cores, fp8), raise $W$. Extra $C$ is useless below the ridge, extra $W$ above it.
+    source: 'Scaling Book Part 1; Williams, Waterman & Patterson 2009; NVIDIA GPU Performance Background §4; Scaling Book Part 12 §"Rooflines for LLM Scaling on GPUs"'
+
+quiz:
+  - id: q1
+    prompt: |
+      A bias add $y = x + b$ adds a bf16 vector $b$ of shape $[h]$ to every row of a bf16 activation $x$ of shape $[16384, h]$, with $h = 4096$. What is its arithmetic intensity?
+    correct: About 1/4 FLOP per byte
+    wrong:
+      - About 1/6 FLOP per byte
+      - About 1/2 FLOP per byte
+      - About 1 FLOP per byte
+    explanation: |
+      Per element of $x$: 1 FLOP, 2 bytes read and 2 written. The 8 KB bias is read once (or stays in cache) and is negligible next to 134 MB of activations, so $I \approx 1/4$. 1/6 treats the bias as a full-size second tensor, as in a residual add. 1/2 forgets the output write. 1 FLOP/byte would need the activation read and written in 1 byte per element.
+    source: 'NVIDIA GPU Performance Background §4 (Table 1), §5.1'
+
+  - id: q2
+    prompt: |
+      An H200 has the same bf16 peak as an H100 (≈ 989 TFLOP/s) but 4.8 TB/s of HBM bandwidth instead of 3.35. You move a LayerNorm and a matmul with 4,096 tokens on a $4096\times11008$ weight from H100 to H200. What changes?
+    correct: The LayerNorm gets about 1.4× faster; the matmul is unchanged
+    wrong:
+      - Both get about 1.4× faster, since every kernel reads from HBM
+      - The matmul gets about 1.4× faster; the LayerNorm is unchanged
+      - Neither changes, since the peak FLOP/s is the same
+    explanation: |
+      The LayerNorm ($I \approx 2$) is memory-bound, so its time is bytes / $W$: $4.8/3.35 \approx 1.43\times$ faster. The matmul ($I \approx 1727$) is far above even the H200's lower ridge ($989/4.8 \approx 206$), so its time is FLOPs / $C$ and does not move. Reading from HBM doesn't make a kernel bandwidth-bound; only $I < C/W$ does. Same peak FLOP/s leaves compute-bound kernels alone, not memory-bound ones.
+    source: 'Scaling Book Part 12 §"Summary of GPU specs" (H200 4.8e12 B/s); Williams, Waterman & Patterson 2009 §3'
+
+  - id: q3
+    prompt: |
+      An 8B-class model's MLP up-projection is a bf16 matmul $[320, 4096]\times[4096, 14336]$ (320 tokens per GPU). Counting each operand read once and the output written once, is it compute-bound on an H100 (ridge ≈ 295)?
+    correct: Just memory-bound; exact intensity ≈ 291
+    wrong:
+      - Compute-bound; intensity ≈ B = 320
+      - Compute-bound; intensity ≈ 14336/3
+      - Deeply memory-bound; intensity ≈ 1
+    explanation: |
+      $1/I = 1/320 + 1/4096 + 1/14336 \approx 0.00344$, so $I \approx 291 < 295$. The $I \approx B$ shortcut says 320 and flips the verdict: activation and output bytes are not free. The exact crossover for this shape is ≈ 325 tokens. $n/3$ applies only to square matmuls. $I \approx 1$ is the matrix–vector case ($B = 1$).
+    source: 'NVIDIA Matrix Multiplication Background §2; Scaling Book Part 1 §"Matrix multiplication"'
+
+  - id: q4
+    prompt: |
+      A square bf16 matmul with $n = 768$ runs on an H100 (ridge ≈ 295). Which is right?
+    correct: Memory-bound, since its intensity n/3 = 256 is below the ridge
+    wrong:
+      - Compute-bound, since n = 768 exceeds the ridge of 295
+      - Compute-bound, since its 2n³ FLOPs outgrow its n² bytes
+      - Memory-bound, since matmuls below n = 1024 skip Tensor Cores
+    explanation: |
+      For a square product $1/I = 3/n$, so $I = 256 < 295$: just memory-bound. The "$n > 295$" option uses $I \approx B$, which only holds when one dimension is much smaller than the other two. The FLOPs-vs-bytes argument is the right *trend* (bigger $n$ eventually wins, from $n \approx 886$), but it doesn't settle this size. Tensor Cores are used at any aligned size.
+    source: 'NVIDIA Matrix Multiplication Background §2'
+
+  - id: q5
+    prompt: |
+      ![Three operations on the H100 bf16 roofline, at their arithmetic intensities.](sys.roofline/roofline-points)
+
+      Which assignment of operations to points A, B and C is right? The matmul uses a 7B-class MLP weight ($4096\times11008$).
+    correct: "A: LayerNorm; B: the matmul with 64 tokens; C: the matmul with 4096 tokens"
+    wrong:
+      - "A: the matmul with 64 tokens; B: LayerNorm; C: the matmul with 4096 tokens"
+      - "A: LayerNorm; B: the matmul with 4096 tokens; C: the matmul with 64 tokens"
+      - "A: the matmul with 4096 tokens; B: the matmul with 64 tokens; C: LayerNorm"
+    explanation: |
+      LayerNorm has $I \approx 2$ whatever the size (A). The matmul's intensity is roughly its token count: about 63 at 64 tokens, below the ridge (B), and about 1730 at 4096 tokens, on the flat roof (C). Swapping A and B would need a LayerNorm with intensity near 60, i.e. dozens of FLOPs per byte, which normalisation never does.
+    source: 'NVIDIA GPU Performance Background §4 (Table 1); NVIDIA Matrix Multiplication Background §2'
+
+  - id: q6
+    prompt: |
+      Which statement is **false** for an H100 running bf16?
+    correct: A $[1, 4096]\times[4096, 4096]$ matrix–vector product is compute-bound
+    wrong:
+      - A LayerNorm's runtime is close to its bytes divided by HBM bandwidth
+      - Above the ridge point, faster HBM would not speed an op up
+      - Fusing two elementwise ops roughly halves their HBM traffic
+    explanation: |
+      With $B = 1$, $1/I = 1 + 2/4096$, so $I \approx 1$: deeply memory-bound, the situation in small-batch decoding. The other statements are true. LayerNorm is memory-bound; above the ridge only FLOP/s matter; fusion replaces two read-write round trips with one.
+    source: 'NVIDIA Matrix Multiplication Background §2 (GEMV); Scaling Book Part 1 §"Visualizing rooflines"; He 2022 §"Bandwidth"'
+
+  - id: q7
+    prompt: |
+      An op has $T_{math} = 30$ µs and $T_{mem} = 45$ µs, and the GPU overlaps loads with compute perfectly. What fraction of peak FLOP/s does it achieve?
+    correct: About 67%
+    wrong:
+      - About 40%
+      - About 100%
+      - About 150%
+    explanation: |
+      With perfect overlap the time is $\max(30, 45) = 45$ µs, during which only 30 µs of math is done: $30/45 \approx 67\%$. 40% is $30/75$, the no-overlap case. 100% would require $T_{math} \ge T_{mem}$. 150% inverts the ratio.
+    source: 'Scaling Book Part 1 §"Where Does the Time Go?"'
+
+  - id: q8
+    prompt: |
+      For the bf16 matmul $[B, 4096]\times[4096, 11008]$ on an H100, you double the token count from 64 to 128. What happens to its time and throughput?
+    correct: Time rises about 2%, so tokens/s nearly doubles
+    wrong:
+      - Time doubles, so tokens/s is unchanged
+      - Time rises about 41%, so tokens/s rises about 41%
+      - Time halves, since intensity doubles
+    explanation: |
+      At these sizes the op is memory-bound and the bytes are dominated by the 90 MB weight: $T_{mem}$ goes from about 27.5 µs to 28.1 µs. Time is almost flat, so throughput nearly doubles. Time doubling is the compute-bound behaviour, which starts only above about 328 tokens. Higher intensity raises *FLOP/s*, but the time cannot fall when the work doubles.
+    source: 'Scaling Book Part 1 §"Matrix multiplication"; Tuning Playbook §"Determining the feasible batch sizes and estimating training throughput"'
+
+  - id: q9
+    prompt: |
+      A memory-bound LayerNorm reads and writes bf16 tensors and computes internally in fp32. You switch the internal arithmetic to fp16, keeping bf16 inputs and outputs. On an H100, how much faster does it get?
+    correct: Essentially no faster, since the bytes moved are unchanged
+    wrong:
+      - About 2× faster, since half-precision math has twice the peak
+      - About 2× faster, since the intensity doubles in half precision
+      - About 1.5× faster, since the registers hold more values
+    explanation: |
+      A memory-bound op's time is bytes / bandwidth. The bytes are unchanged, so its point on the roofline doesn't move, and a higher compute roof is irrelevant below the ridge. Intensity would rise only if the *stored* data shrank. The same holds for fp8: on Hopper fp8 math exists only on the Tensor Cores, so an elementwise op could at best emulate it, and it would still be neither faster nor meaningfully slower.
+    source: 'Williams, Waterman & Patterson 2009 §3; Scaling Book Part 1 §"Visualizing rooflines"'
+
+  - id: q10
+    prompt: |
+      Data parallelism on H100s across nodes needs about 2,470 tokens per GPU for the gradient all-reduce to hide behind the backward pass, assuming bf16 gradients. If the gradients are all-reduced in fp32 instead, what is the threshold?
+    correct: About 4,940 tokens per GPU
+    wrong:
+      - About 1,240 tokens per GPU
+      - About 2,470 tokens per GPU
+      - About 9,890 tokens per GPU
+    explanation: |
+      The backward FLOPs per token are unchanged, but the bytes all-reduced double (4 bytes per gradient instead of 2). Since the condition is $B_{gpu} > (\text{bytes per param}/2)\cdot C/W$, the threshold doubles. 1,240 halves it, as if fp32 halved the traffic. 9,890 quadruples it, as if both the bytes and the ring's factor of 2 changed.
+    source: 'Scaling Book Part 12 §"Rooflines for LLM Scaling on GPUs" › "Data Parallelism"'
+
+  - id: q11
+    prompt: |
+      A custom kernel has intensity 50 FLOPs/byte and achieves 160 TFLOP/s on an H100 (989 TFLOP/s, 3.35 TB/s). What should you do next?
+    correct: Raise its intensity; it is already near its roofline
+    wrong:
+      - Tune instruction scheduling, since it is at 16% of peak
+      - Move to fp8 math, since that doubles the attainable FLOP/s
+      - Nothing; 160 TFLOP/s is above the H100's ridge point
+    explanation: |
+      At $I = 50$ the roofline allows $50 \times 3.35 = 167.5$ TFLOP/s, so the kernel is at about 96% of its bound. Only moving right (more reuse, fusion, bigger tiles) or more bandwidth helps. "16% of peak" compares against the wrong roof. fp8 raises the compute roof, which a memory-bound kernel never reaches. The ridge is an intensity (≈ 295 FLOPs/byte), not a FLOP rate.
+    source: 'Williams, Waterman & Patterson 2009 §3–4'
+
+  - id: q12
+    prompt: |
+      In a linear layer $Y = XW$ with $X \in [B, D]$ and $W \in [D, F]$, how does the arithmetic intensity of the weight-gradient matmul $\partial L/\partial W = X^\top (\partial L/\partial Y)$ compare with the forward matmul?
+    correct: The same, since it multiplies the same three dimensions B, D, F
+    wrong:
+      - About 1, since it contracts over the token dimension
+      - About twice as high, since the backward pass does twice the FLOPs
+      - About D, since the output now has the shape of the weights
+    explanation: |
+      $X^\top$ is $[D, B]$ and $\partial L/\partial Y$ is $[B, F]$. FLOPs are $2BDF$ and bytes are $2(DB + BF + DF)$, the same as the forward, so $1/I = 1/B + 1/D + 1/F$. Contracting over tokens doesn't make it a matrix–vector product. "Twice the FLOPs" is for the two backward matmuls together, not one. A $[D,F]$ output doesn't change the formula.
+    source: 'Scaling Book Part 4 §"Forward and reverse FLOPs"; NVIDIA Matrix Multiplication Background §2'
+
+  - id: q13
+    prompt: |
+      A kernel implements an op whose algorithmic intensity is 300 FLOPs/byte, but a profiler shows it reads each input element from HBM three times. On an H100 (ridge ≈ 295), what does the roofline predict?
+    correct: Memory-bound, with effective intensity near 100 FLOPs/byte
+    wrong:
+      - Compute-bound, since the algorithm's intensity exceeds 295
+      - Compute-bound, since re-reads are served from registers
+      - Memory-bound, with effective intensity near 900 FLOPs/byte
+    explanation: |
+      The roofline uses the bytes that actually cross the HBM interface. Tripling the input traffic cuts effective intensity to roughly a third (somewhat more if outputs are a large share of the bytes), well below the ridge. Re-reads *from HBM* are by definition not served from registers. 900 multiplies instead of dividing.
+    source: 'Williams, Waterman & Patterson 2009 §2; NVIDIA GPU Performance Background §4'
+
+cards:
+  - id: f1
+    front: Write the roofline time bounds and the condition for being compute-bound.
+    back: |
+      $$T_{math} = \frac{\text{FLOPs}}{C}, \quad T_{mem} = \frac{\text{bytes}}{W}$$
+
+      $$\max(T_{math}, T_{mem}) \le T \le T_{math} + T_{mem}$$
+
+      Compute-bound iff $I = \text{FLOPs}/\text{bytes} > C/W$. Attainable FLOP/s: $\min(C, I\,W)$.
+    source: 'Scaling Book Part 1 §"Where Does the Time Go?"; Williams, Waterman & Patterson 2009 §3'
+
+  - id: f2
+    front: Ridge points (dense) for H100 bf16, H100 fp8 and A100 bf16?
+    back: |
+      - H100 bf16: 989e12 / 3.35e12 ≈ **295** FLOPs/byte.
+      - H100 fp8: 1.98e15 / 3.35e12 ≈ **591**.
+      - A100 bf16: 312e12 / 2.0e12 = **156**.
+
+      Spec sheets' "with sparsity" FLOP/s are 2× dense; don't use them.
+    source: 'Scaling Book Part 12 §"Summary of GPU specs", Quiz 1 Q3; NVIDIA GPU Performance Background §2'
+
+  - id: f3
+    front: Arithmetic intensity of a bf16 matmul $[B,D]\times[D,F]$, its harmonic form and its limits?
+    back: |
+      $$I = \frac{BDF}{BD + DF + BF}, \quad \frac{1}{I} = \frac{1}{B} + \frac{1}{D} + \frac{1}{F}$$
+
+      - $I \approx B$ (tokens) when $B \ll D, F$.
+      - Square $n$: $I = n/3$.
+      - Ceiling as $B \to \infty$: $DF/(D+F)$.
+      - Matrix–vector ($B = 1$): $I \approx 1$.
+    source: 'NVIDIA Matrix Multiplication Background §2; Scaling Book Part 1 §"Matrix multiplication"'
+
+  - id: f4
+    front: Intensities of bf16 elementwise ops and reductions, and why they never become compute-bound?
+    back: |
+      Add $1/6$, ReLU $1/4$, LayerNorm ≈ 2, softmax of order 1 FLOPs/byte. Each element is read and written a constant number of times, so $I$ is a size-independent constant, far below even the CUDA-core ridge (≈ 20). Only fusion (fewer HBM round trips) changes it; that is also why a fused GELU costs about the same as a fused ReLU despite many more FLOPs. Judge these ops by achieved bandwidth vs 3.35 TB/s.
+    source: 'NVIDIA GPU Performance Background §4 (Table 1), §5; He 2022 §"Bandwidth"'
+
+  - id: f5
+    front: When does data-parallel gradient communication hide behind compute on H100s?
+    back: |
+      Backward FLOPs $4NB_{gpu}$ vs ring all-reduce bytes $\approx 2\cdot 2N$ (bf16):
+
+      $$B_{gpu} > \frac{C}{W_{link}}$$
+
+      ≈ 2200 tokens/GPU over NVLink (450 GB/s), ≈ 2470 across nodes (400 GB/s node egress; the Scaling Book's 990e12 gives 2475). fp32 gradients double these; MoE multiplies by $E/k$. Assumes perfect overlap and no in-network reduction.
+    source: 'Scaling Book Part 12 §"Rooflines for LLM Scaling on GPUs" › "Data Parallelism"'
+
+  - id: f6
+    front: Which changes speed up an op below the ridge, and which above it?
+    back: |
+      - **Below** (memory-bound): raise intensity (more tokens per weight load, fusion, tiling), move fewer bytes (lower-precision storage), or more bandwidth. More FLOP/s does nothing.
+      - **Above** (compute-bound): Tensor Cores, lower-precision math (fp8 doubles $C$), better kernel efficiency. More bandwidth does nothing.
+    source: 'Williams, Waterman & Patterson 2009 §3–4; Scaling Book Part 1 §"Visualizing rooflines"'
+
+  - id: f7
+    type: open
+    front: Draw an H100 roofline for an interviewer and place a residual add, a LayerNorm, a decode-time matrix–vector product and a large training matmul on it.
+    back: |
+      - **Axes**: log–log, x = FLOPs/byte, y = attainable FLOP/s.
+      - **Lines**: slope-1 line $I \times 3.35$ TB/s; flat roof at 989 TFLOP/s (bf16), fp8 at 1979; ridge at 295 (591). Optionally a CUDA-core ceiling near 67 TFLOP/s.
+      - **Points**:
+        - residual add: $I = 1/6$, at most ≈ 0.56 TFLOP/s;
+        - LayerNorm: $I \approx 2$, ≈ 6.7 TFLOP/s;
+        - decode matvec ($B = 1$): $I \approx 1$, ≈ 3.4 TFLOP/s;
+        - training matmul with thousands of tokens: $I \approx$ tokens ≫ 295, on the roof.
+      - **Message**: elementwise/normalisation ops and small-batch decoding are bandwidth-limited; fix them by fusion, batching or fewer bytes. Training matmuls are compute-limited; fix them with better kernels or lower precision.
+    source: 'Williams, Waterman & Patterson 2009 §3; NVIDIA GPU Performance Background §4; Scaling Book Part 1 §"Visualizing rooflines"'
+
+  - id: f8
+    type: open
+    front: Derive the token count at which a bf16 linear layer becomes compute-bound on an H100, and use it to explain a throughput-vs-batch-size sweep.
+    back: |
+      1. FLOPs $2BDF$; bytes $2(BD + DF + BF)$; so $1/I = 1/B + 1/D + 1/F$.
+      2. Compute-bound iff $I > C/W \approx 295$, i.e. $1/B < 1/295 - 1/D - 1/F$. For $D = 4096$, $F = 11008$: $B > 328$; for large $D, F$, roughly $B > 300$.
+      3. Below that, time ≈ weight bytes / $W$ (≈ 27 µs for a 90 MB weight), nearly independent of $B$. So doubling the batch nearly doubles throughput.
+      4. Above it, time ∝ $B$ and throughput is flat. That is the saturation point in the Tuning Playbook's sweep.
+      5. Caveats: $B$ counts tokens per weight copy (per GPU without model sharding); the backward matmuls have the same intensity; real kernels reach 80–85% of peak; if throughput flattens early, suspect overhead, input pipeline or communication.
+    source: 'Scaling Book Part 1 §"Matrix multiplication"; Tuning Playbook §"Determining the feasible batch sizes and estimating training throughput"'
+
+  - id: f9
+    type: open
+    front: A colleague says your LayerNorm kernel is "0.6% efficient" because it reaches 5.9 TFLOP/s on an H100. How do you respond?
+    back: |
+      - **Wrong metric**: LayerNorm does about 8 FLOPs per element over 4 bytes (bf16 in and out), so $I \approx 2$. Its roofline is $2 \times 3.35 = 6.7$ TFLOP/s, about 0.7% of the 989 TFLOP/s Tensor Core peak, which is unreachable for it.
+      - **Right metric**: achieved bandwidth. 5.9 TFLOP/s at $I = 2$ is 2.95 TB/s, about 88% of HBM peak. Close to the best possible.
+      - **To go faster**: don't tune the kernel; reduce traffic. Fuse the norm with neighbours (residual add, quantisation, the next matmul's input), or store activations in fewer bytes.
+      - **Caveat**: the exact FLOP count is convention-dependent, so state it. The bandwidth argument doesn't depend on it.
+    source: 'NVIDIA GPU Performance Background §4 (Table 1); He 2022 §"Bandwidth"'
+
+  - id: f10
+    type: open
+    front: Explain how switching to fp8 changes where a matmul and an elementwise op sit on the H100 roofline.
+    back: |
+      - **Roof**: fp8 Tensor Core peak ≈ 2× bf16, so the ridge moves from ≈ 295 to ≈ 591.
+      - **fp8 math, bf16 storage**: bytes unchanged. A compute-bound matmul gets up to 2× faster. A memory-bound matmul is unchanged. The crossover token count roughly doubles: ≈ 591 by the $I \approx B$ shortcut, ≈ 736 exactly for $4096\times11008$ (from ≈ 328).
+      - **fp8 storage too**: bytes halve, so $I$ doubles. The crossover stays ≈ 328, and memory-bound matmuls get up to 2× faster because they move half the bytes.
+      - **Elementwise ops**: they gain only from fewer bytes (fp8 storage or fusion), never from faster fp8 arithmetic.
+      - **Caveat**: fp8 needs scaling factors and higher-precision accumulation; numerics are in `sys.fp8-training`.
+    source: 'Scaling Book Part 12 Quiz 1 Q3; Scaling Book Part 1 §"Visualizing rooflines"; Williams, Waterman & Patterson 2009 §3'
+
+reading:
+  - title: "Williams, Waterman & Patterson (2009), Roofline: An Insightful Visual Performance Model for Multicore Architectures"
+    url: https://people.eecs.berkeley.edu/~kubitron/cs252/handouts/papers/RooflineVyNoYellow.pdf
+    kind: paper
+    note: The original model. §3 derives the plot and the ridge point; §4 adds ceilings that order optimisations.
+  - title: "Scaling Book Part 1: All About Rooflines"
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    kind: book
+    note: Compact derivations and worked problems in TPU terms. The app's Scaling Book series (sb.roofline-basics, sb.roofline-matmul) covers it chapter by chapter.
+  - title: "NVIDIA, GPU Performance Background User's Guide (§4–6)"
+    url: https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html
+    kind: docs
+    note: Math- vs memory-limited operations, an intensity table for common DNN ops, and when latency rather than either roof limits you.
+  - title: "Scaling Book Part 12: How to Think About GPUs (§Rooflines for LLM Scaling on GPUs)"
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    kind: book
+    note: Communication rooflines for data, tensor, pipeline and expert parallelism on H100/B200 clusters.
+  - title: "Horace He, Making Deep Learning Go Brrrr From First Principles (§Bandwidth)"
+    url: https://horace.io/brrr_intro.html
+    kind: blog
+    note: Operator fusion and a measured compute-vs-bandwidth sweep that shows the roofline's kink on real hardware.

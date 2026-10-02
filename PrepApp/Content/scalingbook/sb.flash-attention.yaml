@@ -1,0 +1,373 @@
+id: sb.flash-attention
+area: scalingbook
+title: "Flash Attention Through the Roofline Lens"
+summary: Why attention's quadratic cost is less of a barrier than it looks. The online-softmax trick that lets attention run block by block without ever materializing the score matrix, what that does to memory and arithmetic intensity, and the backward-pass identity that makes it trainable and shardable.
+order: 120
+level: intermediate
+tags: [scaling-book, attention, flash-attention, memory, kernels]
+prereqs: [sb.transformer-memory]
+
+explainer:
+  - title: The quadratic objection, and two caveats
+    source: Scaling Book ch. 4 (Transformers) App. A §"How does Flash Attention work?"
+    body: |
+      The standard objection to long context: the attention score array $QK^\top$ has shape $[B, T, S, N]$, quadratic in sequence length, in both FLOPs and memory. The book's appendix makes two counterpoints.
+
+      **1. FLOPs.** Quadratic, yes, but the score/value matmuls only outweigh the rest of the model when $T > 8D$ (lesson 100), about 65k tokens at $D = 8192$. At $T = 16$k they are about 20% of the FLOPs. During training, one layer's attention matrix is also small next to the weights and saved activations, especially once sharded.
+
+      **2. Memory.** We never need the whole score matrix at once. Attention can be computed in chunks of keys, keeping only small running statistics. The FLOPs stay quadratic, but the memory becomes linear in $T$.
+
+      How big would the full matrix be? One sequence, one layer, $N = 64$ heads, bf16:
+
+      $$2\cdot T^2\cdot N \text{ bytes} \approx 137 \text{ GB at } T = 32\text{k},$$
+
+      more than a v5p chip's 96 GB of HBM. The $Q$- and output-sized buffers are only $2\,T\,NH \approx 0.5$ GB each.
+
+      ![Per-layer memory: a materialized score matrix grows like T² and passes a chip's HBM just below 32k; Q- and output-sized buffers grow like T](sb.flash-attention/memory-vs-T)
+
+      The idea was described by Rabe & Staats (2021) and turned into a fast GPU kernel as FlashAttention (Dao et al., 2022). The core is a way to compute softmax in pieces.
+  - title: "Softmax refresher: subtracting the max"
+    source: Scaling Book ch. 4 (Transformers) App. A §"How does Flash Attention work?"
+    body: |
+      For one query $q$ and keys $k_1,\dots,k_S$ with values $v_1,\dots,v_S$, attention is
+
+      $$\text{Attn} = \sum_i \frac{e^{s_i - m}}{\sum_l e^{s_l - m}}\,v_i, \quad s_i = q\cdot k_i,$$
+
+      where $m = \max_j s_j$. (Implementations also scale $s_i$ by $\tau = 1/\sqrt{H}$; we fold that into $s$.)
+
+      **Why subtract $m$?** It does not change the result: $e^{s_i - m} = e^{s_i}e^{-m}$, and the common factor $e^{-m}$ cancels between numerator and denominator. It does change the numerics. Without it, scores around 100 give $e^{100} \approx 2.7\times10^{43}$, which overflows fp32 (max $\approx 3.4\times10^{38}$) and produces inf/NaN. With it, the largest term is $e^0 = 1$.
+
+      **The problem for chunking.** The softmax needs $m$ and the denominator $\sum_l e^{s_l - m}$, and both depend on **all** $S$ keys. Process keys in chunks and the early chunks don't yet know the global max or the full sum. The next card shows how to correct for that after the fact.
+  - title: "Online softmax: merging two chunks"
+    source: Scaling Book ch. 4 (Transformers) App. A §"How does Flash Attention work?"
+    body: |
+      Split the keys into chunks 1 and 2. For each chunk $c$ keep three running quantities:
+
+      - $M^c = \max_{j\in c} s_j$, the local max;
+      - $L^c = \sum_{j\in c} e^{s_j - M^c}$, the local denominator;
+      - $A^c = \sum_{j\in c} e^{s_j - M^c} v_j$, the local unnormalized output.
+
+      To merge, rescale each chunk to the common max $M = \max(M^1, M^2)$, since $e^{s - M^c} = e^{s - M}e^{M - M^c}$:
+
+      $$\begin{aligned} L &= e^{M^1 - M}L^1 + e^{M^2 - M}L^2 \\ A &= e^{M^1 - M}A^1 + e^{M^2 - M}A^2 \end{aligned}$$
+
+      and the final output is $A/L$. Each rescaling factor is $\le 1$, so nothing overflows.
+
+      **Worked example.** Scores $(1, 2)$ with values $(10, 20)$ in chunk 1; scores $(3, 0)$ with values $(30, 40)$ in chunk 2.
+
+      - Chunk 1: $M^1 = 2$, $L^1 = e^{-1} + 1 = 1.368$, $A^1 = 10e^{-1} + 20 = 23.68$.
+      - Chunk 2: $M^2 = 3$, $L^2 = 1 + e^{-3} = 1.050$, $A^2 = 30 + 40e^{-3} = 31.99$.
+      - Merge with $M = 3$: $L = 0.368\cdot1.368 + 1.050 = 1.553$, $A = 0.368\cdot23.68 + 31.99 = 40.70$.
+      - Output $A/L = 26.21$.
+
+      That matches the direct softmax over all four scores exactly. Merging is associative, so any number of chunks can be folded in one at a time.
+  - title: The blocked algorithm
+    source: Scaling Book ch. 4 (Transformers) App. A §"How does Flash Attention work?"
+    body: |
+      Apply the merge rule along the key axis for a whole block of queries at once.
+
+      1. Load a block of $b_q$ queries into fast on-chip memory (VMEM on TPU; SRAM or shared memory on GPU). Initialise per-row $M = -\infty$, $L = 0$, $A = 0$.
+      2. For each block of $b_k$ keys and values: load it, compute the $b_q\times b_k$ scores, update $M$, $L$, $A$ with the merge rule, and discard the scores.
+      3. After the last key block, write $A/L$ (and, for training, the statistics $M$ and $L$) to HBM.
+
+      ![One query block stays on-chip while key/value blocks stream past; under a causal mask, blocks above the diagonal are skipped entirely](sb.flash-attention/tiling)
+
+      **What changes and what doesn't.**
+
+      - FLOPs: the same $4BTSNH$ as the einsum, or slightly more because of the rescaling.
+      - Memory: the $[T, S]$ score array is never in HBM; per query block only $O(b_q H)$ state is kept.
+      - HBM traffic: $Q$ is read once, $O$ written once, and $K, V$ are read once per query block instead of a $T\times S$ array being written and re-read.
+
+      **Causal masking for free.** Blocks entirely above the diagonal contribute nothing and are simply skipped. With $n\times n$ blocks the kernel computes $n(n+1)/2$ of $n^2$, for example 36 of 64 (56%) at $n = 8$, approaching half. That is how the "useful FLOPs halve" of lesson 100 is actually realized.
+  - title: Arithmetic intensity of the blocked kernel
+    source: Scaling Book ch. 4 (Transformers) App. A §"How does Flash Attention work?"; Scaling Book ch. 1 §"Matrix multiplication"
+    body: |
+      The book notes that keeping the $Q$ block on-chip "increases the arithmetic intensity". Here is the size of the effect, by the same counting as lesson 20's tiles. This is a back-of-envelope estimate of ours, ignoring the one-time $Q$ and output traffic.
+
+      For one head and one query block of $b_q$ rows, each key/value block of $b_k$ rows costs:
+
+      - **bytes** (bf16, from HBM): $2\cdot b_k H$ for $K$ plus $2\cdot b_k H$ for $V$ $= 4 b_k H$;
+      - **FLOPs:** scores $2 b_q b_k H$ plus values $2 b_q b_k H$ $= 4 b_q b_k H$.
+
+      $$I \approx \frac{4\,b_q b_k H}{4\,b_k H} = b_q.$$
+
+      **The intensity is the query-block size.** Each loaded key or value is reused by every query in the block, exactly like a weight reused across a batch.
+
+      **Reconciling with lesson 110.** Its prefill intensity $TG/(G+1)$ ($\approx T/2$ for MHA) assumes K and V are read from HBM once in total, as if the whole query sequence fitted on-chip. A real kernel re-reads them $T/b_q$ times, so its intensity is about $\min(T/2,\ b_q)$ for MHA. Grouping a KV head's $G$ query heads into one block multiplies $b_q$ by $G$.
+
+      **Worked example.** On a TPU v5e (ridge ≈ 240), a 128-row query block gives $I \approx 128$: still bandwidth-bound on $K/V$ reads. Blocks of about 256 rows or more reach the ridge, if they fit in VMEM along with the $K/V$ blocks and statistics.
+
+      **During decode** there is only one query per sequence ($b_q = 1$, or $G$ with GQA), so no blocking can help. Decode attention stays bandwidth-bound (lesson 110); the kernel can only make sure the KV cache is read exactly once.
+  - title: "The backward pass: a key identity"
+    source: Scaling Book ch. 4 (Transformers) App. A §"How does Flash Attention work?"
+    body: |
+      Training needs gradients through softmax too. Write $S_{ij}$ for the softmax weight of query $i$ on key $j$ and $O_{id} = \sum_j S_{ij}V_{jd}$. Given $dO$ (the gradient of the loss with respect to $O$):
+
+      $$dS_{ij} = \sum_d dO_{id}\,V_{jd}.$$
+
+      (Here $S_{ij}$ is the softmax matrix, as in the book; elsewhere $S$ is the KV length, and lesson 100 calls these weights $P$.) The softmax Jacobian is $\partial S_{il}/\partial s_{ij} = S_{il}(\delta_{lj} - S_{ij})$, so the gradient of score $s_{ij} = q_i\cdot k_j$ is
+
+      $$\begin{aligned} ds_{ij} &= \sum_l dS_{il}\,S_{il}(\delta_{lj} - S_{ij}) \\ &= S_{ij}\Big(dS_{ij} - \sum_l S_{il}\,dS_{il}\Big). \end{aligned}$$
+
+      The correction term looks like a sum over **all** keys $l$, which would break block-by-block processing. The fix rewrites it by substituting $dS$ and swapping the order of summation:
+
+      $$\begin{aligned} \sum_l S_{il}\,dS_{il} &= \sum_l S_{il}\sum_d dO_{id}V_{ld} \\ &= \sum_d dO_{id}\sum_l S_{il}V_{ld} \\ &= \sum_d dO_{id}\,O_{id}. \end{aligned}$$
+
+      A sum over the long key axis becomes a dot product over the short head axis $H$, computed from $O$ and $dO$, which are already per-row. So each key block's gradient contribution is computed locally, and the backward pass also runs block by block. It recomputes the scores from $Q$, $K$ and the saved $M$, $L$ rather than storing them: more FLOPs, far less memory.
+  - title: From one chip to many
+    source: Scaling Book ch. 4 (Transformers) App. A §"How does Flash Attention work?"; Scaling Book ch. 5 §"Data Parallelism" (context parallelism note)
+    body: |
+      The online-softmax merge doesn't care where the chunks were computed. That makes attention shardable along the sequence.
+
+      **Ring attention.** Shard the sequence across devices, each holding a block of queries plus its own block of keys and values. Pass the KV blocks around a ring of devices. At each step every device merges the incoming block into its running $M$, $L$, $A$, overlapping the transfer of the next block with the current computation (the collective-matmul idea of lesson 80). After a full lap each device has exact attention outputs for its queries. The backward identity above makes the gradient computable the same way.
+
+      This is how **context (sequence) parallelism** handles attention in training (chapter 5): for the MLP "tokens are tokens" and sequence sharding is free, and ring attention covers the one place where tokens interact.
+
+      **The same merge underlies:**
+
+      - sequence-sharded KV caches in inference (lesson 240): each shard computes partial attention, and the partials are merged with the $M$, $L$ rescaling;
+      - split-K decode kernels, which divide a long KV cache across parallel workers for one query.
+  - title: What interviewers probe
+    source: Scaling Book ch. 4 (Transformers) App. A
+    body: |
+      - *Does Flash Attention reduce FLOPs?* No. Forward FLOPs are unchanged (causal block skipping aside), and the backward pass recomputes scores. It cuts **memory** from $O(T^2)$ to $O(T)$ and the HBM traffic of the score matrix.
+      - *How can softmax be computed in chunks?* Keep a running max $M$, denominator $L$ and unnormalized output $A$; rescale by $e^{M^c - M}$ when merging.
+      - *Why subtract the max?* Numerical stability: $e^{s}$ overflows fp32 near $s \approx 89$. Shifting doesn't change the softmax.
+      - *What sets the kernel's arithmetic intensity?* The query-block size: $I \approx b_q$ FLOPs per byte of K/V loaded.
+      - *How is the backward made blockwise?* $\sum_j S_{ij}dS_{ij} = \sum_d dO_{id}O_{id}$ turns a key-length reduction into a local one.
+      - *How does this enable longer context across chips?* Ring attention merges KV blocks passed around devices; sequence-sharded inference uses the same merge.
+  - title: Key results
+    source: Scaling Book ch. 4 (Transformers) App. A
+    body: |
+      $$\begin{aligned} M &= \max(M^1, M^2) \\ L &= e^{M^1 - M}L^1 + e^{M^2 - M}L^2 \end{aligned}$$
+
+      $A$ merges with the same rescaling as $L$, and the output is $A/L$.
+
+      $$\sum_j S_{ij}\,dS_{ij} = \sum_d dO_{id}\,O_{id}$$
+
+      $$I_\text{flash} \approx b_q \text{ FLOPs per byte of } K/V$$
+
+      This intensity is our estimate.
+
+      - Memory $O(T^2) \to O(T)$; FLOPs unchanged; the score matrix never touches HBM.
+      - Causal masking: skip blocks above the diagonal, $n(n+1)/2$ of $n^2$ computed.
+      - Decode ($b_q = 1$ or $G$) stays bandwidth-bound.
+      - The merge enables ring attention and sequence-sharded KV caches.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 4 (Transformers) App. A
+    prompt: |
+      Chunk 1 has $M^1 = 2$ and $L^1 = 1.368$; chunk 2 has $M^2 = 3$ and $L^2 = 1.050$. What is the merged softmax denominator $L$, relative to the merged max?
+    correct: About 1.55
+    wrong:
+      - About 2.42
+      - About 4.22
+      - About 1.05
+    explanation: |
+      $M = 3$, so $L = e^{2-3}\cdot1.368 + e^{0}\cdot1.050 = 0.503 + 1.050 \approx 1.553$. Adding $L^1 + L^2 = 2.42$ ignores that they were computed with different maxima. 4.22 rescales chunk 2 by $e^{+1}$ instead of chunk 1 by $e^{-1}$: $1.368 + e\cdot1.050$.
+  - id: q2
+    source: Scaling Book ch. 4 (Transformers) App. A
+    prompt: |
+      Two chunks of keys give unnormalized outputs $A^1 = 23.68$ (with $M^1 = 2$, $L^1 = 1.368$) and $A^2 = 31.99$ (with $M^2 = 3$, $L^2 = 1.050$). What is the final attention output?
+    correct: About 26.2
+    wrong:
+      - About 23.0
+      - About 30.5
+      - About 17.3
+    explanation: |
+      Rescale to $M = 3$: $A = e^{-1}\cdot23.68 + 31.99 = 40.70$ and $L = 1.553$; output $40.70/1.553 \approx 26.2$, matching the direct softmax. 23.0 adds $A^1 + A^2$ and $L^1 + L^2$ without rescaling; 30.5 and 17.3 are the two chunks' local outputs $A^c/L^c$ on their own.
+  - id: q3
+    source: Scaling Book ch. 4 (Transformers) App. A
+    prompt: |
+      A softmax over scores $(100, 98)$ is computed in fp32 (max ≈ $3.4\times10^{38}$) without subtracting the max. What happens?
+    correct: $e^{100}$ overflows to inf, and the result becomes NaN
+    wrong:
+      - The result is exact, since fp32 handles values up to e^127
+      - The result loses about two digits of precision but stays finite
+      - The result rounds both weights to exactly 0.5
+    explanation: |
+      $e^{100} \approx 2.7\times10^{43}$ exceeds fp32's range; inf/inf gives NaN. fp32's exponent reaches $2^{127}$, not $e^{127}$ ($e^{88.7}$ is the limit). Subtracting the max gives $e^0$ and $e^{-2}$, which are exact enough, and the shift cancels.
+  - id: q4
+    source: Scaling Book ch. 4 (Transformers) App. A
+    prompt: |
+      For one sequence of $T = 65{,}536$ tokens and one layer with $N = 32$ heads, how much memory would materializing the full bf16 attention score array take?
+    correct: About 275 GB
+    wrong:
+      - About 0.5 GB
+      - About 8.6 GB
+      - About 137 GB
+    explanation: |
+      $2\cdot T^2\cdot N = 2\cdot65536^2\cdot32 \approx 2.75\times10^{11}$ bytes, about 3× a v5p's HBM. 0.5 GB is one $Q$-sized buffer ($2TNH$ with $H = 128$), the scale Flash Attention keeps; 8.6 GB is a single head; 137 GB forgets that $T$ is squared when it doubles.
+  - id: q5
+    source: Scaling Book ch. 4 (Transformers) App. A
+    prompt: |
+      Compared with a naive einsum implementation, what does Flash Attention change about the **forward** pass of non-causal attention?
+    correct: Same FLOPs, but memory falls from O(T²) to O(T)
+    wrong:
+      - FLOPs fall from O(T²) to O(T), memory unchanged
+      - FLOPs and memory both fall to O(T)
+      - FLOPs halve, because softmax is computed once per block
+    explanation: |
+      Every score is still computed, so FLOPs stay $4BTSNH$ (slightly more for the rescaling). What disappears is the $[T, S]$ array in HBM and the traffic to write and re-read it. FLOPs halve only under a causal mask with block skipping.
+  - id: q6
+    source: Scaling Book ch. 4 (Transformers) App. A; Scaling Book ch. 1 §"Matrix multiplication"
+    prompt: |
+      In a blocked attention kernel on a TPU v5e (ridge ≈ 240), each query block of $b_q$ rows reuses every loaded key and value. With $b_q = 128$, is the kernel compute-bound with respect to HBM reads of $K$ and $V$?
+    correct: No; its intensity is about 128, below the ridge
+    wrong:
+      - Yes; its intensity is about 128 × H, far above the ridge
+      - Yes; its intensity is about 512, set by b_q × 4
+      - No; its intensity is about 1, as in decode
+    explanation: |
+      Per KV block: FLOPs $4b_qb_kH$, bytes $4b_kH$ (bf16 K and V), so $I \approx b_q = 128 < 240$. About 256 rows or more would reach the ridge, if they fit on-chip. Intensity ≈ 1 applies when there is a single query (MHA decode).
+  - id: q7
+    source: Scaling Book ch. 4 (Transformers) §"Attention" (causal masking note); Scaling Book ch. 4 App. A
+    prompt: |
+      A causal attention kernel splits the $T\times T$ score array into an $8\times8$ grid of equal blocks and skips blocks entirely above the diagonal. What fraction of the blocks does it compute?
+    correct: About 56%
+    wrong:
+      - About 50%
+      - About 88%
+      - About 100%
+    explanation: |
+      Blocks on or below the diagonal: $8\cdot9/2 = 36$ of 64, ≈ 56%. The diagonal blocks are partly masked but must still be computed, so the saving approaches exactly half only as the grid gets finer.
+  - id: q8
+    source: Scaling Book ch. 4 (Transformers) App. A
+    prompt: |
+      In the attention backward pass, the softmax correction term $\sum_j S_{ij}\,dS_{ij}$ (with $dS_{ij} = \sum_d dO_{id}V_{jd}$) equals which quantity?
+    correct: $\sum_d dO_{id}\,O_{id}$
+    wrong:
+      - $\sum_d dO_{id}\,V_{id}$
+      - $\sum_j dS_{ij}$
+      - $\sum_d Q_{id}\,K_{id}$
+    explanation: |
+      Substitute $dS$ and swap sums: $\sum_d dO_{id}\sum_j S_{ij}V_{jd} = \sum_d dO_{id}O_{id}$, since $O = SV$. It replaces a reduction over all keys with a local dot product over the head dimension.
+  - id: q9
+    source: Scaling Book ch. 4 (Transformers) App. A
+    prompt: |
+      Why does the identity $\sum_j S_{ij}dS_{ij} = \sum_d dO_{id}O_{id}$ matter for Flash Attention and ring attention?
+    correct: Each key block's gradient no longer needs the other blocks
+    wrong:
+      - It removes the need to recompute scores in the backward pass
+      - It halves the FLOPs of the backward pass
+      - It makes the backward pass numerically exact in bf16
+    explanation: |
+      The naive correction needs a sum over every key for each query, so all KV blocks would have to be visited first. Computing it from $O$ and $dO$ (both per-query) makes every block independent, so the backward runs block by block, and across devices in ring attention. Scores are still recomputed.
+  - id: q10
+    source: Scaling Book ch. 4 (Transformers) App. A, §"Fractional cost of attention with context length"
+    prompt: |
+      For a model with $D = 8192$ (MHA, $F = 4D$) at $T = 16{,}384$, which is the bigger practical obstacle to naive attention?
+    correct: Memory for the score matrix, not attention's share of FLOPs
+    wrong:
+      - Attention's share of FLOPs, which already exceeds 80% here
+      - Neither; attention is negligible in both memory and FLOPs
+      - The extra parameters that attention needs at long context
+    explanation: |
+      $T/(8D) = 0.25$, so attention is about 20% of FLOPs. A materialized score matrix is $2T^2N$ bytes per layer: ≈ 34 GB at 16k with 64 heads, which Flash Attention removes. Attention has no sequence-length-dependent parameters.
+  - id: q11
+    source: Scaling Book ch. 4 (Transformers) App. A
+    prompt: |
+      Which statement is **false**?
+    correct: Flash Attention turns attention's quadratic FLOP count into a linear one
+    wrong:
+      - Online softmax rescales partial sums by $e^{M^c - M}$ when merging chunks
+      - The query block is kept on-chip while key/value blocks stream past
+      - Decode attention stays bandwidth-bound even with a Flash-style kernel
+    explanation: |
+      Flash Attention computes every score; only memory becomes linear in $T$. The other statements are true: the merge rule; the blocked schedule; and decode has one query per sequence, so there is nothing to reuse K/V across.
+  - id: q12
+    source: Scaling Book ch. 4 (Transformers) App. A; Scaling Book ch. 5 §"Data Parallelism"
+    prompt: |
+      In ring attention, each device holds a block of queries and passes key/value blocks around a ring of devices. What lets each device combine contributions from KV blocks that arrive one at a time?
+    correct: The online-softmax merge of running max, sum and output
+    wrong:
+      - An AllReduce of the full score matrix after each step
+      - Recomputing the softmax from scratch once all blocks arrive
+      - Storing every block's scores until the lap completes
+    explanation: |
+      Each arriving block updates the running $M$, $L$, $A$ exactly as in the single-chip kernel, so nothing needs storing or globally reducing. Storing all scores would bring back the $O(T^2)$ memory that the method avoids.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 4 (Transformers) App. A
+    front: Write the online-softmax merge of two key chunks.
+    back: |
+      $M = \max(M^1, M^2)$; $L = e^{M^1-M}L^1 + e^{M^2-M}L^2$; $A = e^{M^1-M}A^1 + e^{M^2-M}A^2$; output $= A/L$.
+  - id: f2
+    source: Scaling Book ch. 4 (Transformers) App. A
+    front: Why subtract the max inside softmax, and why is it allowed?
+    back: |
+      $e^{s}$ overflows fp32 near $s \approx 89$; shifting by $m$ multiplies numerator and denominator by $e^{-m}$, which cancels, so the result is unchanged.
+  - id: f3
+    source: Scaling Book ch. 4 (Transformers) App. A
+    front: What does Flash Attention change, and what does it not change?
+    back: |
+      Changes: score matrix never materialized in HBM; memory $O(T^2)\to O(T)$; less HBM traffic; causal blocks skippable. Unchanged: forward FLOPs (quadratic); backward recomputes scores.
+  - id: f4
+    source: Scaling Book ch. 4 (Transformers) App. A
+    front: The attention-backward identity used by Flash Attention?
+    back: |
+      $$\sum_j S_{ij}\,dS_{ij} = \sum_d dO_{id}\,O_{id}$$
+
+      It turns a key-length reduction into a local head-dim dot product.
+  - id: f5
+    source: Scaling Book ch. 4 (Transformers) App. A; Scaling Book ch. 1 §"Matrix multiplication"
+    front: Arithmetic intensity of a blocked attention kernel?
+    back: |
+      ≈ $b_q$ FLOPs per byte of K/V (bf16), our estimate: FLOPs $4b_qb_kH$ over bytes $4b_kH$. Needs $b_q \gtrsim 240$ on v5e; decode has $b_q = 1$ (or $G$).
+  - id: f6
+    source: Scaling Book ch. 4 (Transformers) App. A
+    front: Fraction of blocks computed by a causal kernel with an n×n block grid?
+    back: |
+      $n(n+1)/2$ out of $n^2$ (36/64 at $n = 8$), approaching ½ as blocks get finer.
+  - id: f7
+    type: open
+    source: Scaling Book ch. 4 (Transformers) App. A
+    front: Derive the online-softmax update and walk through a small numerical example.
+    back: |
+      - Per chunk keep $M^c$, $L^c = \sum e^{s-M^c}$, $A^c = \sum e^{s-M^c}v$.
+      - $e^{s-M^c} = e^{s-M}e^{M-M^c}$, so rescaling by $e^{M^c-M}$ puts all chunks on a common max $M$.
+      - Merge: $L = \sum_c e^{M^c-M}L^c$, $A = \sum_c e^{M^c-M}A^c$; output $A/L$.
+      - Example: scores (1, 2) with values (10, 20) and (3, 0) with values (30, 40): $L^1 = 1.368$, $A^1 = 23.68$, $L^2 = 1.050$, $A^2 = 31.99$. With $M = 3$: $L = 1.553$, $A = 40.70$, output 26.21, equal to the direct softmax.
+      - Associative, so chunks can be merged in any grouping: that is the basis of blocking and ring attention.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 4 (Transformers) App. A
+    front: Explain to an interviewer how Flash Attention works from a hardware (roofline) perspective.
+    back: |
+      - Naive attention writes the $[T, S]$ score matrix to HBM and reads it back: $O(T^2)$ memory and traffic for a low-intensity softmax.
+      - Flash keeps a $b_q$-row query block in on-chip memory (VMEM/SRAM) with running $M$, $L$, $A$; streams $K/V$ blocks; never writes scores.
+      - Each loaded K/V byte serves $b_q$ queries: intensity ≈ $b_q$, so large query blocks make it compute-bound.
+      - Causal masks: skip blocks above the diagonal (≈ ½ FLOPs).
+      - Backward: recompute scores from saved $M$, $L$; the identity $\sum_j S dS = \sum_d dO\,O$ keeps it blockwise.
+      - Decode can't benefit from reuse ($b_q = 1$): the kernel just reads the KV cache once.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 4 (Transformers) App. A; Scaling Book ch. 5 §"Data Parallelism"
+    front: How does the online-softmax trick extend attention across many devices? Describe ring attention.
+    back: |
+      - Shard the sequence: each device holds a query block and its own KV block.
+      - Pass KV blocks around a ring; at each step, merge the incoming block into the running $M$, $L$, $A$ while the next block is in flight (overlap as in collective matmul).
+      - After one lap, each device has exact attention for its queries; memory per device is $O(T/n)$.
+      - Backward uses the same blocks plus the $\sum_d dO\,O$ identity.
+      - It is the attention half of context/sequence parallelism; the MLP needs no communication for sequence sharding.
+      - Inference analogue: sequence-sharded KV caches merge partial attentions with the same rescaling.
+
+reading:
+  - title: "Scaling Book ch. 4, Appendix A: How does Flash Attention work?"
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    kind: book
+    note: The source appendix, with the chunk-merge formula and the backward identity.
+  - title: "Dao et al. (2022), FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"
+    url: https://arxiv.org/abs/2205.14135
+    kind: paper
+    note: The tiled GPU kernel, its IO analysis, and the full forward and backward algorithms.
+  - title: "Rabe & Staats (2021), Self-attention Does Not Need O(n²) Memory"
+    url: https://arxiv.org/abs/2112.05682
+    kind: paper
+    note: The earlier observation that chunked attention with running statistics needs only linear memory.
+  - title: "Liu, Zaharia & Abbeel (2023), Ring Attention with Blockwise Transformers"
+    url: https://arxiv.org/abs/2310.01889
+    kind: paper
+    note: Ring attention across devices, built on the same blockwise merge.

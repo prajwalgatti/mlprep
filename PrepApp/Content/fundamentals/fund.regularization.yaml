@@ -1,0 +1,524 @@
+id: fund.regularization
+area: fundamentals
+title: Parameter Norm Penalties & Other Regularizers
+summary: How L2 and L1 penalties act (eigenbasis shrinkage, soft-thresholding, constraint geometry, priors), why some problems need a penalty to have a solution, and the regularizers that aren't norm penalties, through to label smoothing and weight decay under Adam.
+order: 150
+level: core
+tags: [regularization, weight-decay, lasso, ridge, label-smoothing, generalization]
+prereqs: [fund.bias-variance, fund.mle-map]
+
+explainer:
+  - title: "The problem: capacity we can't fully use"
+    body: |
+      A model with enough capacity to fit the signal can usually fit the noise too. The bias–variance lesson showed that such a model has high variance: its fit depends heavily on which training sample it saw. **Regularization** is any change to the learning algorithm meant to lower generalization error without trying to lower training error. In practice it is a preference for "simpler" solutions that the data alone don't express.
+
+      **Explicit regularizers** change the objective. The most common adds a *parameter norm penalty*:
+
+      $$\tilde J(w)=J(w)+\lambda\,\Omega(w),\qquad \lambda\geq0.$$
+
+      Here $J$ is the training loss, $\Omega$ measures the size of the weights, and $\lambda$ sets the strength. This lesson uses
+      - L2: $\Omega(w)=\tfrac12\|w\|_2^2$, and
+      - L1: $\Omega(w)=\|w\|_1=\sum_j|w_j|$.
+
+      **Implicit regularizers** leave the objective alone and constrain the search instead: early stopping, SGD noise, architecture choices.
+
+      **Which parameters get penalized.** Usually only the weights, not the biases. A weight describes how two variables interact, and fitting it well needs data covering both. A bias controls one variable, so leaving it free adds little variance, and penalizing it can cause noticeable underfitting.
+
+      **Notation warning.** Goodfellow et al. write $\alpha$ for the penalty strength, while ESL and Murphy use $\lambda$, as here. Below, $\eta$ is the learning rate and $h_i$ are Hessian eigenvalues.
+
+      **Roadmap:** L2 in the eigenbasis → L1 and soft-thresholding → constraint geometry → priors and ill-posed problems → augmentation and noise → label smoothing → weight decay under Adam and choosing $\lambda$.
+    source: Goodfellow DL §5.2.2, §7.1; Murphy PML1 §4.5.3
+
+  - title: "L2 (weight decay): the update and the eigenbasis picture"
+    body: |
+      **One step.** The penalized gradient is $\nabla J+\lambda w$, so a gradient step with learning rate $\eta$ is
+
+      $$w\leftarrow(1-\eta\lambda)\,w-\eta\nabla J(w).$$
+
+      Each step first shrinks the weights by a constant factor, then takes the usual step. That is why it is called *weight decay*.
+
+      **The end point.** Approximate $J$ by a quadratic around its unpenalized minimum $w^*$. The gradient vanishes there, so there is no linear term:
+
+      $$\hat J(w)=J(w^*)+\tfrac12(w-w^*)^\top H(w-w^*),$$
+
+      with $H$ the Hessian at $w^*$ (positive semidefinite). The penalized minimum $\tilde w$ sets the gradient to zero:
+
+      $$\begin{aligned}H(\tilde w-w^*)+\lambda\tilde w&=0\\ \tilde w&=(H+\lambda I)^{-1}Hw^*.\end{aligned}$$
+
+      **Read it in the eigenbasis.** Write $H=Q\Lambda Q^\top$ with orthonormal eigenvectors $q_i$ and eigenvalues $h_i$. Then $(H+\lambda I)^{-1}H=Q(\Lambda+\lambda I)^{-1}\Lambda Q^\top$, so each component is rescaled separately:
+
+      $$q_i^\top\tilde w=\frac{h_i}{h_i+\lambda}\,q_i^\top w^*.$$
+
+      - **High curvature** ($h_i\gg\lambda$): the factor is close to 1. The data pin this direction down, and the penalty barely moves it.
+      - **Low curvature** ($h_i\ll\lambda$): the factor is close to 0. The loss hardly cares about this direction, so the penalty removes it.
+
+      For example, with $h=10$ and $\lambda=1$ the direction keeps $10/11=0.91$ of $w^*$; with $h=0.1$ it keeps $0.1/1.1=0.09$.
+
+      ![Synthetic Hessian spectrum. L2 keeps h/(h+λ) along each eigenvector; directions with curvature below λ lose most of their weight.](fund.regularization/eigen-shrink)
+
+      **Linear regression** makes the quadratic exact: $J=\tfrac12\|Xw-y\|^2$ has $H=X^\top X$, giving ridge, $\tilde w=(X^\top X+\lambda I)^{-1}X^\top y$. With the SVD $X=UDV^\top$, $H$ has eigenvalues $d_j^2$. So ridge shrinks the coefficient along the $j$-th principal direction by $d_j^2/(d_j^2+\lambda)$, and the directions in which the inputs vary least are shrunk most.
+    source: Goodfellow DL §7.1.1 (eqs. 7.5–7.13, 7.17); ESL §3.4.1 (eq. 3.47)
+
+  - title: "L1: subgradients and soft-thresholding"
+    body: |
+      **Refresher: subgradients.** $|w|$ has no derivative at 0. For a convex $g$, the *subdifferential* $\partial g(w)$ is the set of slopes $s$ with $g(v)\geq g(w)+s(v-w)$ for all $v$. For $|w|$ it is $\{\mathrm{sign}(w)\}$ when $w\neq0$ and the interval $[-1,1]$ at $w=0$. A point minimises a convex function exactly when $0$ lies in its subdifferential.
+
+      **Set-up.** Use the same quadratic approximation, but assume a *diagonal* Hessian $H=\mathrm{diag}(H_{11},\dots)$ with $H_{ii}>0$. This holds, for instance, after decorrelating the features. The objective then splits into one problem per coordinate:
+
+      $$\tfrac12H_{ii}(w_i-w_i^*)^2+\lambda|w_i|.$$
+
+      **Optimality condition:** $0\in H_{ii}(w_i-w_i^*)+\lambda\,\partial|w_i|$. Check the three cases.
+      - $w_i>0$: $w_i=w_i^*-\lambda/H_{ii}$, which is consistent only if $w_i^*>\lambda/H_{ii}$.
+      - $w_i<0$: $w_i=w_i^*+\lambda/H_{ii}$, which needs $w_i^*<-\lambda/H_{ii}$.
+      - $w_i=0$: we need $H_{ii}w_i^*\in\lambda[-1,1]$, i.e. $|w_i^*|\leq\lambda/H_{ii}$.
+
+      Combining the cases gives the **soft-threshold**:
+
+      $$w_i=\mathrm{sign}(w_i^*)\max\!\Big(|w_i^*|-\frac{\lambda}{H_{ii}},\,0\Big).$$
+
+      Small coefficients become **exactly zero**, and large ones move toward zero by a fixed amount $\lambda/H_{ii}$. Compare L2 with the same diagonal $H$: $\tilde w_i=\frac{H_{ii}}{H_{ii}+\lambda}w_i^*$, which never reaches zero unless $w_i^*=0$. The difference is in the gradients. L1's pull has constant size $\lambda$ however small $w_i$ gets, while L2's pull $\lambda w_i$ fades as $w_i\to0$.
+
+      **Numbers.** Take $w^*=(2.5,-0.4)$, $H=\mathrm{diag}(2,1)$ and $\lambda=1$. The thresholds are $0.5$ and $1$, so L1 gives $(2.0,\,0)$. L2 gives $(\tfrac23\cdot2.5,\,\tfrac12\cdot(-0.4))=(1.67,\,-0.2)$.
+
+      ![With an orthonormal design (H = I) and λ = 1, each estimator is a function of the unpenalized estimate: L1 shifts toward zero and clips, L2 scales, L0 (best subset) keeps or kills.](fund.regularization/shrinkage-curves)
+
+      Zeroed coefficients mean the feature has been removed, so the lasso performs **feature selection**.
+    source: Goodfellow DL §7.1.2 (eqs. 7.19–7.23); ESL §3.4 (Table 3.4)
+
+  - title: Constraint view, geometry and the Lq family
+    body: |
+      **Penalty ⇔ constraint.** Minimising $J$ subject to $\Omega(w)\leq t$ has the Lagrangian
+
+      $$L(w,\lambda)=J(w)+\lambda\big(\Omega(w)-t\big),\quad\lambda\geq0.$$
+
+      At the optimal multiplier $\lambda^*$, minimising over $w$ is exactly the penalized problem with strength $\lambda^*$. A larger $\lambda$ corresponds to a smaller budget $t$. The exact mapping depends on $J$, so you usually tune $\lambda$, not $t$.
+
+      **Geometry.** The solution is where the smallest loss contour around $w^*$ first touches the constraint region:
+
+      ![Same quadratic loss, same budget t. The contour touches the round L2 ball at a generic point (both weights nonzero) but hits the L1 diamond at a corner, so one weight is exactly zero.](fund.regularization/l1-l2-geometry)
+
+      The L1 ball has corners on the coordinate axes, and in higher dimensions also edges and faces where many coordinates are zero. A contour arriving from a generic direction tends to hit one of these first. The L2 ball has no corners.
+
+      **The Lq family** $\sum_j|w_j|^q$ links the cases.
+      - $q=0$ counts nonzeros (best-subset selection).
+      - $q=1$ is the lasso, $q=2$ is ridge.
+      - For $q<1$ the region is non-convex: sparse, but hard to optimise.
+      - $q=1$ is the *smallest* $q$ whose region is convex.
+      - For $q>1$ the penalty is differentiable at 0, so there are no exact zeros.
+
+      **Elastic net**, $\lambda\sum_j\big(\alpha w_j^2+(1-\alpha)|w_j|\big)$, keeps the corners (so it selects) and is strictly convex (so it shrinks correlated features together). Here is why the lasso alone fails with correlated features. Suppose two features are identical copies. The loss depends only on $w_1+w_2$, and $|w_1|+|w_2|$ is the same for every same-sign split. So any split is optimal and the solver picks one arbitrarily. Adding $w_1^2+w_2^2$, which is smallest at an equal split, breaks the tie.
+
+    source: Goodfellow DL §7.2 (eqs. 7.25–7.28); ESL §3.4.3 (eqs. 3.53–3.54, Figs. 3.12–3.13)
+
+  - title: Priors, and problems that need a penalty to have a solution
+    body: |
+      **MAP view** (derived in fund.mle-map). Take Gaussian noise with variance $\sigma^2$ and a prior $w\sim\mathcal N(0,\tau^2I)$. The negative log posterior is
+
+      $$\frac{1}{2\sigma^2}\sum_i(y_i-w^\top x_i)^2+\frac{1}{2\tau^2}\|w\|^2+\text{const}.$$
+
+      Multiplying by $2\sigma^2$ gives $\sum_i(\cdot)^2+\lambda\|w\|^2$ with $\lambda=\sigma^2/\tau^2$: ridge. A strong prior (small $\tau$) means strong shrinkage. A Laplace prior $p(w_j)=\frac1{2b}e^{-|w_j|/b}$ gives the lasso with $\lambda=2\sigma^2/b$.
+
+      **Caveat:** these are posterior *modes*. Under the Gaussian prior the posterior is Gaussian, so ridge is also the posterior mean. Under the Laplace prior the posterior mean is **not** sparse. Only the mode has exact zeros.
+
+      **Ill-posed least squares.** If $p>N$, or features are collinear, $X^\top X$ is singular and infinitely many weight vectors fit equally well. Adding $\lambda I$ fixes this: $X^\top X+\lambda I$ has eigenvalues $d_j^2+\lambda\geq\lambda>0$, so it is invertible and the solution is unique. As $\lambda\to0$ the ridge solution tends to the Moore–Penrose pseudoinverse (minimum-norm) solution, $X^+=\lim_{\lambda\to0}(X^\top X+\lambda I)^{-1}X^\top$.
+
+      **Separable logistic regression.** If $w$ classifies every training point correctly, so does $cw$ for any $c>1$. Scaling up multiplies every margin $y_iw^\top x_i>0$, so every predicted probability for the correct class rises and the likelihood strictly increases. The MLE does not exist: gradient descent keeps growing $\|w\|$ until numerical overflow. With an L2 penalty the objective is strictly convex and grows without bound as $\|w\|\to\infty$, so it has a unique finite minimiser. Gradient descent stops where the slope of the log-likelihood balances the decay. Softmax regression with one-hot targets has the same problem (see label smoothing below).
+    source: Goodfellow DL §7.1.2 (eq. 7.24), §7.3 (eq. 7.29); Murphy PML1 §11.3.1; ESL §3.4.3
+
+  - title: Augmentation, noise injection and structural priors
+    body: |
+      **Data augmentation** adds transformed copies $(T(x),y)$ for transformations $T$ that shouldn't change the label, such as small shifts, crops and rescaling for images. It encodes a known *invariance*. Transformations that do change the label are harmful: flipping "b" into "d", or rotating "6" into "9". When comparing two methods, give both the same augmentation, or the comparison measures the augmentation.
+
+      **Input noise is a penalty in disguise.** For a linear model, add fresh noise $\xi\sim\mathcal N(0,s^2I)$ to the input. The cross term has mean zero and $\mathbb{E}(w^\top\xi)^2=s^2\|w\|^2$, so
+
+      $$\begin{aligned}\mathbb{E}_\xi\big(w^\top(x+\xi)-t\big)^2&=(w^\top x-t)^2\\&\quad+s^2\|w\|^2.\end{aligned}$$
+
+      Training a linear model with input noise is ridge, exactly. For a general model $y(x)$, Bishop Taylor-expands $y(x+\xi)$ for small noise. The term involving $(y-t)$ vanishes to leading order at the optimum, leaving a **Tikhonov** penalty proportional to $\int\|\nabla_x y(x)\|^2p(x)\,dx$. It punishes functions that change quickly with the input. For a linear model $\nabla_x y=w$, which recovers the result above.
+
+      **Weight noise.** Perturbing the weights with small variance $s^2$ adds roughly $s^2\,\mathbb{E}\|\nabla_W\hat y(x)\|^2$. This favours *flat* regions where small weight changes barely move the output.
+
+      **Structural regularizers** build assumptions into the model rather than the loss:
+      - **Parameter sharing**: a CNN uses one filter at every position, encoding translation equivariance with far fewer parameters. An RNN reuses its weights at every time step. A soft version penalizes $\|w^{(A)}-w^{(B)}\|^2$ between two related models.
+      - **Multitask learning**: shared lower layers see the pooled data of all tasks, so they are better constrained. This helps only if the tasks really share factors.
+      - **Sparse representations**: penalize $\|h\|_1$ on hidden activations rather than on weights.
+      - **Max-norm constraints**: after each step, project each unit's incoming weights back onto a norm ball. Unlike a penalty, this never pulls small weights toward zero, so it avoids penalty-induced "dead" units, and it caps runaway weight growth at high learning rates.
+    source: Goodfellow DL §7.2, §7.4, §7.5, §7.7, §7.9, §7.10; Bishop PRML §5.5.5 (eqs. 5.129–5.135)
+
+  - title: Label smoothing
+    body: |
+      **The problem.** With one-hot targets, softmax cross-entropy approaches zero only as the correct logit's lead over the others goes to infinity. Training keeps inflating logits and weights, making ever more confident predictions. It also trusts every label fully, including mislabelled ones.
+
+      **The fix.** Mix the target with the uniform distribution $u$ over $K$ classes:
+
+      $$q=(1-\varepsilon)\,y+\varepsilon\,u.$$
+
+      The true class gets $1-\varepsilon+\varepsilon/K$, every other class $\varepsilon/K$.
+
+      **The loss splits.** Cross-entropy $\mathrm{CE}(q,p)=-\sum_kq_k\log p_k$ is linear in $q$, so
+
+      $$\begin{aligned}\mathrm{CE}(q,p)&=(1-\varepsilon)\,\mathrm{CE}(y,p)\\&\quad+\varepsilon\,\mathrm{CE}(u,p).\end{aligned}$$
+
+      The second term equals $\log K+\mathrm{KL}(u\,\|\,p)$: a penalty pulling predictions toward uniform. Note the weight $1-\varepsilon$ on the first term. It is not "CE plus $\varepsilon$ times a penalty".
+
+      **The optimum is finite.** $\mathrm{CE}(q,p)=H(q)+\mathrm{KL}(q\|p)$ is minimised exactly at $p=q$, since KL is zero only for equal distributions. With $p=\mathrm{softmax}(z)$, the logit gaps must satisfy $z_i-z_j=\log(q_i/q_j)$. So the true-vs-other gap is
+
+      $$\log\frac{1-\varepsilon+\varepsilon/K}{\varepsilon/K},$$
+
+      which is $\log(0.91/0.01)=\log 91\approx4.51$ for $K=10$ and $\varepsilon=0.1$, instead of infinity.
+
+      **Convention.** Goodfellow et al. spread $\varepsilon$ only over the $K-1$ wrong classes (targets $1-\varepsilon$ and $\varepsilon/(K-1)$). The same nominal $\varepsilon$ then gives a different target, e.g. a gap of $\log81\approx4.39$ at $K=10$, $\varepsilon=0.1$.
+
+      **What it does in practice (scoped).** Müller et al. (2019) found it improves calibration, makes penultimate-layer representations cluster tightly by class, and makes teachers worse for distillation. Shallue et al. (2019, ResNet-50 on ImageNet, fixed budget per batch size) found it cut error by up to about one percentage point at *large* batch sizes, with no visible effect at small ones. On MNIST it helped at all batch sizes. One reading is that small-batch gradient noise already regularizes. Calibration and distillation are covered in fund.loss-functions.
+    source: Goodfellow DL §7.5.1; Müller et al. 2019 §1.1, §2–4; Shallue et al. 2019 §4.6
+
+  - title: Weight decay ≠ L2 under Adam; what to decay; choosing λ
+    body: |
+      **For SGD they coincide, with coupled constants** (Loshchilov & Hutter, Prop. 1). An L2 term $\frac{\lambda'}2\|w\|^2$ gives the step
+
+      $$\begin{aligned}w&\leftarrow w-\eta(\nabla f+\lambda' w)\\&=(1-\eta\lambda')\,w-\eta\nabla f.\end{aligned}$$
+
+      *Decoupled* weight decay is $w\leftarrow(1-\lambda)w-\eta\nabla f$. These match exactly when $\lambda'=\lambda/\eta$. So the best L2 coefficient moves whenever you change the learning rate.
+
+      **For Adam they differ.** With L2, the term $\lambda'w$ enters the gradient and is divided by $\sqrt{\hat v}+\epsilon$ along with everything else. A coordinate with a large gradient history (large $\hat v_i$) therefore gets *less* regularization. AdamW applies the decay outside the adaptive scaling, so every weight decays at the same rate:
+
+      $$\theta\leftarrow\theta-\eta_t\Big(\frac{\alpha\,\hat m}{\sqrt{\hat v}+\epsilon}+\lambda\theta\Big).$$
+
+      Here $\alpha$ is Adam's step size and $\eta_t$ a schedule multiplier. The full update is in fund.adam. Many papers say "weight decay" when they mean an L2 term; under Adam that is a real difference.
+
+      **What not to decay.**
+      - *Biases*, for the reason on the first card.
+      - *Normalization gains and shifts*: Goyal et al. (2017) follow the common practice of not decaying BN's $\gamma,\beta$.
+      - *Scale-invariant weights.* If $w$ feeds a normalization layer, the output satisfies $f(cw)=f(w)$ for every $c>0$, so L2 on $w$ doesn't restrict the function at all. Differentiating that identity in $w$ gives $c\,\nabla f(cw)=\nabla f(w)$: gradients scale like $1/\|w\|$. Shrinking $\|w\|$ therefore *raises* the effective step size. Decay on such weights changes the optimisation, not the capacity (see fund.batchnorm).
+
+      **Choosing λ.** Search on a log grid using a validation set or cross-validation, because its effect is multiplicative. Then refit on train + validation. Watch how the loss is normalised. A fixed prior gives $\sum_i\ell_i+\frac{\sigma^2}{\tau^2}\|w\|^2$; dividing by $N$ gives $\frac1N\sum_i\ell_i+\frac{\sigma^2}{N\tau^2}\|w\|^2$. With a **mean** loss, the same prior needs $\lambda\propto1/N$. Keeping $\lambda$ fixed as data grows quietly strengthens the prior. Loshchilov & Hutter also found that longer training wanted smaller weight decay.
+    source: Loshchilov & Hutter 2019 §1, §2 (Props. 1–2, Alg. 2); Goodfellow DL §7.1; Goyal et al. 2017 §5.1; Ba et al. 2016 §5.1, §5.2.2; Murphy PML1 §4.5.4
+
+  - title: Pitfalls and what interviewers probe
+    body: |
+      **Pitfalls**
+      - Calling an L2 term "weight decay" in an Adam setting. It is a different regularizer, and it regularizes high-gradient weights less.
+      - Expecting L2 to produce zeros. It only scales coefficients, by $h_i/(h_i+\lambda)$.
+      - Expecting the lasso to choose sensibly between correlated features. It picks arbitrarily. Use the elastic net.
+      - Forgetting to standardise inputs before an L1 or L2 penalty. The penalty treats every coefficient alike, so a feature measured in large units gets a small coefficient and is barely penalized.
+      - Reading a posterior *mean* as sparse under a Laplace prior. Only the MAP is.
+      - Mixing label-smoothing conventions ($\varepsilon/K$ vs $\varepsilon/(K-1)$).
+
+      **Probe chain**
+      - *Why does L2 help?* It trades a little bias for less variance, by removing directions the data don't pin down (factor $h_i/(h_i+\lambda)$).
+      - *Why does L1 give zeros?* Three views. Geometry: the diamond's corners. Subgradient: the pull stays at $\lambda$ near 0, so $|w_i^*|\leq\lambda/H_{ii}$ gives exactly 0. Prior: the Laplace density has a sharp peak at 0.
+      - *When is a penalty required, not optional?* When $p>N$ or features are collinear, and for separable logistic regression.
+      - *What does input noise do?* For a linear model it is exactly ridge with $\lambda=s^2$ (mean-loss form). In general it is a Tikhonov gradient penalty.
+      - *Label smoothing's optimal logits?* The gap is $\log\frac{1-\varepsilon+\varepsilon/K}{\varepsilon/K}$, which is finite.
+      - *SGD vs Adam?* Under SGD, L2 and decay are equivalent with $\lambda'=\lambda/\eta$. Under Adam they are not, which is why AdamW exists.
+      - *How should λ change with N?* For a fixed prior and a mean loss, as $1/N$.
+    source: Goodfellow DL §7.1–7.3, §7.5.1; ESL §3.4.1 (standardising inputs), §3.4.3; Loshchilov & Hutter 2019 §2
+
+  - title: Key results
+    body: |
+      $$\begin{aligned}\text{L2 step: } w&\leftarrow(1-\eta\lambda)w-\eta\nabla J\\ \text{L2 optimum: } \tilde w&=(H+\lambda I)^{-1}Hw^*\end{aligned}$$
+
+      - Along Hessian eigenvector $q_i$: keep $\frac{h_i}{h_i+\lambda}$. Ridge on the data's SVD: $\frac{d_j^2}{d_j^2+\lambda}$.
+      - L1 with diagonal $H$: $w_i=\mathrm{sign}(w_i^*)\max(|w_i^*|-\lambda/H_{ii},0)$.
+      - MAP: Gaussian prior gives $\lambda=\sigma^2/\tau^2$; Laplace prior gives $\lambda=2\sigma^2/b$ (objective $\sum$ residual² + penalty).
+      - Input noise of variance $s^2$ on a linear model adds exactly $s^2\|w\|^2$ to the squared error.
+      - Label smoothing: $\mathrm{CE}(q,p)=(1-\varepsilon)\mathrm{CE}(y,p)+\varepsilon\mathrm{CE}(u,p)$. Logit gap $\log\frac{1-\varepsilon+\varepsilon/K}{\varepsilon/K}$, which is 4.51 at $K=10$, $\varepsilon=0.1$.
+      - SGD: decay $\lambda$ equals L2 $\lambda'=\lambda/\eta$. Not equivalent under Adam.
+      - Mean loss and fixed prior: $\lambda\propto1/N$.
+    source: Goodfellow DL §7.1, §7.5.1; ESL §3.4; Loshchilov & Hutter 2019 Prop. 1; Murphy PML1 §11.3.1
+
+quiz:
+  - id: q1
+    prompt: |
+      Quadratic loss with $H=I$ and unpenalized minimum $w^*=(3,\,0.5)$. Penalty strength $\lambda=1$, with $\Omega=\|w\|_1$ for L1 and $\Omega=\tfrac12\|w\|_2^2$ for L2. What are the two solutions?
+    correct: 'L1: $(2,\,0)$; L2: $(1.5,\,0.25)$'
+    wrong:
+      - 'L1: $(2.5,\,0)$; L2: $(1.5,\,0.25)$'
+      - 'L1: $(2,\,-0.5)$; L2: $(1.5,\,0.25)$'
+      - 'L1: $(1.5,\,0.25)$; L2: $(2,\,0)$'
+    explanation: |
+      L1 soft-thresholds at $\lambda/H_{ii}=1$: $3\to2$, and $|0.5|\leq1$ becomes exactly 0. L2 scales by $H_{ii}/(H_{ii}+\lambda)=\tfrac12$. The $(2,-0.5)$ option subtracts the threshold straight through zero. The soft-threshold stops at 0, because past 0 the subgradient condition can't hold.
+    source: Goodfellow DL §7.1.2 (eq. 7.23); ESL §3.4 (Table 3.4)
+
+  - id: q2
+    prompt: |
+      Near its minimum, a loss has Hessian eigenvalues 10 and 0.1. With an L2 penalty $\tfrac{\lambda}{2}\|w\|^2$, $\lambda=1$, what fraction of $w^*$'s component survives along each eigenvector?
+    correct: 0.909 and 0.091
+    wrong:
+      - 0.091 and 0.909
+      - 0.5 and 0.5
+      - 0.909 and exactly 0
+    explanation: |
+      The factor is $h_i/(h_i+\lambda)$: $10/11=0.909$ and $0.1/1.1=0.091$. Flat directions are shrunk most, because the loss barely resists. "0.5 and 0.5" would hold only if both eigenvalues equalled $\lambda$. L2 never sets a component exactly to zero.
+    source: Goodfellow DL §7.1.1 (eq. 7.13)
+
+  - id: q3
+    prompt: |
+      You train with Adam and add an L2 term $\tfrac{\lambda'}{2}\|w\|^2$ to the loss, instead of using decoupled weight decay. Which weights end up regularized *least*?
+    correct: Those with large historical gradient magnitudes
+    wrong:
+      - Those with small historical gradient magnitudes
+      - None of them, since every weight gets the same decay
+      - The largest weights, since the decay term grows with $w$
+    explanation: |
+      The L2 gradient $\lambda'w$ is divided by $\sqrt{\hat v}+\epsilon$ together with the loss gradient. Coordinates with large $\hat v_i$ (big past gradients) receive a proportionally smaller pull toward zero. AdamW applies $\lambda\theta$ outside that scaling, so all weights decay at the same rate.
+    source: Loshchilov & Hutter 2019 §2 (Prop. 2, Alg. 2)
+
+  - id: q4
+    prompt: |
+      Linear regression with Gaussian noise of variance $\sigma^2$, objective $\sum_i(\text{residual}_i)^2+\text{penalty}$. Which statement is **false**?
+    correct: Under a Laplace prior, the posterior mean has exact zeros
+    wrong:
+      - Under a Gaussian prior, ridge is both posterior mode and mean
+      - Under a Laplace prior, the lasso is the posterior mode
+      - Ridge with $\lambda=\sigma^2/\tau^2$ is MAP for the prior $\mathcal N(0,\tau^2I)$
+    explanation: |
+      Only the posterior *mode* (MAP) of the Laplace model is sparse. The posterior mean averages over a continuous posterior and is almost surely nonzero. With a Gaussian prior and likelihood the posterior is Gaussian, so mode = mean. The $\lambda=\sigma^2/\tau^2$ mapping comes from multiplying the negative log posterior by $2\sigma^2$.
+    source: ESL §3.4.3; Murphy PML1 §11.3.1
+
+  - id: q5
+    prompt: |
+      Label smoothing with $\varepsilon=0.1$ over $K=10$ classes, target $q=(1-\varepsilon)y+\varepsilon/K$. What is the true class's target probability, and what is the cross-entropy-optimal gap between its logit and any other class's?
+    correct: '0.91; gap $\ln 91\approx4.51$'
+    wrong:
+      - '0.90; gap $\ln 9\approx2.20$'
+      - '0.91; the gap still grows without bound'
+      - '0.91; gap $\ln 10\approx2.30$'
+    explanation: |
+      True class: $0.9+0.01=0.91$; others $0.01$. CE is minimised at $\mathrm{softmax}(z)=q$, so $z_{\text{true}}-z_{\text{other}}=\ln(0.91/0.01)=\ln91\approx4.51$. Unbounded logits are the hard-label behaviour that smoothing removes. $\ln 9$ treats the whole $0.1$ as one competing class.
+    source: Goodfellow DL §7.5.1; Müller et al. 2019 §1.1
+
+  - id: q6
+    prompt: |
+      With an orthonormal design, three penalized estimators are plotted as functions of the unpenalized estimate $w^*$:
+
+      ![Three estimators labelled A, B and C.](fund.regularization/shrinkage-abc)
+
+      Which curve is the lasso (L1)?
+    correct: C
+    wrong:
+      - A
+      - B
+      - None, as the lasso has no closed form here
+    explanation: |
+      C is the soft-threshold: zero on $|w^*|\leq\lambda$, then parallel to the identity line, shifted down by $\lambda$. A keeps or kills (hard threshold, best subset / L0). B scales every estimate by $1/(1+\lambda)$ (ridge). With orthonormal columns the lasso does have the closed form $\mathrm{sign}(w^*)(|w^*|-\lambda)_+$.
+    source: ESL §3.4 (Table 3.4)
+
+  - id: q7
+    prompt: |
+      Least squares with $N=50$ examples and $p=200$ features. What does adding $\lambda\|w\|^2$ with $\lambda>0$ do?
+    correct: Makes the solution unique, as $X^\top X+\lambda I$ is invertible
+    wrong:
+      - Nothing, because 150 directions remain fully unconstrained
+      - Makes it unique only if $\lambda$ beats the top eigenvalue
+      - Selects exactly 50 of the 200 features, one per example
+    explanation: |
+      $X^\top X$ has rank at most 50, so 150 eigenvalues are zero. Adding $\lambda I$ lifts every eigenvalue to at least $\lambda>0$, so the system has one solution. In the null-space directions the penalty alone decides, and it picks zero. Any $\lambda>0$ suffices. Exact zeros in coefficients come from L1, not L2.
+    source: Goodfellow DL §7.3
+
+  - id: q8
+    prompt: |
+      Unregularized logistic regression is trained by gradient descent on linearly separable data. What happens to $\|w\|$?
+    correct: It grows without bound, as scaling $w$ up raises the likelihood
+    wrong:
+      - It converges to a finite $w$ where the gradient is zero
+      - It shrinks toward zero, since the classes are already separated
+      - It stays at its initial norm, since only the direction is learned
+    explanation: |
+      If $w$ separates the data, every margin $y_iw^\top x_i$ is positive. Scaling by $c>1$ pushes every correct-class probability toward 1, so there's no finite maximiser and the gradient never reaches zero. An L2 penalty makes the objective strictly convex and coercive, giving a finite optimum.
+    source: Goodfellow DL §7.3
+
+  - id: q9
+    prompt: |
+      SGD with learning rate $\eta=0.1$ uses decoupled weight decay $w\leftarrow(1-\lambda)w-\eta\nabla f$ with $\lambda=10^{-3}$. Which L2 coefficient $\lambda'$ in $f+\tfrac{\lambda'}{2}\|w\|^2$ produces identical steps?
+    correct: '$10^{-2}$'
+    wrong:
+      - '$10^{-3}$'
+      - '$10^{-4}$'
+      - '$5\times10^{-3}$'
+    explanation: |
+      The L2 step is $(1-\eta\lambda')w-\eta\nabla f$, so we need $\eta\lambda'=\lambda$, i.e. $\lambda'=\lambda/\eta=10^{-3}/0.1=10^{-2}$. $10^{-4}$ multiplies by $\eta$ instead of dividing. The two are equal only when $\eta=1$. This coupling is why tuning L2 and LR together is awkward.
+    source: Loshchilov & Hutter 2019 §2 (Prop. 1)
+
+  - id: q10
+    prompt: |
+      A dataset contains two identical copies of one useful feature. How do the lasso and the elastic net treat the pair?
+    correct: The lasso's split is arbitrary; the elastic net splits evenly
+    wrong:
+      - Both split the weight evenly between the two copies
+      - The lasso splits evenly; the elastic net zeroes one copy
+      - Both drop both copies, since they carry no unique signal
+    explanation: |
+      The loss sees only $w_1+w_2$, and $|w_1|+|w_2|$ is constant over same-sign splits, so the lasso has a whole segment of optima. The solver returns one of them. The elastic net's $w_1^2+w_2^2$ term is strictly convex and smallest at $w_1=w_2$. This is the grouping effect.
+    source: ESL §3.4.3 (eq. 3.54)
+
+  - id: q11
+    prompt: |
+      A linear model $\hat y=w^\top x$ is trained on mean squared error, with fresh input noise $\xi\sim\mathcal N(0,s^2I)$, $s=0.1$, added each time an example is seen. In expectation the objective equals the clean MSE plus:
+    correct: '$0.01\,\|w\|_2^2$'
+    wrong:
+      - '$0.1\,\|w\|_2^2$'
+      - '$0.01\,\|w\|_1$'
+      - '$0$, since zero-mean noise averages out'
+    explanation: |
+      $\mathbb{E}(w^\top(x+\xi)-t)^2=(w^\top x-t)^2+\mathbb{E}(w^\top\xi)^2$, and the cross term vanishes because $\mathbb{E}\xi=0$. $\mathbb{E}(w^\top\xi)^2=s^2\|w\|^2=0.01\|w\|^2$. The noise averages out of the mean prediction but not out of the *squared* error. $0.1$ uses $s$ instead of $s^2$.
+    source: Bishop PRML §5.5.5 (eq. 5.135); Goodfellow DL §7.5
+
+  - id: q12
+    prompt: |
+      You fit a MAP model with a fixed Gaussian prior, writing the objective as $\frac1N\sum_i\ell_i+\lambda\|w\|^2$. The $\lambda$ that matched the prior at $N=10{,}000$ was $\lambda_0$. To keep the same prior at $N=40{,}000$, set $\lambda$ to:
+    correct: '$\lambda_0/4$'
+    wrong:
+      - '$\lambda_0$'
+      - '$4\lambda_0$'
+      - '$\lambda_0/2$'
+    explanation: |
+      The prior contributes a fixed $\frac{1}{2\tau^2}\|w\|^2$ against the *summed* NLL. Dividing everything by $N$ makes the mean-form coefficient $\propto1/N$, so quadrupling $N$ divides it by 4. Keeping $\lambda_0$ means the penalty keeps pace with the data, which is a prior that strengthens as $N$ grows.
+    source: Murphy PML1 §4.5.3, §11.3.1
+
+  - id: q13
+    prompt: |
+      A weight vector $w$ feeds straight into a BatchNorm layer, so the network's output is unchanged if $w$ is multiplied by any $c>0$. What does weight decay on $w$ mainly do?
+    correct: Shrinks $\|w\|$, which raises the effective learning rate
+    wrong:
+      - Restricts the function class, just as ridge does
+      - Nothing, because its gradient on $w$ is zero
+      - Shrinks $\|w\|$, which lowers the effective learning rate
+    explanation: |
+      Scale invariance $f(cw)=f(w)$ means the penalty can shrink $\|w\|$ without changing any prediction, so the function class isn't restricted. Differentiating the identity gives $\nabla f(cw)=\nabla f(w)/c$: smaller $\|w\|$ means larger gradients relative to $w$, and so larger relative steps. The decay gradient $\lambda w$ itself is not zero.
+    source: Ba et al. 2016 §5.1, §5.2.2; Goyal et al. 2017 §5.1
+
+  - id: q14
+    prompt: |
+      Which statement about penalties $\sum_j|w_j|^q$ is **false**?
+    correct: With $q=1.5$ it zeroes coefficients exactly, like the lasso
+    wrong:
+      - $q=1$ is the smallest $q$ whose constraint region is convex
+      - For $q<1$ the penalty gives exact zeros but a non-convex problem
+      - The elastic net has corners on the axes yet is strictly convex
+    explanation: |
+      For $q>1$, $|w|^q$ is differentiable at 0 with zero slope there, so there is no constant pull to hold coefficients exactly at zero. Only $q\leq1$ (and the elastic net, which keeps an L1 part) produce exact zeros. The other three statements are ESL's.
+    source: ESL §3.4.3 (Figs. 3.12–3.13)
+
+cards:
+  - id: f1
+    front: Write the gradient step with an L2 penalty $\tfrac{\lambda}{2}\|w\|^2$ and explain the name "weight decay".
+    back: |
+      $$w\leftarrow(1-\eta\lambda)\,w-\eta\nabla J(w)$$
+
+      Each step multiplies the weights by $1-\eta\lambda<1$ (they decay), then takes the ordinary gradient step.
+    source: Goodfellow DL §7.1.1 (eq. 7.5)
+
+  - id: f2
+    front: L2-regularized optimum under a quadratic approximation, and its eigenbasis form.
+    back: |
+      $$\tilde w=(H+\lambda I)^{-1}Hw^*$$
+
+      Along eigenvector $q_i$ of $H$ (eigenvalue $h_i$): $q_i^\top\tilde w=\frac{h_i}{h_i+\lambda}q_i^\top w^*$. Low-curvature directions are shrunk most. For ridge, $h_i=d_j^2$ from the SVD of $X$.
+    source: Goodfellow DL §7.1.1 (eqs. 7.10–7.13); ESL §3.4.1
+
+  - id: f3
+    front: L1 solution under a diagonal-Hessian quadratic approximation (soft-thresholding).
+    back: |
+      $$w_i=\mathrm{sign}(w_i^*)\max\Big(|w_i^*|-\frac{\lambda}{H_{ii}},0\Big)$$
+
+      Coefficients with $|w_i^*|\leq\lambda/H_{ii}$ become exactly 0. The rest move toward 0 by $\lambda/H_{ii}$.
+    source: Goodfellow DL §7.1.2 (eq. 7.23)
+
+  - id: f4
+    front: Which priors give ridge and lasso, and what is λ in terms of the noise and prior scales?
+    back: |
+      For the objective $\sum_i(\text{residual})^2+\text{penalty}$ with noise variance $\sigma^2$:
+      - Gaussian $\mathcal N(0,\tau^2)$ gives ridge with $\lambda=\sigma^2/\tau^2$. The mode equals the mean.
+      - Laplace with scale $b$ gives the lasso with $\lambda=2\sigma^2/b$. Only the mode is sparse.
+    source: Murphy PML1 §11.3.1; ESL §3.4.3
+
+  - id: f5
+    front: Label smoothing with mixture weight $\varepsilon$ over $K$ classes. Give the loss decomposition and the optimal logit gap.
+    back: |
+      $$\begin{aligned}\mathrm{CE}(q,p)&=(1-\varepsilon)\mathrm{CE}(y,p)\\&\quad+\varepsilon\,\mathrm{CE}(u,p)\end{aligned}$$
+
+      Gap $=\log\frac{1-\varepsilon+\varepsilon/K}{\varepsilon/K}$, which is $\ln91\approx4.51$ for $K=10$, $\varepsilon=0.1$. This uses $q=(1-\varepsilon)y+\varepsilon/K$; Goodfellow et al. use $\varepsilon/(K-1)$ on the wrong classes.
+    source: Goodfellow DL §7.5.1; Müller et al. 2019 §1.1
+
+  - id: f6
+    front: When are L2 regularization and decoupled weight decay equivalent, and with what constants?
+    back: |
+      For plain SGD: decay $w\leftarrow(1-\lambda)w-\eta\nabla f$ equals an L2 term $\tfrac{\lambda'}2\|w\|^2$ with $\lambda'=\lambda/\eta$.
+
+      For adaptive methods (Adam) no $\lambda'$ works. The L2 gradient gets rescaled by $1/(\sqrt{\hat v}+\epsilon)$, so high-gradient weights are regularized less.
+    source: Loshchilov & Hutter 2019 §2 (Props. 1–2)
+
+  - id: f11
+    front: What penalty does Gaussian input noise of variance $s^2$ add to a linear least-squares model?
+    back: |
+      Exactly $s^2\|w\|^2$:
+
+      $$\mathbb{E}_\xi(w^\top(x+\xi)-t)^2=(w^\top x-t)^2+s^2\|w\|^2.$$
+
+      For a general model and small noise it is approximately a Tikhonov penalty $\propto\int\|\nabla_x y\|^2p(x)\,dx$.
+    source: Bishop PRML §5.5.5 (eqs. 5.131–5.135)
+
+  - id: f7
+    type: open
+    front: Why does L1 regularization produce sparse solutions? Give three views.
+    back: |
+      1. **Subgradient.** At $w_i=0$, $|w_i|$ has subdifferential $[-1,1]$. With a diagonal Hessian the optimum is 0 whenever $|w_i^*|\leq\lambda/H_{ii}$. The L1 pull has constant size $\lambda$ right down to 0, while L2's pull $\lambda w_i$ fades, so L2 only scales by $H_{ii}/(H_{ii}+\lambda)$.
+      2. **Geometry.** In the constrained form $\|w\|_1\leq t$, the region is a cross-polytope with corners and low-dimensional faces on the axes. Elliptical loss contours generically touch it first at a corner or face, where some coordinates are zero. The L2 ball is smooth, so the touching point is generic.
+      3. **Prior.** L1 is MAP under a Laplace prior, whose density has a sharp peak at 0. That makes 0 a likely *mode*. The posterior *mean* is not sparse.
+
+      Then add the caveats: the lasso is arbitrary among correlated features (use the elastic net), it needs standardised inputs, and $q=1$ is the smallest convex member of the $\ell_q$ family.
+    source: Goodfellow DL §7.1.2, §7.2; ESL §3.4.3
+
+  - id: f8
+    type: open
+    front: Explain to an interviewer why "L2 regularization" and "weight decay" differ under Adam, and what AdamW changes.
+    back: |
+      - **SGD.** Adding $\tfrac{\lambda'}2\|w\|^2$ gives $w\leftarrow(1-\eta\lambda')w-\eta\nabla f$, which is decoupled decay with $\lambda=\eta\lambda'$. They're the same method, but the best $\lambda'$ is tied to the LR.
+      - **Adam with L2.** The regularizer's gradient $\lambda'w$ is added to $g$ before the moment estimates, so it gets divided by $\sqrt{\hat v}+\epsilon$. Weights with large gradient history get a weaker pull toward zero, which is the opposite of uniform shrinkage. Loshchilov & Hutter's Prop. 2 shows that no L2 coefficient reproduces decoupled decay when the preconditioner isn't a multiple of $I$.
+      - **AdamW.** Compute the Adam step from the loss gradient alone, then subtract $\eta_t\lambda\theta$ separately. Every weight decays at the same rate, and the optimal $\lambda$ becomes much less coupled to the LR.
+      - **Evidence.** Loshchilov & Hutter report about 15% relative test-error improvement over Adam+L2 on their image benchmarks (CIFAR-10, ImageNet32×32). That's an empirical, setting-specific result.
+    source: Loshchilov & Hutter 2019 §1, §2 (Props. 1–2, Alg. 2)
+
+  - id: f9
+    type: open
+    front: Derive what L2 regularization does to the optimum of a quadratic loss, and interpret it for linear regression.
+    back: |
+      1. Expand around $w^*$: $\hat J=J(w^*)+\tfrac12(w-w^*)^\top H(w-w^*)$. There is no linear term because $\nabla J(w^*)=0$.
+      2. Add $\tfrac\lambda2\|w\|^2$ and set the gradient to zero: $H(\tilde w-w^*)+\lambda\tilde w=0$, so $\tilde w=(H+\lambda I)^{-1}Hw^*$.
+      3. Diagonalise $H=Q\Lambda Q^\top$: $\tilde w=Q(\Lambda+\lambda I)^{-1}\Lambda Q^\top w^*$. Each eigen-component is scaled by $h_i/(h_i+\lambda)$.
+      4. **Interpretation.** Directions where the loss is sharply curved are determined by the data and are kept. Flat directions are poorly determined (high variance) and are shrunk toward 0.
+      5. **Linear regression.** $H=X^\top X=VD^2V^\top$, so ridge shrinks the $j$-th principal-component coefficient by $d_j^2/(d_j^2+\lambda)$. Low-variance input directions, where estimates are noisiest, are shrunk most. It is a soft version of principal-components regression.
+    source: Goodfellow DL §7.1.1; ESL §3.4.1 (eq. 3.47)
+
+  - id: f10
+    type: open
+    front: Why do practitioners usually exclude biases and normalization parameters from weight decay?
+    back: |
+      - **Biases.** Each controls a single variable, so it needs little data to fit and adds little variance. Penalizing biases pulls outputs toward zero mean and can cause underfitting without buying much generalization.
+      - **Normalization gains/shifts** ($\gamma,\beta$). It is common practice not to decay them (Goyal et al. 2017 follow it). They are few, and they set the scale and offset that the normalization deliberately removed.
+      - **Weights feeding a normalization layer.** These are scale-invariant: $f(cw)=f(w)$. The penalty doesn't restrict the function. It only shrinks $\|w\|$, and since $\nabla f(cw)=\nabla f(w)/c$, that raises the effective step size. Decay there works as an optimisation knob rather than a capacity control (details in fund.batchnorm).
+
+      The upshot: only the "real" weight matrices get decayed. Many modern recipes also exclude embeddings, but that's a recipe choice; check the paper.
+    source: Goodfellow DL §7.1; Goyal et al. 2017 §5.1; Ba et al. 2016 §5.1, §5.2.2
+
+reading:
+  - title: "Goodfellow, Bengio & Courville, Deep Learning, ch. 7 (§7.1–7.5, §7.7–7.10)"
+    url: https://www.deeplearningbook.org/contents/regularization.html
+    kind: book
+    note: The eigenbasis analysis of L2, the L1 soft-threshold, the constraint view, ill-posed problems, augmentation, noise and label smoothing.
+  - title: "Hastie, Tibshirani & Friedman, The Elements of Statistical Learning, §3.4"
+    url: https://hastie.su.domains/ElemStatLearn/
+    kind: book
+    note: Ridge in the SVD basis, Table 3.4's three shrinkage operators, the ℓq family and the elastic net.
+  - title: "Loshchilov & Hutter 2019, Decoupled Weight Decay Regularization"
+    url: https://arxiv.org/abs/1711.05101
+    kind: paper
+    note: §2 has Props. 1–3 (L2 vs decay for SGD and adaptive methods) and the AdamW algorithm.
+  - title: "Müller, Kornblith & Hinton 2019, When Does Label Smoothing Help?"
+    url: https://arxiv.org/abs/1906.02629
+    kind: paper
+    note: Label smoothing's effects on representations, calibration and distillation.
+  - title: "Dive into Deep Learning, §3.7 Weight Decay"
+    url: https://d2l.ai/chapter_linear-regression/weight-decay.html
+    kind: book
+    note: A short from-scratch implementation for experimenting with λ.

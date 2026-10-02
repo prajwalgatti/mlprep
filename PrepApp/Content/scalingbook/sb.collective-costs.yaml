@@ -1,0 +1,386 @@
+id: sb.collective-costs
+area: scalingbook
+title: "Collectives I: AllGather, ReduceScatter and AllReduce Costs"
+summary: Derives how long the core collectives take on a TPU ring. The surprising result is that an AllGather's time depends only on bytes and link bandwidth, not on the number of chips. Also covers when latency takes over, how multiple mesh axes add bandwidth, and what a missing wraparound costs.
+order: 70
+level: core
+tags: [scaling-book, collectives, communication, tpu]
+prereqs: [sb.sharded-matmul]
+
+explainer:
+  - title: The setup
+    source: Scaling Book ch. 3 (Sharding) §"Case 2", §"Case 3"
+    body: |
+      The last lesson said which collective each sharded matmul needs. To decide whether a sharding is fast, we need their costs. The model is one mesh axis of $N$ chips connected in a ring (a torus axis with wraparound, lesson 40).
+
+      Notation, following the book:
+
+      - $V$: total bytes of the **full** array being gathered or reduced, not one shard.
+      - $W_1$: one-way bandwidth of one link (per direction), e.g. $4.5\times10^{10}$ B/s on v5e.
+      - $W = 2W_1$: the **bidirectional** bandwidth, which the book's formulas use (written $W_\text{ici}$).
+      - $T_\text{min}$: fixed latency per hop, about 1 µs.
+
+      Each chip starts with one shard of $V/N$ bytes. In an **AllGather** every chip must end with all $N$ shards. In a **ReduceScatter** every chip starts with a full-size partial sum and must end with one fully summed shard. An **AllReduce** ends with the full sum everywhere.
+
+      **The key accounting fact:** in an AllGather each chip must **receive** $(N-1)/N$ of $V$, everything except its own shard. Its links bound how fast that can happen. On a ring, a chip has two links (left and right), each delivering up to $W_1$ inward.
+  - title: A one-direction ring AllGather
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"; Scaling Book ch. 3, Question 10
+    body: |
+      The simplest algorithm passes shards around the ring in one direction.
+
+      - **Step 1:** every chip sends its own shard to its right-hand neighbour.
+      - **Each later step:** every chip forwards the shard it just received.
+      - After $N-1$ steps every shard has visited every chip.
+
+      All links work in parallel, each carrying one shard ($V/N$ bytes) per step, so
+
+      $$\begin{aligned} T &= (N-1)\cdot\frac{V/N}{W_1} \\ &= \frac{N-1}{N}\cdot\frac{V}{W_1} \;\approx\; \frac{V}{W_1}. \end{aligned}$$
+
+      ![Who holds which shard after each step, for 4 chips: one-way needs 3 steps, both ways 2](sb.collective-costs/ring-allgather)
+
+      This matches the accounting: each chip receives $(N-1)V/N$ bytes, through one inbound link of speed $W_1$. The ring wastes nothing, but it uses only one direction of each link.
+  - title: Both directions, and why N drops out
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    body: |
+      Use both directions: each chip sends its shard both left and right, and forwards in both directions. After $\lfloor N/2\rfloor$ steps every shard has reached every chip. Each step still moves $V/N$ bytes per link per direction, so
+
+      $$\begin{aligned} T &\approx \frac{N}{2}\cdot\frac{V/N}{W_1} \\ &= \frac{V}{2W_1} = \frac{V}{W}. \end{aligned}$$
+
+      **The striking part: $N$ cancels.** A bandwidth-bound AllGather of $V$ bytes takes the same time on 4 chips as on 400. More chips mean more hops, but also more links working in parallel, and the two effects cancel exactly. The torus being only locally connected costs nothing here; only per-link bandwidth matters.
+
+      The accounting agrees for large $N$: each chip receives $\approx V$ bytes through 2 inbound links of $W_1$ each. For small $N$ this simple algorithm sits slightly above the bound, because it sends the shard opposite each chip both ways round; the book's $V/W$ is this algorithm's time.
+
+      **Measured.** On a TPU v5e $8\times16$ slice (gathering along the 16-long axis, which has wraparound) the book measures about 95% of the 4.5e10 B/s link peak. That peak is reached at arrays of about 10 MB, i.e. about 625 kB per chip.
+
+      **Worked example.** AllGather a 1 GB array along a TPU v5p axis with wraparound ($W = 1.8\times10^{11}$ B/s): $10^9/1.8\times10^{11} \approx 5.6$ ms, for any axis length.
+  - title: When latency takes over
+    source: Scaling Book ch. 3 (Sharding) §"Case 2" (ICI latency)
+    body: |
+      Each hop also costs a fixed $T_\text{min} \approx 1$ µs, however few bytes it carries. Per hop, the time is the larger of the latency and the transfer:
+
+      $$T_\text{hop} = \max\Big(T_\text{min},\ \frac{V/N}{W_1}\Big).$$
+
+      With $N/2$ hops in the bidirectional ring:
+
+      $$T = \max\Big(\frac{T_\text{min}\,N}{2},\ \frac{V}{W}\Big).$$
+
+      The transfer term wins when each hop carries more than $W_1 T_\text{min}$ bytes: on a v5e, $4.5\times10^{10}\times10^{-6} = 45$ kB per shard. Below that we are **latency-bound**, and now the time *does* grow with $N$.
+
+      ![Modelled (not measured) bidirectional AllGather time on v5e vs total bytes: a latency floor of N/2 µs, then V/W regardless of N](sb.collective-costs/latency-vs-bandwidth)
+
+      **Where it bites.** Training moves weights and gradients of many MB: bandwidth-bound. Inference, especially decoding, moves activations of a few tokens: often latency-bound. For example, bf16$[16, 4096]$ is 128 kB in total. Gathered over 8 chips, that is a 16 kB shard, needing 0.36 µs of transfer per hop against 1 µs of latency. The AllGather takes about 4 hops × 1 µs ≈ 4 µs, not the 1.5 µs the bandwidth term predicts.
+  - title: Several axes, and arrays sharded elsewhere
+    source: Scaling Book ch. 3 (Sharding) §"Case 2", Question 2
+    body: |
+      **Gathering over several mesh axes.** $\text{AllGather}_{XY}$ on a 2D (or 3D) torus can run rings along each axis at once. Each chip then has links on every axis, so the bandwidth multiplies by the number of axes:
+
+      $$T = \max\Big(\frac{T_\text{min}\sum_i |X_i|}{2},\ \frac{V}{W\cdot N_\text{axes}}\Big).$$
+
+      $\sum_i |X_i|/2$ is the longest path through the mesh.
+
+      **Gathering an array that is also sharded on another axis.** In $\text{AllGather}_X([B_X, D_Y])$, each $Y$-slice is an independent gather of only $V/|Y|$ bytes, running in parallel on separate links. So the time is $V/(|Y|\,W)$.
+
+      **Worked example** (book Q2, TPU v4p $4\times4\times4$, full cube so all axes wrap, $W = 9\times10^{10}$ B/s; bf16, $B = 1024$, $D = 4096$, so $V = 2BD \approx 8.4$ MB):
+
+      - $\text{AllGather}_X([B_X, D_Y])$: $V/(4W) \approx 23$ µs.
+      - $\text{AllGather}_{XY}([B_X, D_Y])$: all of $V$ over 2 axes, $V/(2W) \approx 47$ µs.
+      - Latency floor: about $(4+4)/2 = 4$ hops, ≈ 4 µs, far below both.
+
+      **A free speed-up.** The array is replicated across the unused $Z$ axis. Re-label it as $[B_{XZ}, D_Y]$ (each chip just discards part of what it holds, no communication), then gather over $X$ and $Z$: 2 axes instead of 1, so ≈ 12 µs. The same trick cuts $\text{AllGather}_{XY}$ from 47 µs to $V/(3W) \approx 31$ µs by gathering over all three axes. The general lesson: shard over as many axes as possible so collectives can use more links.
+  - title: ReduceScatter and AllReduce
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    body: |
+      **ReduceScatter** is an AllGather run in reverse. Pass pieces around the same ring, but instead of keeping each arriving piece, **add** it to the running sum for that shard. After $N-1$ one-way steps (or $N/2$ both-way steps) each chip owns one fully summed shard. The per-link traffic is identical, so
+
+      $$T_\text{RS} \approx T_\text{AG} \approx \frac{V}{W}.$$
+
+      The additions are cheap next to the transfers, and the book leaves them out of the cost.
+
+      **AllReduce** is a ReduceScatter followed by an AllGather (lesson 60), so
+
+      $$T_\text{AR} \approx \frac{2V}{W}.$$
+
+      Here $V$ is the size of the full array in both phases.
+
+      The book also quotes the exact one-way form, $T = \frac{V}{W_1}\cdot\frac{N-1}{N}$, which tends to $V/W$ once both directions are used. All of these assume a full ring (wraparound) and arrays large enough to be bandwidth-bound.
+
+      **Worked example.** Data-parallel training AllReduces the gradients. For a 1B-parameter model in bf16 ($V = 2\times10^9$ bytes) along a TPU v5p ring ($W = 1.8\times10^{11}$): $2\cdot2\times10^9/1.8\times10^{11} \approx 22$ ms per step. Lesson 130 asks whether that hides under compute.
+
+      **Worked example** (book Q2, continued). $\text{AllReduce}_Z([B_X, D_Y]\{U_Z\})$ on the v4p cube: each chip's array is $V/16 \approx 0.52$ MB, so $T \approx 2\times0.52\times10^6/9\times10^{10} \approx 12$ µs.
+  - title: "What a missing wraparound costs"
+    source: Scaling Book ch. 3 (Sharding) §"Case 2" (Pop Quiz 2); Scaling Book ch. 2 §"TPU Networking"
+    body: |
+      On a slice without wraparound, an axis is a line, not a ring. Return to the accounting: each chip must receive $(N-1)/N$ of $V$. A chip at the **end** of the line has only **one** link, so
+
+      $$T \approx \frac{N-1}{N}\cdot\frac{V}{W_1}.$$
+
+      Compare that with the book's ring time $V/(2W_1)$: the line is $1.5\times$ slower for $N = 4$. Against the ring's tight lower bound, $(N-1)V/(2NW_1)$, it is exactly $2\times$ for every $N$, and both comparisons approach $2\times$ for long axes. That is the "about double" of lesson 40.
+
+      **Worked example** (book pop quiz). $\text{AllGather}_Y([E_Y, F])$ on a TPU v5e with mesh $\{X{:}\,8, Y{:}\,4\}$, $E = 2048$, $F = 8192$, bf16.
+
+      - $V = 2\cdot2048\cdot8192 \approx 33.6$ MB; each shard is 8.4 MB.
+      - With a ring: $V/W = 33.6\times10^6/9\times10^{10} \approx 373$ µs.
+      - But a v5e axis of length 4 has no wraparound. An end chip receives 3 shards through one link: $3\times8.4\times10^6/4.5\times10^{10} \approx 560$ µs.
+      - The book's profile measures 680 µs: about 80% of theoretical bandwidth.
+
+      The same gather with $E = F = 256$ has 32 kB shards, 0.7 µs per hop, so it is latency-bound: 3 hops ≈ 3 µs (8 µs measured).
+  - title: What interviewers probe
+    source: Scaling Book ch. 3 (Sharding) §"What Have We Learned?"
+    body: |
+      - *How long does an AllGather take?* $\approx V/W$ (bidirectional ring, bandwidth-bound), with $V$ the full array size.
+      - *Does it get slower on more chips?* Not when bandwidth-bound: more hops, but proportionally more links. When latency-bound, yes: $\approx N/2$ hops × 1 µs.
+      - *Where's the latency crossover?* Shards smaller than $W_1 T_\text{min}$ ≈ 45 kB (v5e).
+      - *AllReduce vs AllGather?* AllReduce = ReduceScatter + AllGather ≈ $2V/W$; ReduceScatter costs the same as AllGather.
+      - *How do you make a collective faster?* Gather over more mesh axes (bandwidth × number of axes); shard arrays over idle axes first; keep rings complete with wraparounds.
+      - *What does a missing wraparound cost?* End chips have one link: $(N-1)/N\cdot V/W_1$, up to 2× slower.
+      - *Gathering $[B_X, D_Y]$ over $X$?* Only $V/|Y|$ bytes per gather: $V/(|Y|W)$.
+  - title: Key results
+    source: Scaling Book ch. 3 (Sharding)
+    body: |
+      $$T_\text{AG} \approx T_\text{RS} \approx \frac{V}{W}, \qquad T_\text{AR} \approx \frac{2V}{W}$$
+
+      $$T = \max\Big(\frac{T_\text{min}\sum_i|X_i|}{2},\ \frac{V}{W N_\text{axes}}\Big)$$
+
+      One direction, or a line without wraparound:
+
+      $$T \approx \frac{N-1}{N}\cdot\frac{V}{W_1}$$
+
+      - $W$ = bidirectional link bandwidth = $2W_1$; $V$ = full array bytes.
+      - Bandwidth-bound time is independent of $N$; latency-bound time is ≈ $N/2$ µs.
+      - Latency-bound below ≈ 45 kB per shard on v5e ($W_1 \times 1$ µs).
+      - Gathering an array also sharded over $Y$ moves only $V/|Y|$: time $V/(|Y|W)$.
+      - Re-shard over idle axes for free before gathering to use more links.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    prompt: |
+      A 1 GB array is sharded along one TPU v5p mesh axis with wraparound (bidirectional bandwidth $1.8\times10^{11}$ B/s). Roughly how long does an AllGather take?
+    correct: About 5.6 ms
+    wrong:
+      - About 11 ms
+      - About 8.3 ms
+      - About 2.8 ms
+    explanation: |
+      Bandwidth-bound AllGather time is $V/W = 10^9/1.8\times10^{11} \approx 5.6$ ms. 11 ms uses the one-way bandwidth (a one-direction ring); 8.3 ms is what a line of 4 chips without wraparound would take, $0.75V/W_1$; 2.8 ms divides by an extra factor of 2. The axis length does not enter.
+  - id: q2
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    prompt: |
+      A large, bandwidth-bound AllGather of a fixed array runs on a ring of 4 chips. The same array is now gathered over a ring of 16 chips with the same link speed. What happens to the time?
+    correct: It stays about the same
+    wrong:
+      - It grows about 4×
+      - It shrinks about 4×
+      - It grows about 2×
+    explanation: |
+      Each chip must receive about all of $V$ through its two links whatever $N$ is, so $T \approx V/W$. There are more hops, but proportionally more links work in parallel. Only the latency floor ($\approx N/2$ µs) grows with $N$, and a large array is far above it.
+  - id: q3
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"; Scaling Book ch. 5 §"Data Parallelism"
+    prompt: |
+      Data-parallel training AllReduces the gradients of a 1B-parameter model in bf16 along a TPU v5p ring ($W = 1.8\times10^{11}$ B/s bidirectional). How long does each AllReduce take?
+    correct: About 22 ms
+    wrong:
+      - About 11 ms
+      - About 44 ms
+      - About 5.6 ms
+    explanation: |
+      $V = 2\times10^9$ bytes, and an AllReduce costs $2V/W = 4\times10^9/1.8\times10^{11} \approx 22$ ms (a ReduceScatter plus an AllGather, each ≈ 11 ms). 11 ms forgets the factor of 2; 5.6 ms treats the gradients as 1 GB.
+  - id: q4
+    source: Scaling Book ch. 3 (Sharding) §"Case 2" (ICI latency); Scaling Book ch. 7 App. C
+    prompt: |
+      A bf16 activation $[16, 4096]$ is AllGathered over a ring of 8 chips with wraparound ($4.5\times10^{10}$ B/s per link per direction, ≈ 1 µs per hop). About how long does it take?
+    correct: About 4 µs, latency-bound
+    wrong:
+      - About 1.5 µs, bandwidth-bound
+      - About 0.4 µs, one shard's transfer time
+      - About 8 µs, one hop per chip
+    explanation: |
+      $V = 2\cdot16\cdot4096 = 131$ kB, so each shard is 16 kB: 0.36 µs per hop, under the 1 µs latency. The bidirectional ring needs $8/2 = 4$ hops, so ≈ 4 µs. The bandwidth formula $V/W$ gives 1.5 µs, but the latency floor dominates; 8 hops would be a one-way ring.
+  - id: q5
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    prompt: |
+      On a TPU v4p $4\times4\times4$ cube (wraparound on all axes), how does $\text{AllGather}_{XY}$ of an array compare with $\text{AllGather}_X$ of an array of the **same total size** $V$, when bandwidth-bound?
+    correct: The XY gather is about 2× faster
+    wrong:
+      - The XY gather is about 2× slower
+      - They take the same time
+      - The XY gather is about 4× faster
+    explanation: |
+      Gathering over two mesh axes runs rings on both axes at once, doubling usable bandwidth: $T = V/(W\cdot N_\text{axes})$. The total bytes are the same, so the time halves. 4× would need four axes' worth of links.
+  - id: q6
+    source: Scaling Book ch. 3 (Sharding) §"Case 2" (Pop Quiz 2)
+    prompt: |
+      An axis of 4 chips has **no** wraparound (a line). Using the lesson's ring cost $T = V/W = V/(2W_1)$ as the baseline, roughly how much slower is a large AllGather on the line?
+    correct: About 1.5× slower
+    wrong:
+      - About 3× slower
+      - About 4× slower
+      - No slower; the same bytes cross each link
+    explanation: |
+      An end chip of the line has one inbound link and must receive 3/4 of $V$: $T \approx 0.75\,V/W_1$. Against the ring's $V/(2W_1) = 0.5\,V/W_1$, that is 1.5×. (Against the tighter ring lower bound $0.75V/(2W_1)$ it would be exactly 2×, and for long axes both comparisons approach 2×, the "about double" of lesson 40.) The same bytes do not cross each link: the end links carry more.
+  - id: q7
+    source: Scaling Book ch. 3 (Sharding), Question 2
+    prompt: |
+      On a TPU v4p $4\times4\times4$ cube ($W = 9\times10^{10}$ B/s bidirectional), how long does $\text{AllGather}_X([B_X, D_Y])$ take for $B = 1024$, $D = 4096$ in bf16?
+    correct: About 23 µs
+    wrong:
+      - About 93 µs
+      - About 47 µs
+      - About 4 µs
+    explanation: |
+      The array is $V = 2BD \approx 8.4$ MB, but it is also split over $Y$, so each gather along $X$ handles only $V/|Y| = 2.1$ MB: $2.1\times10^6/9\times10^{10} \approx 23$ µs. 93 µs gathers the whole $V$; 47 µs is the $\text{AllGather}_{XY}$ answer; 4 µs is the latency floor.
+  - id: q8
+    source: Scaling Book ch. 3 (Sharding), Question 2
+    prompt: |
+      Same cube and array: how long does $\text{AllReduce}_Z([B_X, D_Y]\{U_Z\})$ take?
+    correct: About 12 µs
+    wrong:
+      - About 6 µs
+      - About 47 µs
+      - About 187 µs
+    explanation: |
+      Each chip's array is $V/(|X||Y|) = 8.4\text{ MB}/16 \approx 0.52$ MB. An AllReduce costs twice its size over $W$: $2\times0.52\times10^6/9\times10^{10} \approx 12$ µs. 6 µs forgets the factor of 2; 187 µs uses the full unsharded array.
+  - id: q9
+    source: Scaling Book ch. 3 (Sharding), Question 2
+    prompt: |
+      In the cube above, $[B_X, D_Y]$ is replicated along $Z$. You first re-label it $[B_{XZ}, D_Y]$ and then gather over $X$ and $Z$, ending in the same state as $\text{AllGather}_X$. Why is this faster, and by how much?
+    correct: Two axes' links instead of one, about 2× faster
+    wrong:
+      - The re-label halves the bytes to gather, so about 2× faster
+      - The Z axis has twice the bandwidth of X, so about 2× faster
+      - It is not faster; re-labelling costs an extra AllToAll
+    explanation: |
+      Re-labelling is free: each chip just drops part of what it holds. The same $V/|Y|$ bytes are then gathered over two mesh axes, doubling usable bandwidth: ≈ 12 µs instead of 23 µs. All v4p axes have the same per-link bandwidth, and the total bytes gathered are unchanged.
+  - id: q10
+    source: Scaling Book ch. 3 (Sharding), Question 3
+    prompt: |
+      $\text{AllGather}_X([B_X])$ with $B = 128$ in bf16 runs on a v4p axis of 4 chips with wraparound. Roughly how long does it take?
+    correct: About 2 µs
+    wrong:
+      - About 3 ns
+      - About 4 µs
+      - About 0.5 µs
+    explanation: |
+      The whole array is 256 bytes, 64 per chip, so transfer time is negligible: latency-bound. With wraparound, a bidirectional gather over 4 chips needs 2 hops: ≈ 2 µs. 3 ns is the bandwidth term alone; 4 µs assumes 4 hops.
+  - id: q11
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    prompt: |
+      Which statement about ReduceScatter is correct?
+    correct: It moves the same bytes per link as an AllGather of the full array
+    wrong:
+      - It costs about twice an AllGather, like an AllReduce
+      - It needs only one hop, so its time is latency-bound
+      - It costs about a quarter of an AllGather, like an AllToAll
+    explanation: |
+      ReduceScatter runs the AllGather pattern in reverse, adding instead of keeping each arriving piece, so it costs ≈ $V/W$. AllReduce is RS + AG ≈ $2V/W$. A quarter is the AllToAll's cost (next lesson).
+  - id: q14
+    source: Scaling Book ch. 3 (Sharding) §"Case 2" (ICI latency)
+    prompt: |
+      A bidirectional AllGather runs over a ring of 8 TPU v5e chips with wraparound ($W_1 = 4.5\times10^{10}$ B/s per direction, ≈ 1 µs per hop). Above roughly what total array size $V$ does it stop being latency-bound?
+    correct: About 360 kB
+    wrong:
+      - About 45 kB
+      - About 720 kB
+      - About 180 kB
+    explanation: |
+      The latency floor is $8/2 = 4$ hops ≈ 4 µs; the bandwidth term is $V/W = V/(9\times10^{10})$. They cross at $V = 4\times10^{-6}\times9\times10^{10} = 360$ kB, i.e. 45 kB per shard. 45 kB is the per-shard threshold, not the total; 720 kB and 180 kB are the crossovers for 16 and 4 chips.
+  - id: q13
+    source: Scaling Book ch. 3 (Sharding) §"What Have We Learned?"
+    prompt: |
+      Which statement is **false**?
+    correct: A bandwidth-bound AllGather over 64 chips takes about 16× as long as over 4
+    wrong:
+      - Gathering over three mesh axes gives about 3× the bandwidth of one axis
+      - An AllReduce can be built from a ReduceScatter and an AllGather
+      - Below about 45 kB per shard, a v5e AllGather becomes latency-bound
+    explanation: |
+      Bandwidth-bound AllGather time is $V/W$, independent of the number of chips. The other three statements hold: $V/(W N_\text{axes})$; AR = RS + AG; and $W_1 T_\text{min} = 4.5\times10^{10}\times10^{-6} = 45$ kB.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 3 (Sharding) §"Case 2", §"Case 3"
+    front: Bandwidth-bound costs of AllGather, ReduceScatter and AllReduce on a ring?
+    back: |
+      AllGather ≈ ReduceScatter ≈ $V/W$; AllReduce ≈ $2V/W$. $V$ = full array bytes, $W$ = bidirectional link bandwidth.
+  - id: f2
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    front: One-direction ring AllGather time, exactly?
+    back: |
+      $$T = (N-1)\cdot\frac{V/N}{W_1} = \frac{N-1}{N}\cdot\frac{V}{W_1}$$
+
+      $N-1$ steps of one shard per link.
+  - id: f3
+    source: Scaling Book ch. 3 (Sharding) §"Case 2" (ICI latency)
+    front: AllGather time including per-hop latency?
+    back: |
+      $$T = \max\Big(\frac{T_\text{min}\,N}{2},\ \frac{V}{W}\Big)$$
+
+      Latency-bound when each shard is below $W_1 T_\text{min}$ (≈ 45 kB on v5e).
+  - id: f4
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    front: How do multiple mesh axes change AllGather time?
+    back: |
+      $$T = \max\Big(\frac{T_\text{min}\sum_i|X_i|}{2},\ \frac{V}{W N_\text{axes}}\Big)$$
+
+      Bandwidth multiplies by the number of axes gathered over.
+  - id: f5
+    source: Scaling Book ch. 3 (Sharding), Question 2
+    front: Cost of $\text{AllGather}_X([B_X, D_Y])$?
+    back: |
+      Each $Y$-slice gathers only $V/|Y|$ bytes, in parallel: $T \approx V/(|Y|\,W)$.
+  - id: f6
+    source: Scaling Book ch. 3 (Sharding) §"Case 2" (Pop Quiz 2)
+    front: AllGather time on an axis without wraparound?
+    back: |
+      End chips have one link and must receive $(N-1)/N$ of $V$: $T \approx \frac{N-1}{N}\cdot V/W_1$. That is 1.5× a ring for $N = 4$, approaching 2×.
+  - id: f7
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    front: Derive the time of a bidirectional ring AllGather and explain why it doesn't depend on the number of chips.
+    back: |
+      - $N$ chips, each with a $V/N$ shard; links of $W_1$ per direction.
+      - Send every shard both ways and forward each step; after $\lfloor N/2\rfloor$ steps all chips have all shards.
+      - Per step, each link carries $V/N$ per direction: $T \approx (N/2)(V/N)/W_1 = V/(2W_1) = V/W$.
+      - Check by accounting: each chip receives ≈ $V$ bytes through 2 inbound links.
+      - $N$ cancels: more hops, but proportionally more links in parallel.
+      - Caveats: latency floor $N T_\text{min}/2$ for small arrays; a missing wraparound halves inbound links at the ends.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"Case 2", Question 2
+    front: You need an AllGather to be faster. What levers do you have, and what does each buy?
+    back: |
+      - Gather over more mesh axes: bandwidth × $N_\text{axes}$.
+      - Shard the array over idle (replicated) axes first, which is free, so the gather can use those links too (v4p example: 23 → 12 µs).
+      - Keep the gather sharded on other axes where possible: $\text{AllGather}_X([B_X, D_Y])$ moves only $V/|Y|$.
+      - Use slices with wraparound, so rings use both directions (up to 2×).
+      - Shrink bytes: lower precision, or ReduceScatter instead of AllReduce when a sharded result suffices.
+      - Hide it: overlap with compute (collective matmul, next lesson).
+      - For tiny messages, cut hops (fewer chips on the axis), since latency dominates.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"Case 2" (ICI latency); Scaling Book ch. 7 App. C
+    front: Explain the latency-bound regime for collectives and why it matters more for inference than for training.
+    back: |
+      - Each hop has a fixed ≈ 1 µs cost: $T_\text{hop} = \max(T_\text{min}, (V/N)/W_1)$.
+      - If shards are below $W_1 T_\text{min}$ (≈ 45 kB on v5e), time ≈ hops × 1 µs ≈ $N/2$ µs, growing with $N$ and ignoring bandwidth.
+      - Training collectives move MB-to-GB weights and gradients: bandwidth-bound.
+      - Decode moves a few tokens' activations (e.g. bf16[16, 4096] = 128 kB total, 16 kB shards over 8 chips): latency-bound, ≈ 4 µs instead of ≈ 1.5 µs.
+      - So for inference, more model sharding can add latency per layer, even though bandwidth looks ample.
+
+reading:
+  - title: "Scaling Book ch. 3: Sharded Matrices and How to Multiply Them"
+    url: https://jax-ml.github.io/scaling-book/sharding/
+    kind: book
+    note: The AllGather animation and derivation, the latency note, the empirical v5e bandwidth plot, and Problems 2–3.
+  - title: "NCCL tests: performance measurement notes (algorithm vs bus bandwidth)"
+    url: https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md
+    kind: docs
+    note: Derives the same (N−1)/N ring factors for AllGather, ReduceScatter and AllReduce, from the GPU side.
+  - title: "Patarasuk & Yuan (2009), Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations"
+    url: https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf
+    kind: paper
+    note: Proves the ring AllReduce is bandwidth-optimal; the origin of the ReduceScatter + AllGather decomposition.
+  - title: "Scaling Book ch. 7, Appendix C: Latency bound communications"
+    url: https://jax-ml.github.io/scaling-book/inference/
+    kind: book
+    note: Applies the latency floor to inference-time collectives on activations.

@@ -1,0 +1,571 @@
+id: gen.flow-matching
+area: genmodels
+title: Flow Matching
+summary: Training a continuous normalizing flow by simulation-free regression. The continuity equation, why the marginal flow-matching loss is intractable, the conditional loss and the proof that its gradient matches, Gaussian and OT paths, sampling with ODE solvers, and how it relates to diffusion and v-prediction.
+order: 180
+level: advanced
+tags: [flow-matching, continuous-normalizing-flows, ode, diffusion, optimal-transport]
+prereqs: [gen.flows, gen.diffusion-parameterizations]
+
+explainer:
+  - title: "The problem: train a continuous flow without simulating it"
+    body: |
+      **Goal.** Transport a simple density $p_0=\mathcal N(0,I)$ to the data distribution $q$ with an ODE
+
+      $$\frac{dx}{dt}=v_\theta(x,t),\qquad t\in[0,1].$$
+
+      Sample by drawing $x_0\sim p_0$ and integrating to $t=1$. The ODE defines a **flow** $\phi_t$: $\phi_t(x)$ is where a particle starting at $x$ sits at time $t$. Pushing $p_0$ through $\phi_t$ gives a density $p_t$, and we want $p_1\approx q$. This model is a **continuous normalizing flow (CNF)** (Chen et al. 2018).
+
+      **Time convention in this lesson (Lipman, Liu).** $t=0$ is noise, $t=1$ is data, and data points are written $x_1$. DDPM, score SDEs and SD3 use the opposite direction ($t=0$ data). This is the most common source of sign errors.
+
+      **Refresher: why maximum likelihood is expensive.** A discrete flow uses the change-of-variables formula, $\log p_1(\phi(x))=\log p_0(x)-\log|\det\partial\phi/\partial x|$. For a CNF the log-determinant becomes an integral of the **divergence** $\nabla\!\cdot v=\sum_i\partial v_i/\partial x_i=\mathrm{tr}(\partial v/\partial x)$ along the trajectory (derived on the next card):
+
+      $$\log p_1(x_1)=\log p_0(x_0)-\int_0^1\nabla\!\cdot v_\theta(x_t,t)\,dt$$
+
+      Each maximum-likelihood gradient step must therefore:
+      - solve this ODE, typically with dozens to hundreds of network evaluations, and backpropagate through it;
+      - compute the trace of a $D\times D$ Jacobian. Exactly this costs $O(D^2)$, about $D$ backward passes. FFJORD uses Hutchinson's unbiased $O(D)$ estimate instead.
+
+      Simulation is sequential and hard to scale to images (Lipman §5).
+
+      **What we want instead:** pick a target velocity field $u_t(x)$ whose flow carries $p_0$ to $q$. Then **regress** $v_\theta(x,t)$ onto it at randomly sampled $(t,x)$, with no ODE solve during training. This mirrors how denoising score matching trains diffusion models. The difficulty is finding a target we can actually compute.
+    source: Lipman et al. 2023 §2, §5, App. C; Chen et al. 2018 §4 (Thm 1); Grathwohl et al. 2019 §3; Murphy PML2 §25.4.7
+
+  - title: "Refresher: the continuity equation"
+    body: |
+      How does a velocity field change a density? Start in **1-D**. Particles at position $x$ move with speed $u_t(x)$, so the mass crossing $x$ per unit time (the **flux**) is $p_t(x)u_t(x)$. Mass in an interval $[a,b]$ changes only by flux through its ends:
+
+      $$\begin{aligned}\frac{d}{dt}\int_a^bp_t\,dx&=p_tu_t\big|_a-p_tu_t\big|_b\\&=-\int_a^b\partial_x(p_tu_t)\,dx\end{aligned}$$
+
+      This holds for every interval, so the integrands agree: $\partial_tp_t+\partial_x(p_tu_t)=0$.
+
+      **In $d$ dimensions** the divergence $\nabla\!\cdot F=\sum_i\partial F_i/\partial x_i$ measures net outflow per unit volume, giving
+
+      $$\partial_tp_t+\nabla\!\cdot(p_t\,u_t)=0.$$
+
+      We say **$u_t$ generates $p_t$** when this holds with initial density $p_0$. It is a necessary and sufficient test (Lipman App. B).
+
+      **Check on an example.** A translating density $p_t(x)=p_0(x-ct)$ and $u=c$: $\partial_tp_t=-c\cdot\nabla p_0$ and $\nabla\!\cdot(p_tc)=c\cdot\nabla p_0$, which sum to zero.
+
+      **Non-uniqueness.** Add any $w_t$ with $\nabla\!\cdot(p_tw_t)=0$ (e.g. a rotation around a rotation-invariant density). The path is unchanged, so many fields generate the same $p_t$. Flow matching will pick one.
+
+      **Instantaneous change of variables.** Follow one particle $x_t$. Use the product rule $\nabla\!\cdot(pu)=u\cdot\nabla p+p\,\nabla\!\cdot u$:
+
+      $$\begin{aligned}\frac{d}{dt}\log p_t(x_t)&=\frac{\partial_tp_t+u\cdot\nabla p_t}{p_t}\\&=-\nabla\!\cdot u_t(x_t)\end{aligned}$$
+
+      Integrating this gives the likelihood formula on the previous card. The same equation, plus a diffusion term (Fokker–Planck), underlies the probability-flow ODE in gen.score-sde.
+    source: Lipman et al. 2023 App. B–C; Chen et al. 2018 App. A
+
+  - title: "The flow-matching loss, and building a target from conditional paths"
+    body: |
+      **Flow matching (FM).** Choose a **probability path** $p_t$ from $p_0=\mathcal N(0,I)$ to $p_1\approx q$, with a field $u_t$ that generates it. Then regress:
+
+      $$\mathcal L_{FM}(\theta)=\mathbb E_{t\sim U[0,1],\,x\sim p_t}\|v_\theta(x,t)-u_t(x)\|^2$$
+
+      At zero loss, $v_\theta$ generates $p_t$, so integrating it from noise gives data.
+
+      **Why it's intractable as written.** We only have samples from $q$, not its density. We don't know a path $p_t$ to sample $x$ from, and even given one, there is no closed form for a field $u_t$ generating it.
+
+      **Build the path from per-example pieces.** For each data point $x_1$, choose a simple **conditional path** $p_t(x\mid x_1)$ with:
+      - $p_0(x\mid x_1)=\mathcal N(0,I)$;
+      - $p_1(x\mid x_1)=\mathcal N(x_1,\sigma_{\min}^2I)$, concentrated at $x_1$;
+      - a known field $u_t(x\mid x_1)$ generating it.
+
+      Mix over the data:
+
+      $$p_t(x)=\int p_t(x\mid x_1)\,q(x_1)\,dx_1$$
+
+      At $t=1$ this is $q$ blurred by $\sigma_{\min}$.
+
+      ![Synthetic 1-D example: the marginal path $p_t(x)$ (shading) from N(0,1) at t = 0 to a bimodal mixture at t = 1, with trajectories of its marginal field (lines). Trajectories bend toward a mode but never cross.](gen.flow-matching/probability-path)
+
+      **The marginal field.** Define
+
+      $$u_t(x)=\int u_t(x\mid x_1)\,\frac{p_t(x\mid x_1)\,q(x_1)}{p_t(x)}\,dx_1.$$
+
+      The fraction is the posterior $p_t(x_1\mid x)$ by Bayes. So $u_t(x)=\mathbb E[u_t(x\mid x_1)\mid x_t=x]$: average the velocities of all the conditional paths passing through $x$, weighted by how likely each data point is to be the destination. The next card proves this field generates $p_t$. It is still intractable for real data (an integral over the dataset, divided by $p_t(x)$), which the card after deals with.
+    source: Lipman et al. 2023 §3, §3.1 (eqs. 5–8); Tong et al. 2024 §3.1
+
+  - title: "Theorem 1: the marginal field generates the marginal path"
+    body: |
+      **Claim.** If each $u_t(\cdot\mid x_1)$ generates $p_t(\cdot\mid x_1)$, then $u_t$ (marginal field) generates $p_t$ (marginal path), for any data distribution $q$. We assume $p_t>0$ and enough regularity to swap derivatives and integrals (Leibniz rule).
+
+      **Proof.** Differentiate the mixture and use each conditional continuity equation:
+
+      $$\begin{aligned}\partial_tp_t(x)&=\int\partial_tp_t(x\mid x_1)\,q(x_1)\,dx_1\\&=-\int\nabla\!\cdot\big(u_t(x\mid x_1)p_t(x\mid x_1)\big)q(x_1)\,dx_1\\&=-\nabla\!\cdot\!\int u_t(x\mid x_1)p_t(x\mid x_1)q(x_1)\,dx_1\\&=-\nabla\!\cdot\big(u_t(x)\,p_t(x)\big)\end{aligned}$$
+
+      The steps, in order:
+      1. Swap $\partial_t$ and $\int$.
+      2. Apply the conditional continuity equations.
+      3. Pull the divergence (in $x$) out of the integral over $x_1$.
+      4. By the definition of $u_t$, the integral is exactly $u_t(x)p_t(x)$, since the $p_t(x)$ in its denominator cancels.
+
+      This is the continuity equation for $(p_t,u_t)$. ∎
+
+      **Why it works.** The continuity equation is **linear in the flux** $p\,u$. Mixing densities mixes fluxes. The marginal field is just "total flux divided by total density", which is why it is a posterior-weighted average of conditional velocities rather than a plain average.
+
+      **What it buys.** We can design the path one data point at a time with simple closed-form pieces, yet the aggregated field provably carries $\mathcal N(0,I)$ to (blurred) $q$. Tong et al. extend it to any conditioning variable $z$, e.g. a pair $(x_0,x_1)$, with the same proof.
+    source: Lipman et al. 2023 Thm 1, App. A; Tong et al. 2024 Thm 3.1
+
+  - title: "Conditional flow matching: a tractable loss with the same gradient"
+    body: |
+      **Conditional FM (CFM).** Regress onto the *conditional* field, which is cheap to sample and evaluate:
+
+      $$\begin{aligned}\mathcal L_{CFM}(\theta)=\mathbb E_{t,\;x_1\sim q,\;x\sim p_t(\cdot|x_1)}\\ \|v_\theta(x,t)-u_t(x\mid x_1)\|^2\end{aligned}$$
+
+      **Theorem 2:** $\nabla_\theta\mathcal L_{CFM}=\nabla_\theta\mathcal L_{FM}$. **Proof** (fix $t$, write $v=v_\theta(x,t)$). Expand both squares:
+
+      $$\begin{aligned}\|v-u_t(x)\|^2&=\|v\|^2-2\langle v,u_t(x)\rangle\\&\quad+\|u_t(x)\|^2\\ \|v-u_t(x|x_1)\|^2&=\|v\|^2-2\langle v,u_t(x|x_1)\rangle\\&\quad+\|u_t(x|x_1)\|^2\end{aligned}$$
+
+      *Last terms:* neither depends on $\theta$, so they don't affect gradients.
+
+      *First terms:* $p_t(x)=\int p_t(x|x_1)q(x_1)dx_1$, so the two expectations of $\|v\|^2$ are the same integral in a different order.
+
+      *Cross terms:* substitute the definition of $u_t$; its $p_t(x)$ denominator cancels:
+
+      $$\begin{aligned}&\mathbb E_{p_t(x)}\langle v,u_t(x)\rangle\\&=\int\Big\langle v,\int u_t(x|x_1)\,p_t(x|x_1)\\&\qquad\quad q(x_1)\,dx_1\Big\rangle dx\\&=\mathbb E_{q(x_1)p_t(x|x_1)}\langle v,u_t(x|x_1)\rangle\end{aligned}$$
+
+      (The inner product is linear and $v$ depends on $x$, not $x_1$. Swapping the integrals needs Fubini-type regularity.) So $\mathcal L_{FM}=\mathcal L_{CFM}+\text{const}$. ∎
+
+      **Same result, quicker:** the minimiser of an $L_2$ regression is the conditional mean. For each $(x,t)$, the best predictor of $u_t(x|x_1)$ given $x_t=x$ is $\mathbb E[u_t(x|x_1)\mid x_t=x]=u_t(x)$.
+
+      **Consequences.**
+      - The CFM loss does **not** go to zero at the optimum: what remains is the variance of the conditional target given $x_t$. A "high" CFM loss is not by itself a sign of underfitting.
+      - The construction mirrors denoising score matching, where regressing onto the conditional score $\nabla\log q(x_t|x_0)$ gives the marginal score.
+    source: Lipman et al. 2023 §3.2, Thm 2, App. A; Tong et al. 2024 Thm 3.2
+
+  - title: "Gaussian conditional paths and the OT path"
+    body: |
+      **Gaussian paths.** Take $p_t(x\mid x_1)=\mathcal N\big(\mu_t(x_1),\sigma_t(x_1)^2I\big)$ with:
+      - $\mu_0=0$, $\sigma_0=1$ (pure noise at $t=0$);
+      - $\mu_1=x_1$, $\sigma_1=\sigma_{\min}$.
+
+      The simplest flow producing this path is the affine map $\psi_t(x_0)=\sigma_tx_0+\mu_t$. It pushes $\mathcal N(0,I)$ to $\mathcal N(\mu_t,\sigma_t^2I)$.
+
+      **Deriving its field (Thm 3).** A particle at $x=\psi_t(x_0)$ moves with velocity $\tfrac{d}{dt}\psi_t(x_0)=\sigma_t'x_0+\mu_t'$. To write this as a function of $x$, invert the map, $x_0=(x-\mu_t)/\sigma_t$:
+
+      $$u_t(x\mid x_1)=\frac{\sigma_t'}{\sigma_t}\,(x-\mu_t)+\mu_t'$$
+
+      In words: drift with the moving mean, and expand or contract around it at rate $\sigma_t'/\sigma_t$.
+
+      **The OT path.** Let mean and std change linearly: $\mu_t=tx_1$, $\sigma_t=1-(1-\sigma_{\min})t$. Plugging in:
+
+      $$u_t(x\mid x_1)=\frac{x_1-(1-\sigma_{\min})\,x}{1-(1-\sigma_{\min})\,t}$$
+
+      Along a particle's path $x=\psi_t(x_0)$, this equals $x_1-(1-\sigma_{\min})x_0$, **constant in $t$**: a straight line at constant speed. As $\sigma_{\min}\to0$,
+
+      $$x_t=(1-t)\,x_0+t\,x_1,\qquad \text{target}=x_1-x_0.$$
+
+      This is the rectified-flow objective of Liu et al. (2023) and Tong et al.'s I-CFM.
+
+      **"OT" is per pair.** $\psi_t$ is the optimal-transport displacement between the two Gaussians $\mathcal N(0,I)$ and $\mathcal N(x_1,\sigma_{\min}^2I)$. The marginal flow between noise and data is generally *not* an OT map (Lipman §4.1; Tong §3.2.1).
+
+      **Diffusion paths are special cases**, with time reversed:
+      - VE: $\mu_t=x_1$, $\sigma_t=\varsigma_{1-t}$, where $\varsigma_\tau$ is the diffusion's increasing noise scale ($\varsigma_0=0$, $\varsigma_1\gg1$).
+      - VP: $\mu_t=a_{1-t}x_1$, $\sigma_t=\sqrt{1-a_{1-t}^2}$, where $a_\tau=e^{-\frac12\int_0^\tau\beta(s)ds}$ is the diffusion's signal coefficient.
+
+      Their conditional fields coincide with the probability-flow ODE restricted to one data point (Lipman App. D). They reach pure noise only in the limit, whereas the OT path hits $\mathcal N(0,I)$ exactly at $t=0$.
+    source: Lipman et al. 2023 §4, Thm 3, §4.1 (eqs. 16–23), App. A, App. D; Tong et al. 2024 §3.2.1–3.2.2
+
+  - title: "Training and sampling, with a worked example"
+    body: |
+      **Training step** (OT path):
+
+      ```python
+      x1 = sample_data()            # batch of data
+      x0 = randn_like(x1)           # noise, t = 0 end
+      t = rand(len(x1))             # U[0,1]
+      xt = (1 - (1 - smin) * t) * x0 + t * x1
+      target = x1 - (1 - smin) * x0
+      loss = ((v_net(xt, t) - target) ** 2).mean()
+      ```
+
+      There is no ODE solve and no divergence: one network pass per example, like diffusion training.
+
+      **Worked example** ($\sigma_{\min}=0$, 2-D). Noise $x_0=(0,0)$, data $x_1=(4,8)$, $t=0.25$. Then $x_t=0.75\,x_0+0.25\,x_1=(1,2)$ and the target is $x_1-x_0=(4,8)$. At every $t$ along this pair the target is the same $(4,8)$: one unit of time covers the whole displacement.
+
+      **Sampling.** Draw $x_0\sim\mathcal N(0,I)$ and integrate $dx/dt=v_\theta(x,t)$ from 0 to 1:
+      - **Euler:** $x_{t+h}=x_t+h\,v_\theta(x_t,t)$, 1 network evaluation (NFE) per step.
+      - **Heun or midpoint:** 2 NFE per step, second order.
+      - **Adaptive** (e.g. dopri5): steps chosen to meet a tolerance.
+
+      **Exact likelihood** is available by integrating $-\nabla\!\cdot v_\theta$ alongside, but it is only needed for evaluation, never for training.
+
+      **Reported numbers** (Lipman Table 1; same U-Net, unconditional CIFAR-10, adaptive dopri5 solver):
+      - FM with the OT path: FID 6.35 at 142 NFE, 2.99 bits/dim.
+      - The DDPM-trained model: FID 7.48 at 274 NFE, 3.12 bits/dim.
+      - FM with a diffusion (VP) path: FID 8.06 at 183 NFE.
+
+      These are from their setup only. The straighter conditional paths are their explanation for the lower NFE.
+
+      **Guidance** works on velocities exactly as on scores. For Gaussian paths the velocity is affine in the score (last card), so $v_u+s(v_c-v_u)$ is CFG with scale $s$ (gen.guidance).
+    source: Lipman et al. 2023 §4.1 eq. 23, §6.1–6.2, Table 1, App. C; Tong et al. 2024 Alg. 1
+
+  - title: "Straight conditional paths, curved marginal trajectories"
+    body: |
+      ![Synthetic 2-D example, exact marginal field. Left: straight conditional paths for random (noise, data) training pairs, which cross freely. Right: trajectories of the marginal ODE from the same noise points. They bend and still land on the data. Their 2-D projections can intersect at different times, but two trajectories never meet at the same $(x,t)$.](gen.flow-matching/conditional-vs-marginal)
+
+      Each conditional path is a straight line, but **the learned flow follows the marginal field**, and its trajectories curve.
+
+      **Why.** Random pairing makes conditional lines cross. At a crossing point $x$, several destinations are plausible, and $u_t(x)$ averages their velocities with posterior weights $p_t(x_1\mid x)$. As $t$ grows those weights sharpen toward one destination, so the average velocity turns. Two ODE trajectories can never be at the same point at the same time, because the solution through each $(x,t)$ is unique. (Their 2-D projections can still intersect at different times.) The flow "rewires" crossing pairs (Liu §2.1).
+
+      ![Synthetic: data at ±2, linear path, t = 0.5. The marginal velocity (solid) follows the conditional field of the likelier endpoint and switches between the two dashed lines near x = 0, where it is much shorter than either.](gen.flow-matching/posterior-average)
+
+      **Numbers.** At $t=0.5$ with data $\{-2,+2\}$:
+      - At $x=0$ the conditional targets are $\pm4$, but the posterior is 50/50, so $u=0$.
+      - At $x=0.25$ the posterior is $0.881/0.119$ and the targets are $3.5$ and $-4.5$, so $u=2.55$: shorter than either target.
+
+      **Consequence 1: few steps are inexact.** At $t=0$, $x_t=x_0$ carries no information about $x_1$, so $u_0(x)=\mathbb E[x_1]-x$. **One Euler step from $t=0$ to $1$ sends every noise sample to the data mean.** Straight conditional paths do not make one-step sampling exact.
+
+      **Consequence 2: the coupling matters.** **Minibatch OT** (Tong et al.) pairs each batch's noise and data points by solving an OT problem on the batch. This reduces crossings and straightens the marginal flow. When the OT batch covers the whole dataset, the flow solves the dynamic OT problem. **Reflow** retrains on the model's own (noise, sample) pairs (next lesson, gen.rectified-flow).
+    source: Liu et al. 2023 §2.1; Tong et al. 2024 §3.2.2–3.2.3; Gao et al. 2024 (blog), "Sampling"; Lipman et al. 2023 §4.1
+
+  - title: "Relation to diffusion and v-prediction"
+    body: |
+      **Same forward process, time reversed.** With $\tau=1-t$, the linear path is $z_\tau=(1-\tau)\,x_1+\tau\,x_0$. This is a diffusion forward process with $\alpha_\tau=1-\tau$ and $\sigma_\tau=\tau$, i.e. **Gaussian FM is diffusion with a particular schedule**.
+
+      **Sign conventions for the velocity:**
+      - Lipman and Liu (data at $t=1$): target $x_1-x_0$ = data − noise.
+      - SD3 (data at $t=0$, $z_t=(1-t)x_0+t\epsilon$): target $\epsilon-x_0$ = noise − data. Gao et al. use this sign too.
+
+      Same physics, opposite sign. Check before reusing a checkpoint or a sampler.
+
+      **Velocity, noise, data and score are interconvertible.** Given $x_t$ and a velocity estimate $\hat u\approx\mathbb E[x_1-x_0\mid x_t]$, use $x_t=t\,x_1+(1-t)\,x_0$:
+
+      $$\hat x_1=x_t+(1-t)\,\hat u,\qquad \hat\epsilon=\hat x_0=x_t-t\,\hat u$$
+
+      For the score, $x_t\mid x_1\sim\mathcal N(tx_1,(1-t)^2I)$ gives $\nabla\log p_t(x)=-\mathbb E[x_0\mid x_t]/(1-t)$. Hence
+
+      $$u_t(x)=\frac{x+(1-t)\,\nabla\log p_t(x)}{t}.$$
+
+      For Gaussian paths, the FM ODE is the probability-flow ODE of the matching diffusion. A velocity network can drive diffusion samplers, and DDIM on this schedule is exactly FM's Euler sampler (Gao et al.).
+
+      **v-prediction is velocity prediction.** Salimans & Ho use $z_\phi=\cos\phi\,x+\sin\phi\,\epsilon$ and $v=\cos\phi\,\epsilon-\sin\phi\,x$, which is exactly $dz_\phi/d\phi$. Running time as $t=1-2\phi/\pi$ (data at $t=1$) gives
+
+      $$\frac{dz}{dt}=-\frac{\pi}{2}\,v.$$
+
+      So v-prediction is flow matching on the trigonometric (VP) path, up to sign and scale.
+
+      **As a weighted diffusion loss.** For the linear path, $\|\hat u-u\|^2=(1+\mathrm{SNR}^{-1/2})^2\|\hat\epsilon-\epsilon\|^2$, a factor of 4 at SNR = 1 (Kingma & Gao App. D.3). The choice between "FM" and "diffusion" is mostly a choice of path, output parameterization and weighting (gen.rectified-flow).
+    source: Gao et al. 2024 (blog), "Flow matching", "Sampling", "How do we choose what the network should output?"; Kingma & Gao 2023 App. D.3; Lipman et al. 2023 App. D; Esser et al. 2024 §2–3; Salimans & Ho 2022 §4, App. D
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Why not train a CNF by maximum likelihood?"** It needs ODE simulation plus Jacobian traces at every step ($O(D^2)$ exact, or Hutchinson). FM is simulation-free regression.
+      - **"Why can't we minimise $\mathcal L_{FM}$ directly?"** $p_t$ and $u_t$ for the data marginal are unknown. Even after choosing conditional paths, $u_t(x)$ needs an integral over the dataset divided by $p_t(x)$.
+      - **"Prove CFM is a valid surrogate."** Expand both squares. The $\|v\|^2$ terms agree by marginalisation, and the cross terms agree because $u_t$ is the posterior-weighted average of $u_t(x|x_1)$. The rest is $\theta$-free. Or: the $L_2$ minimiser is a conditional mean.
+      - **"Why does $u_t$ generate $p_t$?"** The continuity equation is linear in the flux $pu$: differentiate the mixture, use each conditional equation, and pull out the divergence.
+      - **"What does the network regress onto with the OT path?"** $x_1-(1-\sigma_{\min})x_0$, or $x_1-x_0$ as $\sigma_{\min}\to0$. It is constant along each pair.
+      - **"Are the generated trajectories straight?"** No. Marginal trajectories curve where conditional paths cross. One Euler step from $t=0$ gives the data mean. Fixes: minibatch OT couplings, reflow.
+      - **"What is 'optimal' about the OT path?"** The per-pair Gaussian-to-Gaussian displacement. The marginal flow is not an OT map in general.
+      - **"How is this related to diffusion?"** Gaussian FM is diffusion with $\alpha=1-\tau$, $\sigma=\tau$, and time reversed. Velocity is a linear combination of $\hat x$ and $\hat\epsilon$, and an affine function of the score. v-prediction is the trigonometric case.
+      - **"Does the CFM loss go to zero?"** No. The target's conditional variance remains.
+    source: Lipman et al. 2023 §3–4, App. A; Tong et al. 2024 §3; Gao et al. 2024 (blog); Grathwohl et al. 2019 §3
+
+  - title: "Key results"
+    body: |
+      - Continuity equation ($u$ generates $p$): $\partial_tp_t+\nabla\!\cdot(p_tu_t)=0$. Likelihood: $\tfrac{d}{dt}\log p_t(x_t)=-\nabla\!\cdot u_t$.
+      - FM loss: $\mathbb E_{t,x\sim p_t}\|v_\theta-u_t(x)\|^2$, intractable.
+      - Marginal path: $p_t(x)=\int p_t(x|x_1)q(x_1)dx_1$.
+      - Marginal field:
+
+        $$u_t(x)=\mathbb E[u_t(x|x_1)\mid x_t=x]$$
+
+      - Thm 1: the marginal field generates the marginal path. Thm 2: $\nabla\mathcal L_{CFM}=\nabla\mathcal L_{FM}$, with $\mathcal L_{CFM}=\mathbb E\|v_\theta-u_t(x|x_1)\|^2$.
+      - Gaussian path field:
+
+        $$u_t(x|x_1)=\tfrac{\sigma_t'}{\sigma_t}(x-\mu_t)+\mu_t'$$
+
+      - OT path: $\mu_t=tx_1$, $\sigma_t=1-(1-\sigma_{\min})t$. As $\sigma_{\min}\to0$: $x_t=(1-t)x_0+tx_1$, target $x_1-x_0$.
+      - Conversions (linear path, data at $t=1$): $\hat x_1=x_t+(1-t)\hat u$, $\hat x_0=x_t-t\hat u$, and
+
+        $$u=\frac{x+(1-t)\nabla\log p_t}{t}$$
+
+      - v-prediction: $dz/dt=-\tfrac{\pi}{2}v$ on the trig path. FM-OT is the $\epsilon$-loss weighted by $(1+\mathrm{SNR}^{-1/2})^2$.
+      - Conventions: Lipman/Liu target data − noise with $t=1$ data; SD3 target noise − data with $t=1$ noise.
+    source: Lipman et al. 2023 §3–4, App. A–C; Gao et al. 2024 (blog); Kingma & Gao 2023 App. D.3
+
+quiz:
+  - id: q1
+    prompt: |
+      Flow matching with Lipman's OT path, $\sigma_{\min}=0$ ($t=0$ noise, $t=1$ data). For noise $x_0=(1,-1)$, data $x_1=(5,3)$ and $t=0.75$, what are the training input $x_t$ and regression target?
+    correct: "$x_t=(4,2)$, target $(4,4)$"
+    wrong:
+      - "$x_t=(2,0)$, target $(4,4)$"
+      - "$x_t=(4,2)$, target $(1,1)$"
+      - "$x_t=(4,2)$, target $(-4,-4)$"
+    explanation: |
+      $x_t=(1-t)x_0+tx_1=0.25\,(1,-1)+0.75\,(5,3)=(4,2)$, and the target $x_1-x_0=(4,4)$ is the same at every $t$. $(1,1)$ is the remaining displacement $x_1-x_t$, but the conditional field is that displacement divided by the remaining time $1-t=0.25$, which gives $(4,4)$ again. $x_t=(2,0)$ swaps the time direction. $(-4,-4)$ is the noise − data sign used with SD3's reversed time, not Lipman's.
+    source: Lipman et al. 2023 §4.1 eqs. 20–23
+
+  - id: q2
+    prompt: |
+      In the proof that $\nabla_\theta\mathcal L_{CFM}=\nabla_\theta\mathcal L_{FM}$, the cross term $\mathbb E_{p_t(x)}\langle v_\theta(x),u_t(x)\rangle$ is rewritten as $\mathbb E_{q(x_1)\,p_t(x|x_1)}\langle v_\theta(x),u_t(x|x_1)\rangle$. Which fact makes this step valid?
+    correct: "The marginal field is the posterior-weighted average of conditional fields"
+    wrong:
+      - "The marginal field generates the marginal path, which is Theorem 1"
+      - 'The conditional paths $p_t(x\mid x_1)$ are Gaussian with known mean and std'
+      - 'The time $t$ is sampled uniformly on $[0,1]$, independently of $x_1$'
+    explanation: |
+      Substitute $u_t(x)=\int u_t(x|x_1)p_t(x|x_1)q(x_1)dx_1/p_t(x)$. The $p_t(x)$ cancels, and swapping the integrals gives the conditional expectation. Theorem 1 is tempting, but it is a separate result about the continuity equation. The gradient equivalence holds for any field defined this way, Gaussian or not and for any time distribution.
+    source: Lipman et al. 2023 Thm 2, App. A
+
+  - id: q3
+    prompt: |
+      1-D data are $\pm2$ with probability ½ each. Linear path, $\sigma_{\min}=0$, $x_0\sim\mathcal N(0,1)$. At $t=0.5$ and $x=0.5$, what does the optimal velocity field output (to 2 d.p.)?
+    correct: "$2.86$"
+    wrong:
+      - "$3.00$"
+      - "$-1.00$"
+      - "$0.00$"
+    explanation: |
+      $x_t\mid x_1\sim\mathcal N(0.5x_1,0.25)$. The posterior weights are $\propto e^{-(0.5-1)^2/0.5}$ vs $e^{-(0.5+1)^2/0.5}$, i.e. $0.982$ vs $0.018$. The conditional targets $x_1-x_0$ with $x_0=(x-tx_1)/(1-t)$ are $3$ and $-5$. So $u=0.982\cdot3+0.018\cdot(-5)=2.86$. Answering 3.00 takes only the likelier endpoint's target, and −1.00 averages the targets with equal weights. This shrinkage toward the other target is what bends marginal trajectories.
+    source: Lipman et al. 2023 eq. 8; Tong et al. 2024 eq. 9
+
+  - id: q4
+    prompt: |
+      Which statement about conditional flow matching with the OT path is **false**?
+    correct: "Each training step must integrate the ODE to find where $x_0$ is carried at time $t$"
+    wrong:
+      - "At the optimum the CFM loss is still positive, because the target is random given $x_t$"
+      - 'With $\sigma_{\min}=0$ the regression target is the same at every $t$ along a fixed pair'
+      - "The conditional flow moves each noise point to its data point at constant speed"
+    explanation: |
+      $x_t=\psi_t(x_0)$ is in closed form, so training is simulation-free. That is the whole point. The other statements are true. The irreducible part of the CFM loss is $\mathbb E\,\mathrm{Var}[u_t(x|x_1)\mid x_t]$. The target $x_1-x_0$ doesn't depend on $t$. And the affine flow is a straight line traversed at constant speed.
+    source: Lipman et al. 2023 §3.2, §4.1
+
+  - id: q5
+    prompt: |
+      A flow-matching model (linear path, independent noise–data pairing) is trained perfectly on a multimodal image dataset. You sample with a single Euler step from $t=0$ to $t=1$. What do you get?
+    correct: "Every sample is the same image: the mean of the training data"
+    wrong:
+      - "Exact samples from the data, since every conditional path is a straight line"
+      - "For each noise draw, the training image closest to that noise vector"
+      - "The noise itself, since the optimal velocity vanishes at $t=0$"
+    explanation: |
+      At $t=0$, $x_t=x_0$ is independent of $x_1$, so $u_0(x)=\mathbb E[x_1-x_0\mid x_0=x]=\mathbb E[x_1]-x$. One step gives $x+1\cdot(\mathbb E[x_1]-x)=\mathbb E[x_1]$. Straight *conditional* paths don't make the *marginal* trajectories straight. That is why few-step sampling needs straighter couplings (minibatch OT, reflow) or distillation.
+    source: Liu et al. 2023 §2.1; Gao et al. 2024 (blog), "Sampling"
+
+  - id: q6
+    prompt: |
+      A Gaussian conditional path has flow map $\psi_t(x_0)=\sigma_t x_0+\mu_t$. Which field $u_t(x\mid x_1)$ generates it?
+    correct: '$\frac{\sigma_t''}{\sigma_t}(x-\mu_t)+\mu_t''$'
+    wrong:
+      - '$\sigma_t''\,x+\mu_t''$'
+      - '$\frac{\sigma_t''}{\sigma_t}\,x+\mu_t''$'
+      - '$\frac{\sigma_t''}{\sigma_t}(x-\mu_t)-\mu_t''$'
+    explanation: |
+      Velocity along a path is $\tfrac{d}{dt}\psi_t(x_0)=\sigma_t'x_0+\mu_t'$. Expressing it at the current position requires $x_0=(x-\mu_t)/\sigma_t$, which gives $\frac{\sigma_t'}{\sigma_t}(x-\mu_t)+\mu_t'$. The option $\sigma_t'x+\mu_t'$ forgets this inversion: it plugs the current position in where the starting noise $x_0$ belongs.
+    source: Lipman et al. 2023 Thm 3, App. A
+
+  - id: q7
+    prompt: |
+      An SD3-style model uses $z_t=(1-t)x_0+t\epsilon$ ($t=1$ noise) and is trained with target $\epsilon-x_0$. Which Euler step moves a sample from time $t$ toward the data?
+    correct: '$z_{t-h}=z_t-h\,v_\theta(z_t,t)$'
+    wrong:
+      - '$z_{t-h}=z_t+h\,v_\theta(z_t,t)$'
+      - '$z_{t+h}=z_t+h\,v_\theta(z_t,t)$'
+      - '$z_{t-h}=z_t-h\,(1-t)\,v_\theta(z_t,t)$'
+    explanation: |
+      $dz/dt=\epsilon-x_0$ points toward noise, and data lies at smaller $t$. So step backward in time: $z_{t-h}=z_t-h\,v$. Adding $h\,v$ while decreasing $t$ is what you would write for Lipman's convention ($t=1$ data, target data − noise). Mixing the two conventions sends samples the wrong way.
+    source: Esser et al. 2024 §2–3; Gao et al. 2024 (blog), "Flow matching"
+
+  - id: q8
+    prompt: |
+      Salimans & Ho's v-prediction uses $z_\phi=\cos\phi\,x+\sin\phi\,\epsilon$ and $v=\cos\phi\,\epsilon-\sin\phi\,x$. Re-time the path with $t=1-2\phi/\pi$ (so $t=1$ is data, as in Lipman). What is the flow-matching velocity $dz/dt$?
+    correct: '$-\tfrac{\pi}{2}\,v$'
+    wrong:
+      - '$+\tfrac{2}{\pi}\,v$'
+      - '$\tfrac{\pi}{2}\,v$'
+      - '$-\tfrac{2}{\pi}\,v$'
+    explanation: |
+      $dz_\phi/d\phi=-\sin\phi\,x+\cos\phi\,\epsilon=v$, and $d\phi/dt=-\pi/2$. So $dz/dt=-\tfrac{\pi}{2}v$. The sign flips because $\phi$ grows toward noise while $t$ grows toward data. The magnitude $\pi/2$ comes from the time rescaling. So v-prediction is velocity prediction on the trigonometric path.
+    source: Salimans & Ho 2022 §4, App. D; Tong et al. 2024 Table 1
+
+  - id: q9
+    prompt: |
+      Tong et al.'s OT-CFM replaces independent (noise, data) pairing with a minibatch optimal-transport pairing. What changes?
+    correct: "The noise–data pairing within each batch, so paths cross less and the flow straightens"
+    wrong:
+      - "The shape of each conditional path, which becomes curved to follow the data manifold"
+      - "The endpoint distribution at $t=1$, which becomes the OT barycentre of the data"
+      - "The regression target, which becomes the score of the noised data distribution"
+    explanation: |
+      Only the coupling $q(x_0,x_1)$ changes. Within each batch, pairs are chosen by solving an OT problem, while the conditional paths stay straight with target $x_1-x_0$. The marginals at both ends are preserved. Fewer crossings mean less averaging in the marginal field, so trajectories are straighter, approaching dynamic OT as the batch size grows.
+    source: Tong et al. 2024 §3.2.3, Prop. 3.4
+
+  - id: q10
+    prompt: |
+      A 1-D path of densities is $p_t=\mathcal N\big(0,(1+t)^2\big)$. Which velocity field generates it (satisfies the continuity equation)?
+    correct: "$u_t(x)=x/(1+t)$"
+    wrong:
+      - '$u_t(x)=x\,(1+t)$'
+      - "$u_t(x)=x$"
+      - "$u_t(x)=1/(1+t)$"
+    explanation: |
+      The affine flow $\psi_t(x_0)=(1+t)x_0$ produces this path. Its velocity is $x_0=x/(1+t)$, i.e. $\sigma_t'/\sigma_t\cdot x$ with $\sigma_t=1+t$. You can check it numerically against $\partial_tp+\partial_x(pu)=0$. Answering $u=x$ uses the velocity in terms of the *starting* point. A constant field $1/(1+t)$ translates the density instead of widening it.
+    source: Lipman et al. 2023 Thm 3, App. B
+
+  - id: q11
+    prompt: |
+      In the proof that the marginal field generates the marginal path, which step uses the assumption that each $u_t(\cdot\mid x_1)$ generates $p_t(\cdot\mid x_1)$?
+    correct: '$\int\partial_tp_t(x|x_1)q(x_1)dx_1$ becomes $-\int\nabla\!\cdot(u_tp_t)(x|x_1)\,q(x_1)dx_1$'
+    wrong:
+      - 'Moving $\partial_t$ inside the integral over $x_1$ in $\partial_t\int p_t(x|x_1)q(x_1)dx_1$'
+      - 'Pulling $\nabla\!\cdot$ outside the integral over $x_1$, since it acts on $x$ only'
+      - 'Recognising $\int u_t(x|x_1)p_t(x|x_1)q(x_1)dx_1$ as $u_t(x)\,p_t(x)$ by definition'
+    explanation: |
+      Replacing $\partial_tp_t(x|x_1)$ by $-\nabla\!\cdot(u_t(x|x_1)p_t(x|x_1))$ is exactly the conditional continuity equation. The other steps use different facts: swapping $\partial_t$ and $\int$ is the Leibniz rule, moving the divergence outside is linearity, and the last step is the definition of the marginal field.
+    source: Lipman et al. 2023 Thm 1, App. A
+
+  - id: q12
+    prompt: |
+      Linear path $x_t=t\,x_1+(1-t)\,x_0$ ($x_0$ noise). At $t=0.5$ a sample has $x_t=1.0$ and the network outputs velocity $\hat u=2.0$. What are the implied data and noise predictions $(\hat x_1,\hat x_0)$?
+    correct: '$(2.0,\ 0.0)$'
+    wrong:
+      - '$(3.0,\ -1.0)$'
+      - '$(2.0,\ 1.0)$'
+      - '$(1.5,\ 0.5)$'
+    explanation: |
+      Use $\hat x_1=x_t+(1-t)\hat u=1+0.5\cdot2=2$ and $\hat x_0=x_t-t\hat u=1-1=0$. Check: $0.5\cdot2+0.5\cdot0=1=x_t$, and $\hat x_1-\hat x_0=2=\hat u$. $(3,-1)$ adds and subtracts the full velocity without the time factors, and is inconsistent with $x_t$.
+    source: Gao et al. 2024 (blog), "How do we choose what the network should output?"
+
+cards:
+  - id: f1
+    front: State the continuity equation and what "$u_t$ generates $p_t$" means.
+    back: |
+      $$\partial_tp_t(x)+\nabla\!\cdot\big(p_t(x)\,u_t(x)\big)=0$$
+
+      Mass changes only by flux $p\,u$ through boundaries. $u_t$ generates $p_t$ if pushing $p_0$ along $u$'s flow gives $p_t$, which is equivalent to this PDE holding. The field is not unique: adding $w$ with $\nabla\!\cdot(p_tw)=0$ changes nothing.
+    source: Lipman et al. 2023 §2, App. B
+
+  - id: f2
+    front: Instantaneous change of variables for a CNF (with the one-line reason).
+    back: |
+      $$\frac{d}{dt}\log p_t(x_t)=-\nabla\!\cdot v_t(x_t)$$
+
+      Reason: $\partial_t\log p+v\cdot\nabla\log p=(\partial_tp+v\cdot\nabla p)/p$, and the continuity equation gives $-p\,\nabla\!\cdot v$ for the numerator. So $\log p_1(x_1)=\log p_0(x_0)-\int_0^1\nabla\!\cdot v\,dt$. The exact trace is $O(D^2)$.
+    source: Chen et al. 2018 Thm 1; Lipman et al. 2023 App. C
+
+  - id: f3
+    front: Write the FM and CFM objectives, and the marginal field that links them.
+    back: |
+      $\mathcal L_{FM}=\mathbb E_{t,\,x\sim p_t}\|v_\theta(x,t)-u_t(x)\|^2$ and $\mathcal L_{CFM}=\mathbb E_{t,\,x_1\sim q,\,x\sim p_t(\cdot|x_1)}\|v_\theta(x,t)-u_t(x|x_1)\|^2$.
+
+      $$u_t(x)=\int u_t(x|x_1)\frac{p_t(x|x_1)q(x_1)}{p_t(x)}dx_1$$
+
+      $\nabla_\theta\mathcal L_{FM}=\nabla_\theta\mathcal L_{CFM}$; they differ by a $\theta$-free constant.
+    source: Lipman et al. 2023 eqs. 5, 8, 9, Thm 2
+
+  - id: f4
+    front: The conditional field for a Gaussian path $\mathcal N(\mu_t(x_1),\sigma_t(x_1)^2I)$, and for the OT path.
+    back: |
+      $$u_t(x|x_1)=\frac{\sigma_t'}{\sigma_t}(x-\mu_t)+\mu_t'$$
+
+      OT path: $\mu_t=tx_1$, $\sigma_t=1-(1-\sigma_{\min})t$, giving $u_t(x|x_1)=\dfrac{x_1-(1-\sigma_{\min})x}{1-(1-\sigma_{\min})t}$. Along the path it equals $x_1-(1-\sigma_{\min})x_0$, or $x_1-x_0$ as $\sigma_{\min}\to0$.
+    source: Lipman et al. 2023 Thm 3, eqs. 20–23
+
+  - id: f5
+    front: Convert a velocity prediction (linear path, data at $t=1$) into data, noise and score predictions.
+    back: |
+      $\hat x_1=x_t+(1-t)\hat u$ and $\hat x_0=\hat\epsilon=x_t-t\hat u$.
+
+      $$\hat u=\frac{x_t+(1-t)\,\widehat{\nabla\log p_t}}{t}$$
+
+      This uses $\nabla\log p_t(x)=-\mathbb E[x_0|x_t]/(1-t)$, from Tweedie with noise std $1-t$.
+    source: Gao et al. 2024 (blog); Lipman et al. 2023 §4
+
+  - id: f6
+    front: Time direction and velocity sign in Lipman/Liu, SD3, and Gao et al.
+    back: |
+      - **Lipman FM / Liu RF:** $t=0$ noise, $t=1$ data. Target $x_1-x_0$ (data − noise).
+      - **SD3:** $z_t=(1-t)x_0+t\epsilon$, so $t=1$ is noise. Target $\epsilon-x_0$ (noise − data).
+      - **Gao et al.:** $z_t=(1-t)x+t\epsilon$, $u=\epsilon-x$ (noise − data).
+
+      DDPM and score SDEs also put data at $t=0$.
+    source: Lipman et al. 2023 §3; Esser et al. 2024 §2–3; Gao et al. 2024 (blog), "Flow matching"
+
+  - id: f7
+    front: In what sense is Lipman's "OT path" optimal transport, and what does it not imply?
+    back: |
+      For each data point, the affine flow $\psi_t(x_0)=(1-(1-\sigma_{\min})t)x_0+tx_1$ is McCann's OT displacement interpolation between $\mathcal N(0,I)$ and $\mathcal N(x_1,\sigma_{\min}^2I)$: straight lines at constant speed.
+
+      It does **not** make the marginal flow from noise to data an OT map. Marginal trajectories still curve. Minibatch-OT couplings (Tong et al.) move the marginal flow toward dynamic OT.
+    source: Lipman et al. 2023 §4.1; Tong et al. 2024 §3.2.1, §3.2.3
+
+  - id: f8
+    type: open
+    front: Prove that the conditional flow-matching loss has the same gradient as the flow-matching loss.
+    back: |
+      Fix $t$ and write $v=v_\theta(x,t)$.
+      1. Expand: $\|v-u\|^2=\|v\|^2-2\langle v,u\rangle+\|u\|^2$, for both $u=u_t(x)$ and $u=u_t(x|x_1)$.
+      2. $\|u\|^2$ terms are $\theta$-free.
+      3. $\mathbb E_{p_t(x)}\|v\|^2=\int\!\!\int\|v(x)\|^2p_t(x|x_1)q(x_1)dx_1dx=\mathbb E_{q,p_t(\cdot|x_1)}\|v\|^2$, because $p_t$ is the mixture.
+      4. Cross term: plug in $u_t(x)=\int u_t(x|x_1)p_t(x|x_1)q(x_1)dx_1/p_t(x)$. The $p_t(x)$ cancels; swap the integrals (Fubini) to get $\mathbb E_{q,p_t(\cdot|x_1)}\langle v,u_t(x|x_1)\rangle$.
+      5. So $\mathcal L_{FM}=\mathcal L_{CFM}+C$ and the gradients match. This needs $p_t>0$ and decay or boundedness conditions.
+
+      Intuition: $L_2$ regression recovers the conditional mean, $\mathbb E[u_t(x|x_1)\mid x_t=x]=u_t(x)$. Note the CFM loss stays positive at the optimum. It is the flow analogue of denoising score matching.
+    source: Lipman et al. 2023 Thm 2, App. A
+
+  - id: f9
+    type: open
+    front: Prove that the marginal vector field generates the marginal probability path, and explain why the weighting is by the posterior.
+    back: |
+      Given $\partial_tp_t(x|x_1)=-\nabla\!\cdot(u_t(x|x_1)p_t(x|x_1))$ for each $x_1$:
+
+      $$\begin{aligned}\partial_tp_t(x)&=\textstyle\int\partial_tp_t(x|x_1)q(x_1)dx_1\\&=-\nabla\!\cdot\textstyle\int u_t(x|x_1)p_t(x|x_1)q(x_1)dx_1\\&=-\nabla\!\cdot(u_tp_t)\end{aligned}$$
+
+      The steps are: Leibniz, then the conditional continuity equations, then linearity, then the definition of $u_t$.
+
+      Why the posterior: the equation is linear in the flux $pu$, so fluxes add. The velocity is total flux over total density, $\int u_t(x|x_1)p_t(x|x_1)q(x_1)dx_1/p_t(x)=\mathbb E[u_t(x|x_1)\mid x_t=x]$. A plain average of the conditional fields would not satisfy the equation.
+    source: Lipman et al. 2023 Thm 1, App. A; Tong et al. 2024 Thm 3.1
+
+  - id: f10
+    type: open
+    front: '"Flow matching uses straight paths, so it samples in one step." Correct this claim for an interviewer.'
+    back: |
+      Only the **conditional** paths, $x_t=(1-t)x_0+tx_1$ for a fixed pair, are straight. The model learns the **marginal** field $u_t(x)=\mathbb E[x_1-x_0\mid x_t=x]$, a posterior-weighted average over every pair whose line passes through $x$. Lines from random pairings cross, the posterior weights change along the path, and so marginal trajectories curve. Two ODE trajectories also never occupy the same $(x,t)$, though their spatial paths may intersect at different times.
+
+      Extreme case: at $t=0$ the posterior is the prior, so one Euler step sends every noise sample to $\mathbb E[x_1]$.
+
+      Remedies:
+      - better couplings: minibatch OT (Tong et al.) reduces crossings;
+      - reflow: retrain on the model's own (noise, sample) pairs (Liu et al.);
+      - distillation into a few-step student;
+      - higher-order or adaptive solvers.
+
+      Gao et al.: for wide data distributions, a VP schedule can give straighter sampling paths than the linear one.
+    source: Liu et al. 2023 §2.1; Tong et al. 2024 §3.2.3; Gao et al. 2024 (blog), "Sampling"
+
+  - id: f11
+    type: open
+    front: Explain how Gaussian flow matching relates to diffusion models and v-prediction.
+    back: |
+      - **Same forward process.** Reverse time ($\tau=1-t$) and the linear path is the diffusion $z_\tau=\alpha_\tau x+\sigma_\tau\epsilon$ with $\alpha_\tau=1-\tau$, $\sigma_\tau=\tau$.
+      - **Same information.** Velocity, $\hat\epsilon$, $\hat x$ and score are linear conversions given $x_t$: $\hat x_1=x_t+(1-t)\hat u$, $\hat\epsilon=x_t-t\hat u$, $u=(x+(1-t)\nabla\log p_t)/t$. So an FM network can run diffusion samplers, and the FM ODE is the PF-ODE of that schedule. DDIM on this schedule equals FM's Euler sampler.
+      - **Different emphasis.** The FM-OT loss equals the $\epsilon$-loss weighted by $(1+\mathrm{SNR}^{-1/2})^2$, so FM vs diffusion is a choice of path, output and weighting.
+      - **v-prediction.** On the trig path $z_\phi=\cos\phi\,x+\sin\phi\,\epsilon$, Salimans & Ho's $v=dz_\phi/d\phi$. With $t=1-2\phi/\pi$, $dz/dt=-\frac{\pi}{2}v$. v-prediction is velocity prediction up to sign and scale.
+      - **Watch the sign.** Lipman uses data − noise; SD3 and Gao use noise − data.
+    source: Gao et al. 2024 (blog); Kingma & Gao 2023 App. D.3; Salimans & Ho 2022 §4, App. D; Lipman et al. 2023 App. D
+
+reading:
+  - title: "Lipman et al. 2023, Flow Matching for Generative Modeling, §3–4 and App. A"
+    url: https://arxiv.org/abs/2210.02747
+    kind: paper
+    note: The primary source. Theorems 1–3 with short proofs, the OT path, and diffusion paths as special cases.
+  - title: "Tong et al. 2024, Improving and Generalizing Flow-Based Generative Models with Minibatch Optimal Transport, §3"
+    url: https://arxiv.org/abs/2302.00482
+    kind: paper
+    note: CFM for general conditioning (pairs x0, x1), I-CFM, minibatch OT couplings, and a table mapping FM, rectified flow and stochastic interpolants onto one framework.
+  - title: "Gao et al. 2024, Diffusion Meets Flow Matching: Two Sides of the Same Coin"
+    url: https://diffusionflow.github.io/
+    kind: blog
+    note: Interactive demonstrations that Gaussian FM and diffusion are equivalent. Samplers, network outputs, weightings, and why "straight" is a misnomer.
+  - title: "Liu, Gong & Liu 2023, Flow Straight and Fast (Rectified Flow), §2.1"
+    url: https://arxiv.org/abs/2209.03003
+    kind: paper
+    note: The same linear-path objective from the transport view, with the picture of why marginal paths differ from training pairs.
+  - title: "Chen et al. 2018, Neural Ordinary Differential Equations, §4"
+    url: https://arxiv.org/abs/1806.07366
+    kind: paper
+    note: CNF background. The instantaneous change of variables and why maximum-likelihood training needs ODE solves.

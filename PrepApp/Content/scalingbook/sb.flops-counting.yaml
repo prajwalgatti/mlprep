@@ -1,0 +1,375 @@
+id: sb.flops-counting
+area: scalingbook
+title: "Counting FLOPs: Contractions and the 6ND Rule"
+summary: How to count the FLOPs of any einsum from its dimensions, why a matmul costs 3× as much in training as in inference, and where the 6 × parameters × tokens rule comes from, what it leaves out, and how to turn it into a training-time estimate.
+order: 90
+level: core
+tags: [scaling-book, flops, transformers, training-cost]
+prereqs: [sb.alltoall-overlap]
+
+explainer:
+  - title: Why count FLOPs
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"; Scaling Book ch. 6 §"Counting parameters and FLOPs"
+    body: |
+      Chapters 1–3 gave the hardware side: FLOPs/s per chip and bandwidths. Chapter 4 supplies the model side: how many FLOPs and bytes a Transformer actually needs. With both, the roofline tells us how long a training step or a generated token should take, and whether the bottleneck is compute or communication.
+
+      Two conventions, used throughout:
+
+      - A **FLOP** is one floating-point add or multiply. A multiply-accumulate (MAC) is therefore **2 FLOPs**. Hardware peaks are quoted the same way, so FLOP counts and peak FLOP/s are directly comparable.
+      - We count only the matrix multiplies. Elementwise work (activations, norms, softmax) is $O(\text{tokens}\times\text{width})$, while matmuls are $O(\text{tokens}\times\text{width}^2)$, so for large models the elementwise FLOPs are a rounding error. Their *time* can still matter, because they run on the slower vector unit and are bandwidth-bound (lesson 10). That is why they are fused into matmuls.
+
+      A Transformer is, to first order, a stack of matrix multiplies. So counting FLOPs reduces to one skill: counting the FLOPs of a matmul, or more generally of an **einsum** (a tensor contraction written with named dimensions). This lesson builds that skill, then derives the famous training estimate, about 6 FLOPs per parameter per token.
+  - title: Dot products, mat-vecs, matmuls
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"
+    body: |
+      Take $x, y \in \mathbb{R}^P$, $A \in \mathbb{R}^{N\times P}$, $B\in\mathbb{R}^{P\times M}$.
+
+      - **Dot product** $x\cdot y$: $P$ multiplies and $P$ adds ($P - 1$ strictly). **$2P$ FLOPs**, reading $2P$ numbers.
+      - **Matrix-vector** $Ax$: one dot product per row of $A$. **$2NP$ FLOPs**, reading $NP + P$ numbers.
+      - **Matrix-matrix** $AB$: one mat-vec per column of $B$. **$2NPM$ FLOPs**, reading $NP + PM$ numbers.
+
+      The matmul is special. For square $n\times n$ matrices, compute grows like $n^3$ while data grows like $n^2$. So its arithmetic intensity grows like $n$: in bf16, $2n^3$ FLOPs over $3\cdot2n^2$ bytes is $n/3$ FLOPs/byte. The mat-vec stays near 1 FLOP/byte at any size.
+
+      ![FLOPs per byte for square bf16 products: matmul intensity grows like n/3 and crosses the v5e ridge near n ≈ 720; mat-vec stays near 1](sb.flops-counting/matmul-vs-matvec)
+
+      This is the deep reason architectures built from big matmuls scale well. Make the matrices bigger and they get *easier* to run at peak, the opposite of almost every other algorithm. It is also why the matmul roofline of lesson 20 depended on batch size: a batch of $B$ tokens turns many mat-vecs into one matmul.
+  - title: The general einsum rule
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"
+    body: |
+      For any contraction between two arrays, sort each dimension into one of three kinds:
+
+      - **Batching**: appears in both inputs **and** the output. It indexes independent sub-problems.
+      - **Contracting**: appears in both inputs but **not** the output. It is summed away.
+      - **Free**: appears in one input and the output.
+
+      **Rule.** FLOPs $= 2\times$ the product of the sizes of **all distinct** dimensions, counting each batching and contracting dimension **once**. The factor 2 is one multiply and one add per term of each sum. A pure elementwise product, with nothing contracted, has no adds and costs just the product of its dimensions.
+
+      Why it works: each output element (indexed by batch × free dims) is a sum over the contracting dims, so (output size) × (contraction size) multiply-adds are needed.
+
+      ![Attention scores: B and N are batching, H is contracting, T and S are free](sb.flops-counting/einsum-dims)
+
+      **Example.** Attention scores $Q[B, T, N, H]\cdot K[B, S, N, H] \to [B, T, S, N]$:
+
+      $$\text{FLOPs} = 2\,B\,T\,S\,N\,H.$$
+
+      $B$ and $N$ are batching, $H$ is contracting, $T$ and $S$ are free. A common mistake is to multiply the two input sizes, which double-counts $B$, $N$ and $H$.
+  - title: Worked examples
+    source: Scaling Book ch. 4 (Transformers), Question 3; Scaling Book ch. 1, Question 4
+    body: |
+      **Book Q3.** $A[I, J, K, L]\cdot B[I, J, M, N, O] \to C[K, L, M, N, O]$. $I, J$ are contracting; $K, L, M, N, O$ are free; nothing is batching:
+
+      $$\text{FLOPs} = 2\,IJKLMNO.$$
+
+      **Per-example matmul.** $X[B, D]\cdot W[B, D, F] \to Y[B, F]$, a different weight matrix per batch element. $B$ is batching, $D$ contracting, $F$ free: $2BDF$. That is exactly the same FLOP count as a shared $[D, F]$ weight. What changes is the **bytes**: $BDF$ weights instead of $DF$. Lesson 20 showed this makes the per-example version bandwidth-bound at any batch size. FLOPs and bytes must always be counted separately.
+
+      **Elementwise.** $X[B, D] \odot Y[B, D]$: $BD$ FLOPs, with no factor 2, since nothing is summed.
+
+      **Grouped-query attention.** With $N$ query heads sharing $K$ key/value heads, write $Q[B, T, K, G, H]$ with $G = N/K$. Then $Q\cdot K[B, S, K, H] \to [B, T, S, K, G]$ costs $2BTSKGH = 2BTSNH$, the same as full multi-head attention. Sharing keys saves memory and bandwidth, not FLOPs.
+  - title: Training costs 3× inference
+    source: Scaling Book ch. 4 (Transformers) §"Forward and reverse FLOPs"
+    body: |
+      In training we need gradients, not just outputs. Let $B[P, M]$ be a weight matrix inside a network, $A[N, P]$ its input activations ($N$ tokens), and $C = AB$. The forward pass costs $2NPM$.
+
+      The backward pass receives $\partial L/\partial C$ (shape $[N, M]$) and needs two products:
+
+      $$\frac{\partial L}{\partial B} = A^\top \frac{\partial L}{\partial C}.$$
+
+      This is the weight gradient. It contracts over the token dimension $N$: $[P, N]\cdot[N, M]$, so $2NPM$ FLOPs.
+
+      $$\frac{\partial L}{\partial A} = \frac{\partial L}{\partial C} B^\top.$$
+
+      This is the gradient passed to earlier layers. It contracts over $M$: $[N, M]\cdot[M, P]$, again $2NPM$.
+
+      ![Per weight matrix: one forward matmul and two backward matmuls, each 2NPM FLOPs](sb.flops-counting/fwd-bwd)
+
+      Total: $2NPM$ forward + $4NPM$ backward = **$6NPM$** per weight matrix per training step, 3× the inference cost. (The very first layer doesn't need $\partial L/\partial A$ for its input, a negligible saving.)
+
+      Since $PM$ is the matrix's parameter count and $N$ the number of tokens, this is already the famous rule in miniature: **6 FLOPs per parameter per token**.
+  - title: The 6ND rule
+    source: Scaling Book ch. 4 (Transformers) §"Forward and reverse FLOPs", §"General rule of thumb for Transformer FLOPs"; Scaling Book ch. 6 §"Counting parameters and FLOPs"
+    body: |
+      Apply $6NPM$ to every weight matrix and add. Every parameter is a weight in some matmul that sees every token, so
+
+      $$\text{training FLOPs} \approx 6\cdot N_\text{params}\cdot D_\text{tokens}.$$
+
+      The book writes it as $6\times$ num params $\times$ num tokens; $N$ here is params, not the token count of the previous card. Inference (a forward pass only) costs $\approx 2\cdot N_\text{params}$ FLOPs per token.
+
+      **Worked example** (book ch. 6). LLaMA-3 70B trained on about 15T tokens:
+
+      $$6\times 70\times10^{9}\times 15\times10^{12} \approx 6.3\times10^{24}\ \text{FLOPs}.$$
+
+      That is $4.2\times10^{11}$ FLOPs per token, about 1 ms per token on one TPU v5p at peak.
+
+      **What the rule covers, and what it leaves out.** It assumes:
+
+      - **dense matmuls only.** It ignores the attention score and value products, which are matmuls with no parameters. They are small below a few tens of thousands of tokens of context (next lesson: $T \lesssim 8D$).
+      - **no recomputation.** Saving fewer activations and recomputing them adds forward passes: about $8ND$ with full per-layer rematerialization (lesson 110).
+      - **all parameters active.** For mixture-of-experts models use the **activated** parameters per token, not the total.
+      - Elementwise ops and the embedding lookup are ignored. The **unembedding** matmul is included, as a $D\times V$ weight matrix like any other.
+  - title: From FLOPs to wall-clock time
+    source: Scaling Book ch. 6 §"Counting parameters and FLOPs"; Scaling Book ch. 4, Question 7; Scaling Book ch. 1 §"Where Does the Time Go?"
+    body: |
+      With total FLOPs known, training time on $n$ chips of peak $C$ is
+
+      $$T = \frac{6ND}{n\cdot C\cdot \text{MFU}}.$$
+
+      **MFU** (model FLOPs utilization) is the fraction of peak spent on the model's useful FLOPs, i.e. the $6ND$ count, not counting recomputation. 40–50% is a reasonable target for large runs. The rest is lost to communication, imperfect overlap, elementwise work, and the fact that chips reach only about 80–85% (H100/B200) to 95% (TPU) of peak even on large matmuls (ch. 1).
+
+      **Worked example** (book ch. 6). $6.3\times10^{24}$ FLOPs on a full TPU v5p pod (8960 chips, $4.59\times10^{14}$ FLOPs/s each) at 40% MFU:
+
+      $$\begin{aligned} T &= \frac{6.3\times10^{24}}{8960\times4.59\times10^{14}\times0.4} \\ &\approx 3.8\times10^{6}\ \text{s} \approx 44 \text{ days}. \end{aligned}$$
+
+      **Running it backwards** gives MFU from a reported run (book Q7). DeepSeek-V3 reports 2.79M H800-hours for 14.8T tokens with 37B activated parameters. Using $1.513\times10^{15}$ dense FP8 FLOPs/s per GPU (half the spec sheet's sparse figure):
+
+      - available: $2.79\times10^6\times3600\times1.513\times10^{15} \approx 1.52\times10^{25}$;
+      - used: $6\times37\times10^9\times14.8\times10^{12} \approx 3.3\times10^{24}$;
+      - MFU ≈ 22%.
+
+      This rests on the 6ND approximation and the stated peak; with attention FLOPs or a different peak the figure moves.
+  - title: What interviewers probe
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots", §"Forward and reverse FLOPs"
+    body: |
+      - *FLOPs of a matmul $[N, P]\times[P, M]$?* $2NPM$: one multiply-add per output element per contracted index.
+      - *FLOPs of a general einsum?* 2 × product of all distinct dims (batch and contracting counted once); no 2 for pure elementwise.
+      - *Why is training ≈ 3× inference?* Each weight matrix needs a forward matmul plus two backward matmuls (weight gradient, contracting over tokens; input gradient, contracting over outputs), each the same size.
+      - *Derive 6ND.* $6NPM$ per matrix, summed over all matrices: $6 \times$ params $\times$ tokens.
+      - *What does 6ND ignore?* Attention score/value matmuls (grow with context), recomputation (→ 8ND with full remat), MoE sparsity (use active params), elementwise ops.
+      - *How long will a run take?* $6ND/(n\,C\,\text{MFU})$.
+      - *Why do matmul-heavy models scale?* Compute $O(n^3)$ on data $O(n^2)$: intensity grows with size.
+  - title: Key results
+    source: Scaling Book ch. 4 (Transformers)
+    body: |
+      $$x\cdot y: 2P, \quad Ax: 2NP, \quad AB: 2NPM$$
+
+      $$\text{einsum FLOPs} = 2\prod_{\text{distinct dims}} |d|$$
+
+      $$\text{train} = 6NPM \text{ per matrix} \;\Rightarrow\; 6ND$$
+
+      $$T_\text{train} = \frac{6ND}{n\,C\,\text{MFU}}$$
+
+      - Batching and contracting dims count once; elementwise products have no factor 2.
+      - Forward $2NPM$; backward $4NPM$ ($\partial L/\partial W$ contracts tokens, $\partial L/\partial X$ contracts outputs). Inference ≈ $2N_\text{params}$ per token.
+      - 6ND assumes dense, no remat, attention scores negligible ($T \lesssim 8D$).
+      - Square bf16 matmul intensity $= n/3$.
+      - LLaMA-3 70B × 15T tokens ≈ $6.3\times10^{24}$ FLOPs ≈ 44 days on a v5p pod at 40% MFU.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 4 (Transformers), Question 3
+    prompt: |
+      How many FLOPs does $A[I, J, K, L]\cdot B[I, J, M, N, O] \rightarrow C[K, L, M, N, O]$ take?
+    correct: $2\,IJKLMNO$
+    wrong:
+      - $IJKLMNO$
+      - $2\,I^2J^2KLMNO$
+      - $2\,(IJKL + IJMNO)$
+    explanation: |
+      $I$ and $J$ are contracted (in both inputs, not the output); the rest are free. Each distinct dim counts once, times 2 for the multiply and add: $2\,IJKLMNO$. Squaring $I$ and $J$ double-counts the shared dims; dropping the 2 forgets the adds.
+  - id: q2
+    source: Scaling Book ch. 4 (Transformers) §"Attention"
+    prompt: |
+      What is the forward FLOP count of the attention-score einsum $Q[B, T, N, H]\cdot K[B, S, N, H] \rightarrow L[B, T, S, N]$?
+    correct: $2\,BTSNH$
+    wrong:
+      - $2\,B^2TSN^2H$
+      - $2\,BTSH$
+      - $BTSNH$
+    explanation: |
+      $B$ and $N$ are batching (in both inputs and the output), $H$ is contracted, $T$ and $S$ are free. Product of distinct dims times 2: $2BTSNH$. Squaring $B$ and $N$ double-counts batch dims; dropping $N$ forgets that every head does its own product.
+  - id: q3
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"; Scaling Book ch. 1, Question 4
+    prompt: |
+      Compare $X[B, D]\cdot W[D, F]$ (shared weights) with $X[B, D]\cdot W[B, D, F] \rightarrow Y[B, F]$ (a weight matrix per example). How do their FLOPs and weight bytes compare?
+    correct: Same FLOPs; the per-example version reads B× more weight bytes
+    wrong:
+      - B× more FLOPs and B× more weight bytes for the per-example version
+      - Same FLOPs and same weight bytes
+      - Half the FLOPs for the per-example version, since B is batching
+    explanation: |
+      In the per-example einsum $B$ is batching, $D$ contracted, $F$ free: $2BDF$, the same as the shared case. But the weights now total $BDF$ elements instead of $DF$. FLOPs and bytes are separate counts, which is why the per-example version is bandwidth-bound.
+  - id: q4
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"
+    prompt: |
+      How many FLOPs does the elementwise product $X[B, D]\odot Y[B, D]$ take?
+    correct: $BD$
+    wrong:
+      - $2BD$
+      - $2B^2D$
+      - $BD^2$
+    explanation: |
+      There is no contracted dimension, so no additions: one multiply per element, $BD$ FLOPs. The factor 2 in the einsum rule comes from summing over a contracted dim, so it doesn't apply.
+  - id: q5
+    source: Scaling Book ch. 4 (Transformers) §"Forward and reverse FLOPs"
+    prompt: |
+      For $C = A\,W$ with activations $A[N, P]$ ($N$ tokens) and weights $W[P, M]$, which dimension does the weight gradient $\partial L/\partial W$ contract over?
+    correct: The token dimension N
+    wrong:
+      - The input dimension P
+      - The output dimension M
+      - No dimension; it is an outer product per token only
+    explanation: |
+      $\partial L/\partial W = A^\top\,\partial L/\partial C$: $[P, N]\cdot[N, M] \to [P, M]$, summing over tokens. It costs $2NPM$, like the forward pass. The input gradient $\partial L/\partial A = \partial L/\partial C\,W^\top$ is the one that contracts over $M$.
+  - id: q6
+    source: Scaling Book ch. 4 (Transformers) §"Forward and reverse FLOPs"
+    prompt: |
+      Ignoring recomputation, a weight matrix's training step costs how many times its forward matmul?
+    correct: 3×
+    wrong:
+      - 2×
+      - 4×
+      - 6×
+    explanation: |
+      Forward $2NPM$, plus two backward matmuls of $2NPM$ each (weight gradient and input gradient): $6NPM = 3\times$ forward. 6× confuses the "6" in $6NPM$ (FLOPs per parameter per token) with the ratio to the forward pass.
+  - id: q7
+    source: Scaling Book ch. 4 (Transformers) §"General rule of thumb for Transformer FLOPs"
+    prompt: |
+      Roughly how many FLOPs does training a dense 7B-parameter model on 2T tokens take, at short context with no recomputation?
+    correct: About $8.4\times10^{22}$
+    wrong:
+      - About $2.8\times10^{22}$
+      - About $1.4\times10^{22}$
+      - About $8.4\times10^{21}$
+    explanation: |
+      $6 \times 7\times10^9 \times 2\times10^{12} = 8.4\times10^{22}$. $2.8\times10^{22}$ is the forward-only (inference) count $2ND$. Short context keeps attention FLOPs negligible, and no recomputation keeps the factor at 6.
+  - id: q8
+    source: Scaling Book ch. 6 §"Counting parameters and FLOPs"
+    prompt: |
+      A 1B-parameter dense model is trained on 20B tokens on 64 TPU v5e chips ($1.97\times10^{14}$ FLOPs/s each) at 40% MFU. About how long does it take?
+    correct: About 6.6 hours
+    wrong:
+      - About 2.6 hours
+      - About 2.2 hours
+      - About 8.8 hours
+    explanation: |
+      $6ND = 1.2\times10^{20}$ FLOPs. The cluster delivers $64\times1.97\times10^{14}\times0.4 \approx 5.0\times10^{15}$ FLOPs/s: ≈ 23,800 s ≈ 6.6 h. 2.6 h assumes 100% MFU; 2.2 h uses $2ND$; 8.8 h counts the $8ND$ of full rematerialization as if it were the model's FLOPs.
+  - id: q9
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"
+    prompt: |
+      What is the arithmetic intensity of a square bf16 matmul $[2048, 2048]\times[2048, 2048]$ (reading both inputs and writing the output once)?
+    correct: About 680 FLOPs/byte
+    wrong:
+      - About 2048 FLOPs/byte
+      - About 1 FLOP/byte
+      - About 340 FLOPs/byte
+    explanation: |
+      FLOPs $2n^3$; bytes $3\times2n^2$; intensity $n/3 \approx 683$. 2048 forgets the 3 matrices and 2 bytes per element. 1 FLOP/byte is a mat-vec's intensity.
+  - id: q10
+    source: Scaling Book ch. 4 (Transformers) §"General rule of thumb for Transformer FLOPs"
+    prompt: |
+      Which statement about the $6ND$ estimate is **false**?
+    correct: It includes the FLOPs of the attention score and value products
+    wrong:
+      - It comes from 6 FLOPs per parameter per token across all weight matrices
+      - It undercounts when activations are rematerialized in the backward pass
+      - For a mixture-of-experts model, N should be the activated parameters
+    explanation: |
+      The attention score ($QK^\top$) and value ($AV$) products have no parameters, so a per-parameter count can't include them; they are added separately and grow with context. The other three statements are true.
+  - id: q11
+    source: Scaling Book ch. 4 (Transformers), Question 7; Scaling Book ch. 4 §"Sparsity and Mixture-of-Experts"
+    prompt: |
+      DeepSeek-V3 has 671B total parameters, of which 37B are activated per token, and was trained on 14.8T tokens. What does the 6ND rule give for its training FLOPs?
+    correct: About $3.3\times10^{24}$
+    wrong:
+      - About $6.0\times10^{25}$
+      - About $1.1\times10^{24}$
+      - About $3.3\times10^{23}$
+    explanation: |
+      Each token only passes through its activated parameters, so $6\times37\times10^9\times14.8\times10^{12} \approx 3.3\times10^{24}$. Using the 671B total gives $6.0\times10^{25}$; $1.1\times10^{24}$ is the forward-only count.
+  - id: q12
+    source: Scaling Book ch. 4 (Transformers), Question 7
+    prompt: |
+      A run needs $1.2\times10^{20}$ model FLOPs (by 6ND) and takes 10 hours on 64 TPU v5e chips ($1.97\times10^{14}$ FLOPs/s each). What MFU did it achieve?
+    correct: About 26%
+    wrong:
+      - About 40%
+      - About 2.6%
+      - About 9%
+    explanation: |
+      Available FLOPs $= 64\times1.97\times10^{14}\times36{,}000 \approx 4.5\times10^{20}$, and $1.2\times10^{20}/4.5\times10^{20} \approx 26\%$. 2.6% is a 10× slip in the seconds; 9% uses the forward-only $2ND = 0.4\times10^{20}$; 40% is a typical target, not what this run achieved. MFU counts model FLOPs only, not recomputation.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"
+    front: FLOPs of a dot product, a mat-vec and a matmul?
+    back: |
+      $x\cdot y$ ($P$): $2P$. $A[N,P]\,x$: $2NP$. $A[N,P]\,B[P,M]$: $2NPM$.
+  - id: f2
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"
+    front: General rule for the FLOPs of an einsum?
+    back: |
+      2 × product of all distinct dimension sizes, with batching dims (in both inputs and output) and contracting dims (in both inputs, not output) counted once. No factor 2 if nothing is contracted.
+  - id: f3
+    source: Scaling Book ch. 4 (Transformers) §"Forward and reverse FLOPs"
+    front: Training FLOPs per weight matrix, and how they split?
+    back: |
+      $6NPM$: forward $2NPM$; weight gradient $A^\top\,\partial L/\partial C$ ($2NPM$, contracts tokens); input gradient $\partial L/\partial C\,W^\top$ ($2NPM$, contracts outputs).
+  - id: f4
+    source: Scaling Book ch. 4 (Transformers) §"General rule of thumb for Transformer FLOPs"
+    front: The training-FLOPs rule of thumb, and its inference counterpart?
+    back: |
+      Training ≈ $6 \times$ params $\times$ tokens. Inference ≈ $2 \times$ params per token.
+  - id: f5
+    source: Scaling Book ch. 6 §"Counting parameters and FLOPs"
+    front: Training time from FLOPs?
+    back: |
+      $$T = \frac{6ND}{n\,C\,\text{MFU}}$$
+
+      $n$ chips of peak $C$; MFU = useful model FLOPs / peak (≈ 40–50% is good).
+  - id: f6
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"
+    front: Why do matmul-dominated architectures get easier to run efficiently as they grow?
+    back: |
+      Compute grows like $n^3$ and data like $n^2$, so intensity grows like $n$ (square bf16 matmul: $n/3$ FLOPs/byte). Mat-vecs and elementwise ops stay at constant intensity.
+  - id: f7
+    source: Scaling Book ch. 6 §"Counting parameters and FLOPs"
+    front: Training FLOPs and time for LLaMA-3 70B on 15T tokens (book numbers)?
+    back: |
+      $6\times70\times10^9\times15\times10^{12} \approx 6.3\times10^{24}$ FLOPs; ≈ 44 days on a full TPU v5p pod (8960 chips) at 40% MFU.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 4 (Transformers) §"Forward and reverse FLOPs"
+    front: Derive the 6ND rule from a single matrix multiply.
+    back: |
+      - Weight $W[P, M]$, activations $A[N, P]$ for $N$ tokens, $C = AW$: forward $2NPM$.
+      - Backward needs $\partial L/\partial W = A^\top\partial L/\partial C$ (contract $N$): $2NPM$.
+      - And $\partial L/\partial A = \partial L/\partial C\,W^\top$ (contract $M$) to continue backprop: $2NPM$.
+      - Total $6NPM = 6 \times (\text{params in } W) \times (\text{tokens})$.
+      - Every parameter of a dense Transformer is in some matmul seeing every token, so sum over matrices: $6 \times N_\text{params} \times D_\text{tokens}$.
+      - Caveats: attention score/value products excluded; remat → ≈ 8ND; MoE uses active params.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 4 (Transformers) §"Counting Dots"
+    front: Explain to an interviewer how to count the FLOPs of an arbitrary einsum, with an attention example and a common mistake.
+    back: |
+      - Classify each dim: batching (both inputs + output), contracting (both inputs, summed away), free (one input + output).
+      - Each output element is a sum over contracting dims: (output size) × (contraction size) multiply-adds, i.e. 2 × product of distinct dims.
+      - Example: $Q[B,T,N,H]\cdot K[B,S,N,H]\to[B,T,S,N]$ = $2BTSNH$.
+      - GQA ($Q[B,T,K,G,H]$, $K[B,S,K,H]$) gives $2BTSKGH = 2BTSNH$: the same FLOPs, fewer bytes.
+      - Mistake: multiplying the two input sizes (double-counts shared dims), or applying the 2 to elementwise ops.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 6 §"Counting parameters and FLOPs"; Scaling Book ch. 4, Question 7
+    front: Estimate the MFU of a published training run from its reported compute, and say what could make the estimate wrong.
+    back: |
+      - Model FLOPs ≈ $6 N_\text{active} D$ (DeepSeek-V3: $6\times37\text{B}\times14.8\text{T} \approx 3.3\times10^{24}$).
+      - Available FLOPs = chip-hours × 3600 × dense peak at the training precision (2.79M H800-h × 1.513e15 FP8 ≈ 1.52e25).
+      - MFU = used / available ≈ 22%.
+      - Error sources: 6ND omits attention FLOPs (matter at long context) and MoE routing overhead; peak choice (dense vs sparse spec, precision); reported hours may include failures or evaluation; recomputation isn't "model FLOPs".
+
+reading:
+  - title: "Scaling Book ch. 4: All the Transformer Math You Need to Know"
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    kind: book
+    note: '"Counting Dots" and "Forward and reverse FLOPs", plus Problems 3 and 7.'
+  - title: "Scaling Book ch. 6: Training LLaMA 3 on TPUs"
+    url: https://jax-ml.github.io/scaling-book/applied-training/
+    kind: book
+    note: Turns 6ND into training-time and cost estimates for LLaMA-3 70B.
+  - title: "Kaplan et al. (2020), Scaling Laws for Neural Language Models, §2.1"
+    url: https://arxiv.org/abs/2001.08361
+    kind: paper
+    note: The original per-operation FLOP accounting behind C ≈ 6ND, including the attention terms it drops.
+  - title: "EleutherAI, Transformer Math 101"
+    url: https://blog.eleuther.ai/transformer-math/
+    kind: blog
+    note: The same compute and memory rules of thumb from the GPU-training side.

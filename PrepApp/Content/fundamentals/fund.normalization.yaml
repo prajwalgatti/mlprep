@@ -1,0 +1,214 @@
+id: fund.normalization
+area: fundamentals
+title: BatchNorm, LayerNorm & RMSNorm
+summary: Which axes each norm averages over, BatchNorm's train vs eval behaviour, why transformers use LayerNorm or RMSNorm, and pre-LN vs post-LN.
+order: 50
+level: intermediate
+tags: [deep-learning, normalization, transformers, training]
+prereqs: []
+
+explainer:
+  - title: Intuition
+    body: |
+      Normalizing activations keeps their scale well-behaved across layers. That allows higher learning rates and makes training less sensitive to initialization. The original story was reducing "internal covariate shift". Later work (Santurkar et al., 2018) argues the main effect is a **smoother loss landscape**.
+
+      The norms differ only in **which axes the statistics are computed over**. For a conv activation of shape $(N, C, H, W)$:
+
+      - **BatchNorm**: over $(N, H, W)$, separately for each channel.
+      - **LayerNorm**: over $(C, H, W)$ for each sample. In transformers, over the hidden dim $d$ for each token.
+      - **InstanceNorm**: over $(H, W)$, per sample and per channel.
+      - **GroupNorm**: over groups of channels plus $(H,W)$, per sample.
+
+      Each then applies a learnable per-feature affine transform, $\gamma\hat x + \beta$.
+  - title: BatchNorm, train vs eval
+    body: |
+      $$\hat x = \frac{x-\mu_B}{\sqrt{\sigma_B^2+\epsilon}}, \qquad y = \gamma\hat x + \beta$$
+
+      - **Train mode**: $\mu_B$ and $\sigma_B^2$ come from the current minibatch. Running estimates are updated by EMA. In PyTorch, momentum=0.1 means running = 0.9·running + 0.1·batch.
+      - **Eval mode**: the stored running stats are used. Each output then depends only on its own input, and the transform is a fixed affine map that can be folded into the preceding conv.
+      - Problems: noisy stats with small batches, a train/eval mismatch, the need for SyncBN across GPUs, awkward handling of padding and variable lengths, and information leaking between samples in a batch (which can be exploited in contrastive learning).
+      - A conv/linear bias right before BN is redundant, because $\beta$ absorbs it.
+  - title: LayerNorm and RMSNorm
+    body: |
+      For a token vector $x\in\mathbb{R}^d$:
+
+      $$\mathrm{LN}(x) = \gamma\odot\frac{x-\mu}{\sqrt{\sigma^2+\epsilon}} + \beta, \quad \mu=\tfrac1d\textstyle\sum_i x_i,\; \sigma^2=\tfrac1d\textstyle\sum_i (x_i-\mu)^2$$
+
+      $$\mathrm{RMSNorm}(x) = \gamma\odot\frac{x}{\sqrt{\tfrac1d\sum_i x_i^2+\epsilon}}$$
+
+      - LN behaves **identically in train and eval**, needs no batch statistics, and works with any batch size, variable lengths and token-by-token decoding. That is why transformers use it.
+      - RMSNorm drops mean-centering (and usually $\beta$). It keeps re-scaling invariance, costs less, and matches LN's quality. It is used in T5, LLaMA, Mistral and Gemma.
+      - LN uses the **biased** (divide-by-$d$) variance.
+  - title: Pre-LN vs Post-LN
+    body: |
+      **Post-LN** (original Transformer): $x \leftarrow \mathrm{LN}(x + F(x))$.
+
+      - At initialization, gradients are large near the output layers.
+      - It needs learning-rate warmup and gets unstable as depth grows.
+      - When it does train, its final quality can be slightly better.
+
+      **Pre-LN** (GPT-2 onward, and most LLMs): $x \leftarrow x + F(\mathrm{LN}(x))$.
+
+      - A clean identity path along the residual stream gives well-behaved gradients (Xiong et al., 2020). It trains with little or no warmup.
+      - It needs a **final LN** before the output head.
+      - Downside: the residual-stream norm grows with depth, so late layers change the representation less and are less effective.
+
+      Variants that address these issues: sandwich-LN, DeepNorm, and QK-norm (normalizing queries and keys to stop attention-logit blow-up).
+  - title: Common pitfalls
+    body: |
+      - **Forgetting** `model.eval()`: BN normalizes with test-batch statistics, overwrites its running stats, and gives predictions that depend on batch composition. `torch.no_grad()` does *not* switch modes.
+      - BN in train mode with one value per channel (batch size 1 after a linear layer) raises an error, since the variance is undefined.
+      - **Fine-tuning with tiny batches**: freeze BN (keep it in eval mode), or switch to GroupNorm or LayerNorm.
+      - **Multi-GPU**: plain BN computes stats per device. Use SyncBatchNorm if per-GPU batches are small.
+      - Compute norms in fp32 under mixed precision, because the variance reduction can overflow or lose precision in fp16.
+      - Exclude $\gamma$ and $\beta$ from weight decay.
+  - title: What interviewers ask
+    body: |
+      - *BN at train vs test time?* Batch stats in training, running EMA stats at eval.
+      - *Why not BN in transformers?* Sequence models have variable lengths and padding, small per-device batches, and autoregressive inference with batch-size-1 steps. LN is per token and needs no batch statistics.
+      - *LN vs RMSNorm?* RMSNorm skips the mean subtraction and the bias. It is cheaper with similar quality.
+      - *Pre-LN vs post-LN?* Pre-LN is stable and needs little warmup, but can lose some effectiveness in deep layers. Post-LN can be better if it trains, but needs warmup.
+      - *Which axes does each norm use?* Draw the $(N,C,H,W)$ cube and shade the BN, LN, IN and GN regions.
+      - *Can BN be fused at inference?* Yes, it becomes a per-channel affine map folded into the previous conv weights.
+
+quiz:
+  - id: q1
+    prompt: |
+      For a conv activation of shape $(N, C, H, W)$, BatchNorm computes its mean and variance over:
+    correct: $(N, H, W)$, separately for each channel
+    wrong:
+      - $(C, H, W)$, separately for each sample
+      - $(H, W)$, separately for each sample and channel
+      - $N$ only, separately for each channel and pixel
+    explanation: |
+      BN shares statistics across the batch and spatial positions for each channel. Per sample over $(C,H,W)$ is LayerNorm, and per sample and channel over $(H,W)$ is InstanceNorm.
+  - id: q2
+    prompt: |
+      At evaluation time (after model.eval()), a BatchNorm layer:
+    correct: Normalizes with the running mean and variance accumulated during training
+    wrong:
+      - Normalizes with the statistics of the current test batch
+      - Is bypassed entirely, passing activations through unchanged
+      - Recomputes statistics over the entire test set before predicting
+    explanation: |
+      Eval mode uses the EMA estimates gathered in training, so each prediction is deterministic and independent of the other samples in the batch.
+  - id: q3
+    prompt: |
+      What is the main reason transformers use LayerNorm rather than BatchNorm?
+    correct: LN statistics are computed per token, so they don't depend on batch size, padding or train/eval mode
+    wrong:
+      - LN normalizes across sequence positions, giving each token global context
+      - LN has far fewer learnable parameters than BN
+      - BN cannot be backpropagated through a softmax
+    explanation: |
+      LN normalizes each token's feature vector on its own, which suits variable-length, padded sequences and batch-size-1 autoregressive decoding. It does not mix information across tokens, and both norms have $2d$ affine parameters.
+  - id: q4
+    prompt: |
+      Compared with LayerNorm, RMSNorm:
+    correct: Drops the mean subtraction (and usually the bias), rescaling by the root mean square only
+    wrong:
+      - Normalizes across the batch dimension instead of the feature dimension
+      - Drops the division and only subtracts the mean
+      - Uses running statistics at inference, like BatchNorm
+    explanation: |
+      $\mathrm{RMSNorm}(x) = \gamma\odot x/\mathrm{RMS}(x)$. It keeps LN's re-scaling invariance, drops re-centering, saves compute, and empirically performs about the same.
+  - id: q5
+    prompt: |
+      Which residual block is **Pre-LN**? ($F$ is attention or the MLP.)
+    correct: '$x + F(\mathrm{LN}(x))$'
+    wrong:
+      - '$\mathrm{LN}(x + F(x))$'
+      - '$\mathrm{LN}(x) + F(x)$'
+      - '$x + \mathrm{LN}(F(x))$'
+    explanation: |
+      Pre-LN normalizes the sublayer input and leaves the residual path as a pure identity. $\mathrm{LN}(x+F(x))$ is the original Post-LN. $x + \mathrm{LN}(F(x))$ resembles part of the sandwich-LN variant.
+  - id: q6
+    prompt: |
+      Which statement is **false**?
+    correct: Post-LN transformers train stably at large learning rates without any warmup, even when very deep
+    wrong:
+      - Pre-LN transformers need a final LayerNorm before the output projection
+      - BatchNorm's running statistics are updated only in training mode
+      - RMSNorm's output is unchanged if its input is multiplied by a positive scalar (ignoring $\epsilon$)
+    explanation: |
+      Post-LN has large gradients near the output at initialization and typically needs warmup. Xiong et al. (2020) showed that Pre-LN removes most of that need. The other three statements are true. For RMSNorm, $\mathrm{RMS}(\alpha x) = \alpha\,\mathrm{RMS}(x)$ for $\alpha > 0$.
+  - id: q7
+    prompt: |
+      Take $x = (1, 3)$ with $\gamma = 1$, $\beta = 0$ and $\epsilon = 0$. What do LayerNorm and RMSNorm output?
+    correct: LN gives $(-1, 1)$ and RMSNorm gives $(1/\sqrt5,\ 3/\sqrt5)$
+    wrong:
+      - LN gives $(-1/\sqrt2,\ 1/\sqrt2)$ and RMSNorm gives $(1/\sqrt5,\ 3/\sqrt5)$
+      - LN gives $(-1, 1)$ and RMSNorm gives $(-1, 1)$
+      - LN gives $(-0.5, 0.5)$ and RMSNorm gives $(0.25, 0.75)$
+    explanation: |
+      LN: $\mu = 2$, deviations $(-1,1)$, biased variance $1$, so the output is $(-1,1)$. Using the unbiased variance ($2$) gives the $1/\sqrt2$ distractor. RMSNorm: $\mathrm{RMS} = \sqrt{(1+9)/2} = \sqrt5$.
+  - id: q8
+    prompt: |
+      You run inference on a CNN with BatchNorm inside torch.no_grad() but forget model.eval(). What happens?
+    correct: Each batch is normalized with its own statistics and the running stats get overwritten, so predictions depend on batch composition
+    wrong:
+      - Nothing changes, because torch.no_grad() also switches BN to eval mode
+      - BN layers are skipped and activations pass through unnormalized
+      - Outputs are correct but slower, because gradients are still tracked
+    explanation: |
+      `no_grad` only disables autograd. Train mode is controlled separately, by `model.train()` and `model.eval()`. In train mode BN uses batch stats and updates the running buffers even without gradients.
+
+cards:
+  - id: f1
+    front: How does BatchNorm behave in training vs evaluation?
+    back: |
+      - **Train**: normalize with the minibatch mean and variance per channel, and update running stats by EMA.
+      - **Eval**: normalize with the stored running mean and variance. This is deterministic, per-sample, and foldable into the preceding layer.
+  - id: f2
+    front: Write the LayerNorm and RMSNorm formulas for a token $x\in\mathbb{R}^d$.
+    back: |
+      $$\mathrm{LN}(x)=\gamma\odot\frac{x-\mu}{\sqrt{\sigma^2+\epsilon}}+\beta$$
+
+      $$\mathrm{RMSNorm}(x)=\gamma\odot\frac{x}{\sqrt{\frac1d\sum_i x_i^2+\epsilon}}$$
+
+      Here $\mu$ and $\sigma^2$ (the biased variance) are computed over the $d$ features of that token.
+  - id: f3
+    front: Pre-LN vs Post-LN. Formulas and trade-off?
+    back: |
+      - **Post-LN**: $\mathrm{LN}(x+F(x))$. It needs warmup and is unstable when deep, but can reach slightly better quality.
+      - **Pre-LN**: $x+F(\mathrm{LN}(x))$. The identity residual path keeps it stable with little warmup, and it needs a final LN. The residual norm grows with depth, so deep layers contribute less.
+  - id: f4
+    front: For a tensor of shape $(N,C,H,W)$, which axes do BN, LN, InstanceNorm and GroupNorm average over?
+    back: |
+      - BN: $(N,H,W)$ per channel
+      - LN: $(C,H,W)$ per sample
+      - IN: $(H,W)$ per sample and channel
+      - GN: (channel group, $H$, $W$) per sample
+
+      With one group GN is LN. With $C$ groups it is IN.
+  - id: f5
+    type: open
+    front: Explain to an interviewer why transformers use LayerNorm or RMSNorm instead of BatchNorm.
+    back: |
+      BN couples examples through batch statistics. In sequence models that causes problems:
+
+      - Padding tokens and variable lengths pollute the stats.
+      - Per-device batches are often small.
+      - Autoregressive decoding runs one token at a time, so train and eval statistics differ badly.
+
+      LN normalizes each token's feature vector independently. It has no batch dependence and no train/eval gap, and it is cheap. RMSNorm goes further and drops the mean-centering, which saves compute with no quality loss. Empirically, BN in transformers trains worse because batch statistics fluctuate a lot across NLP batches (PowerNorm paper). The placement question also matters: pre-LN is used for stability at depth.
+  - id: f6
+    front: Your detection model must be fine-tuned with batch size 2 per GPU. What do you do about its BatchNorm layers?
+    back: |
+      Freeze BN: keep it in eval mode, use the pretrained running stats, and optionally freeze $\gamma$ and $\beta$. Alternatives are SyncBatchNorm across GPUs, or replacing BN with GroupNorm, which is batch-independent and standard in detection (Mask R-CNN variants).
+
+reading:
+  - title: Batch Normalization (Ioffe & Szegedy, 2015)
+    url: https://arxiv.org/abs/1502.03167
+    kind: paper
+  - title: Layer Normalization (Ba, Kiros & Hinton, 2016)
+    url: https://arxiv.org/abs/1607.06450
+    kind: paper
+  - title: Root Mean Square Layer Normalization (Zhang & Sennrich, 2019)
+    url: https://arxiv.org/abs/1910.07467
+    kind: paper
+    note: Why re-centering can be dropped.
+  - title: On Layer Normalization in the Transformer Architecture (Xiong et al., 2020)
+    url: https://arxiv.org/abs/2002.04745
+    kind: paper
+    note: Pre-LN vs Post-LN gradients at initialization, and why warmup is needed.

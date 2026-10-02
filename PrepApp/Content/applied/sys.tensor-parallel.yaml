@@ -1,0 +1,465 @@
+id: sys.tensor-parallel
+area: applied
+title: Tensor Parallelism (Megatron-style)
+summary: Splitting each matmul of a transformer layer across GPUs. Column- vs row-parallel layers, where the all-reduces go and why, vocab-parallel loss, communication cost, memory effect, and why TP stays inside one node.
+order: 210
+level: core
+tags: [parallelism, tensor-parallel, megatron, communication, distributed-training]
+prereqs: [sys.collectives, sys.memory-anatomy, sys.roofline]
+
+explainer:
+  - title: "The problem, and two ways to split a matmul"
+    body: |
+      Data parallelism (DP) gives every GPU a full copy of the model. That fails when one layer's weights, gradients and optimizer state, or its activations, do not fit on one GPU, and it also stops helping once the global batch cannot grow any further. **Tensor parallelism (TP)** instead splits *each weight matrix* of a layer across $t$ GPUs (the TP degree), so every GPU does $1/t$ of every matmul. The question is where the GPUs must then talk.
+
+      Notation: $X\in\mathbb{R}^{n\times h}$ holds the activations of $n=bs$ tokens ($b$ sequences of length $s$) with hidden size $h$. A linear layer computes $Y=XA$ with $A\in\mathbb{R}^{h\times k}$.
+
+      **Block-matrix refresher.** A product can be split along either dimension of $A$:
+
+      $$\begin{aligned}\text{columns: } & X[A_0\;A_1]=[XA_0\;\;XA_1]\\ \text{rows: } & [X_0\;X_1]\begin{bmatrix}A_0\\A_1\end{bmatrix}=X_0A_0+X_1A_1\end{aligned}$$
+
+      **Tiny example.** $X=\begin{bmatrix}1&2\\3&4\end{bmatrix}$, $A=\begin{bmatrix}1&0&2\\0&1&1\end{bmatrix}$, so $XA=\begin{bmatrix}1&2&4\\3&4&10\end{bmatrix}$.
+      - *Column-parallel* (2 ranks): rank 0 holds columns 1–2 of $A$ and gets $\begin{bmatrix}1&2\\3&4\end{bmatrix}$; rank 1 holds column 3 and gets $\begin{bmatrix}4\\10\end{bmatrix}$. Each rank needs the **full** $X$ and owns a **slice of the output's columns**. Computing it needs no communication.
+      - *Row-parallel*: rank 0 holds row 1 of $A$ and column 1 of $X$, giving $\begin{bmatrix}1&0&2\\3&0&6\end{bmatrix}$; rank 1 gives $\begin{bmatrix}0&2&2\\0&4&4\end{bmatrix}$. Each is a **full-size partial sum**, and only their sum is correct. Finishing it needs an **all-reduce** (every rank ends with the sum).
+
+      The whole of Megatron-style TP is choosing, for each matmul in a transformer layer, which of these two splits to use so that communication is as rare as possible.
+    source: Shoeybi et al. 2019 §3; Ultra-Scale Playbook "Tensor Parallelism"; Scaling Book Part 3 Cases 1–3
+
+  - title: "The MLP: why column-parallel first, then row-parallel"
+    body: |
+      ![2-way TP MLP. The GeLU and both matmuls run locally; the only communication is the sum at g.](sys.tensor-parallel/megatron-mlp)
+
+      A transformer MLP is $Z=\mathrm{GeLU}(XA)\,B$ with $A\in\mathbb{R}^{h\times F}$, $B\in\mathbb{R}^{F\times h}$ and width $F$ (often $4h$).
+
+      **Option 1: split $A$ by rows.** Then $XA=X_0A_0+X_1A_1$ is a partial sum, and GeLU must see the *finished* sum because it is nonlinear. With scalars: $\mathrm{GeLU}(1)+\mathrm{GeLU}(-1)\approx0.68$, but $\mathrm{GeLU}(1-1)=0$. So we would need an all-reduce *before* GeLU, plus another one after $B$.
+
+      **Option 2: split $A$ by columns**, $A=[A_0\cdots A_{t-1}]$ with $A_i\in\mathbb{R}^{h\times F/t}$. Each rank computes $Y_i=\mathrm{GeLU}(XA_i)\in\mathbb{R}^{n\times F/t}$. GeLU acts elementwise, so applying it to a column slice gives exactly that slice of the full result. No communication.
+
+      **Now the second matmul.** $Y=[Y_0\cdots Y_{t-1}]$ is split along $F$, which is the *contracting* dimension of $YB$. That is exactly the input a row-parallel layer wants: give rank $i$ the rows $B_i\in\mathbb{R}^{F/t\times h}$ that match its columns, and
+
+      $$Z=YB=\sum_{i=0}^{t-1}Y_iB_i.$$
+
+      Each rank computes $Z_i=Y_iB_i\in\mathbb{R}^{n\times h}$ locally, and **one all-reduce** forms $Z$. Had we split $B$ by columns instead, each rank would need the full $Y$, which means an all-gather of $n\times F$ values.
+
+      After the all-reduce every rank holds the same $Z$. Dropout and the residual add then run *redundantly* on every rank. That costs a little compute and saves a broadcast. With $t$ ranks the MLP's FLOPs and weights are divided by $t$, at the price of one all-reduce of an $n\times h$ tensor in the forward pass.
+    source: Shoeybi et al. 2019 §3 (MLP, eqs. 1–3); Narayanan et al. 2021 §2.3
+
+  - title: "Attention: split by heads"
+    body: |
+      ![2-way TP attention with 4 heads. Each rank owns whole heads; the output projection is row-parallel.](sys.tensor-parallel/megatron-attention)
+
+      Multi-head attention with $a$ heads of size $d=h/a$ computes, for head $j$,
+
+      $$\mathrm{head}_j=\mathrm{softmax}\Big(\tfrac{Q_jK_j^\top}{\sqrt d}\Big)V_j,$$
+
+      where $Q_j=XW_Q^{(j)}$ uses only the $d$ columns of $W_Q$ that belong to head $j$ (likewise $K_j$, $V_j$). The heads are concatenated and projected: $O=[\mathrm{head}_1\cdots\mathrm{head}_a]\,W_O$.
+
+      **Step 1: QKV column-parallel.** Give rank $i$ the columns of $W_Q,W_K,W_V$ for its $a/t$ heads. It computes those heads' $Q,K,V$ from the full $X$, then their softmax and weighted sum, entirely locally. No head ever looks at another head's scores, so no communication is needed inside attention.
+
+      **Step 2: output projection row-parallel.** Rank $i$ holds $H_i\in\mathbb{R}^{n\times h/t}$, the concatenation of its heads. Split $W_O$ into the matching row blocks $W_O^{(i)}\in\mathbb{R}^{h/t\times h}$:
+
+      $$O=\sum_{i}H_i\,W_O^{(i)}.$$
+
+      This is the same pattern as the MLP: a column-parallel layer feeds a row-parallel layer directly, and **one all-reduce** finishes the block.
+
+      **Divisibility.** Each rank needs whole heads, so $t$ must divide $a$. With grouped-query attention (GQA), $k$ key/value heads are shared by groups of query heads. If $t\le k$, each rank gets $k/t$ KV heads with their query groups. If $t>k$, some KV heads must be **replicated** on several ranks, which wastes memory, and their gradients must be kept in sync. For example, LLaMA-3 8B has 8 KV heads, which caps clean TP at 8.
+    source: Shoeybi et al. 2019 §3 (self-attention); Ultra-Scale Playbook "Tensor Parallelism in a Transformer Block"
+
+  - title: "Backward pass: the f and g operators and the all-reduce count"
+    body: |
+      ![One layer under TP. Each f is free in forward and an all-reduce in backward; each g is the reverse.](sys.tensor-parallel/layer-comm)
+
+      Megatron wraps each parallel block in two conjugate operators:
+      - $g$ (after the row-parallel layer): **all-reduce in forward, identity in backward**.
+      - $f$ (before the column-parallel layer): **identity in forward, all-reduce in backward**.
+
+      **Why $g$'s backward is free.** $Z=\sum_iZ_i$, so $\partial Z/\partial Z_i=I$ and $\partial L/\partial Z_i=\partial L/\partial Z$. Everything after $Z$ runs redundantly on every rank, so every rank already holds the same $\partial L/\partial Z$ and just keeps it.
+
+      **Why $f$'s backward needs an all-reduce.** Every rank uses the same input $X$ in its own branch, $U_i=XA_i$. By the multivariable chain rule, the gradient of a variable used in several places is the *sum* over its uses:
+
+      $$\frac{\partial L}{\partial X}=\sum_{i=0}^{t-1}\frac{\partial L}{\partial U_i}A_i^\top.$$
+
+      Rank $i$ can compute only its own term, because it holds only $A_i$. Summing the terms is an all-reduce.
+
+      **Weight gradients need no TP communication.** $\partial L/\partial A_i=X^\top\,\partial L/\partial U_i$ and $\partial L/\partial B_i=Y_i^\top\,\partial L/\partial Z$ use only local tensors, and each rank owns its shard. Replicated parameters such as LayerNorm weights receive identical gradients on every rank, because their inputs and upstream gradients are identical, so they stay in sync without communication. (DP still all-reduces gradients across replicas. That is a separate group.)
+
+      **Count.** Each layer has two blocks (attention and MLP), so:
+      - forward: 2 all-reduces (the two $g$'s);
+      - backward: 2 all-reduces (the two $f$'s);
+      - per training step: $4L$ for $L$ layers, plus a few for the embedding and loss.
+
+      "Two all-reduces per layer" refers to the forward pass only. Megatron's full recomputation re-runs the whole layer forward just before its backward, including its 2 all-reduces. That is a property of the implementation: strictly, the second $g$'s output is already checkpointed by the next layer.
+    source: Shoeybi et al. 2019 §3 (Code 1, Fig. 3, Fig. 4); Korthikanti et al. 2022 §4.2.1, §6.3 Table 4; Narayanan et al. 2021 §3.5; Ultra-Scale Playbook "Tensor Parallelism in a Transformer Block" (LayerNorm note)
+
+  - title: "Embeddings and the loss without gathering logits"
+    body: |
+      The vocabulary $V$ is large (tens to hundreds of thousands), so the $V\times h$ embedding is split along $V$. Each rank holds $V/t$ rows.
+
+      **Input embedding.** For token id $k$, the rank whose row range contains $k$ outputs row $k$, and the other ranks output zeros. An all-reduce (a $g$) sums these, so every rank gets the embedding. Megatron pads $V$ to a multiple of $128t$ so that the shards are equal and well aligned: GPT-2's 50,257 became 51,200 with $t=8$.
+
+      **Output layer.** With tied weights, the logits $XE^\top$ are column-parallel over $V$. Rank $i$ holds logits $z_j$ for its slice of $V$, shape $[n, V/t]$. Gathering the full logits would move $n\times V$ values per rank. With $n=4096$ and $V=128{,}256$ in bf16 that is about 1.05 GB.
+
+      **Log-sum-exp refresher.** The cross-entropy for target $y$ is $\ell=\log\sum_je^{z_j}-z_y$. To avoid overflow we subtract the maximum $M=\max_jz_j$:
+
+      $$\log\sum_je^{z_j}=M+\log\sum_je^{z_j-M}.$$
+
+      **Parallel cross-entropy** computes this from shards with three small all-reduces over $n$ numbers each:
+      1. Each rank takes the max over its shard, and an all-reduce with *max* gives $M$ for every token.
+      2. Each rank computes $S_i=\sum_{j\in\text{shard}}e^{z_j-M}$, and an all-reduce with *sum* gives $S$.
+      3. The rank that owns $y$ contributes $z_y$ (the others contribute 0), and an all-reduce with sum gives $z_y$.
+
+      Then $\ell=M+\log S-z_y$. In fp32 that is $3\times4096\times4$ bytes $\approx49$ KB instead of 1.05 GB. The backward is local too: $\partial\ell/\partial z_j=e^{z_j-M}/S-\mathbb{1}[j=y]$ needs only the local logits plus $M$ and $S$. PyTorch exposes this as `loss_parallel`.
+    source: Shoeybi et al. 2019 §3 (output embedding) and §4.2 (vocab padding); PyTorch TP tutorial "Apply Loss Parallel"
+
+  - title: "Communication cost: why TP stays inside a node"
+    body: |
+      ![Per-layer forward compute shrinks as $1/t$; per-rank all-reduce time does not. H100, bf16, $b=1$, $s=4096$, $h=8192$, from the formulas below.](sys.tensor-parallel/comm-vs-compute)
+
+      **Recap from `sys.collectives`.** A ring all-reduce of $S$ bytes over $t$ ranks sends $2\frac{t-1}{t}S$ bytes per rank, taking time $\approx2\frac{t-1}{t}S/W$ on links of bandwidth $W$.
+
+      **Per layer, per micro-batch.** Each all-reduce carries an $n\times h$ activation, so $S=2bsh$ bytes in bf16. The forward pass of a GPT-style layer costs $24bsh^2+4bs^2h$ FLOPs: $6bsh^2$ for QKV, $2bsh^2$ for the output projection, $16bsh^2$ for the MLP, and $4bs^2h$ for the attention scores. Each rank does $1/t$ of this.
+
+      **Worked example** ($b=1$, $s=4096$, $h=8192$, $t=8$; H100 peak $C=989$ TFLOP/s):
+      - compute: $7.15\times10^{12}/8$ FLOPs, which takes $\approx0.90$ ms;
+      - one all-reduce: $S=67$ MB, per-rank traffic $2\cdot\frac78\cdot67\approx117$ MB;
+      - over NVLink (450 GB/s): 2 all-reduces take $\approx0.52$ ms, about 58% of the compute;
+      - with the TP group spread one GPU per node, each GPU's data leaves through its own 50 GB/s NIC: $\approx4.7$ ms, which is 5× the compute. A TP group spanning two *full* nodes does far better, because all 8 NICs per node carry traffic: then $t<F/2475$, and the Scaling Book allows ≈16-way TP over exactly 2 nodes.
+
+      **The trend.** Compute per rank scales as $1/t$, while per-rank traffic $2\frac{t-1}{t}S$ *rises* towards $2S$, so comm/compute grows roughly linearly in $t$.
+
+      **Roofline condition (Scaling Book).** For the MLP, compute is $4nhF/(tC)$ and the communication is about $4nh/W$ (bf16, $\frac{t-1}{t}\approx1$). Compute exceeds communication only if
+
+      $$t<\frac{F\,W}{C}.$$
+
+      Within a node $C/W\approx2200$, so $t<F/2200$. For $F=28{,}672$ that gives $t<13$, so 8-way TP, one node. The rule assumes a 2-matrix MLP. A gated MLP (SwiGLU) has 3 matrices and 1.5× the compute, which loosens the bound to $t<1.5\,FW/C$. This assumes perfect *overlap*. Plain Megatron TP has none: the next op needs the all-reduce's result, so it adds directly to step time. These are peak (vendor or Scaling Book) numbers. Achieved FLOP/s (≈80–85%) and NVLink (≈370 GB/s) are both lower, so ratios hold roughly.
+    source: Narayanan et al. 2021 §3.2 and Takeaway #1; Scaling Book Part 12 "Tensor Parallelism"; Ultra-Scale Playbook "Tensor Parallelism in a Transformer Block"
+
+  - title: "Memory: what TP divides, and what it does not"
+    body: |
+      **Model states.** The sharded matrices (QKV, output projection, both MLP matrices, embedding) are split $t$ ways, and so are their gradients and optimizer states. Only small tensors are replicated: LayerNorm weights and the row-parallel layers' biases.
+
+      **Activations.** Korthikanti et al. count the bytes stored for backward in one layer (bf16, 1-byte dropout masks):
+
+      $$\text{no TP: }\;sbh\Big(34+\frac{5as}{h}\Big).$$
+
+      The $5as^2b$ part is the attention-score tensors (softmax output, its dropout mask, dropout output). Under TP, the tensors *inside* the parallel blocks are split, but the block inputs and the work done outside the blocks are replicated:
+      - replicated, $10sbh$: two LayerNorm inputs ($4sbh$), the inputs to QKV and to the first MLP matmul ($2sbh$ each), and two dropout masks ($sbh$ each);
+      - split, $24sbh$: $Q,K$ ($4sbh$), $V$ ($2sbh$), the input to the output projection ($2sbh$), and the MLP's $8sbh$ input to $B$ plus $8sbh$ input to GeLU;
+      - split: the $5as^2b$ score tensors.
+
+      $$\text{TP: }\;sbh\Big(10+\frac{24}{t}+\frac{5as}{ht}\Big).$$
+
+      **Example** (GPT-3-like: $s=2048$, $b=1$, $h=12288$, $a=96$, $t=8$): $5as/h=80$. Without TP, $114\,sbh\approx2.87$ GB per layer. With 8-way TP, $(10+3+10)\,sbh=23\,sbh\approx0.58$ GB. The replicated $10sbh$ is now 43% of what remains, and adding more TP cannot touch it. **Sequence parallelism** (next lesson, `sys.sequence-context-parallel`) shards those regions along $s$.
+    source: Korthikanti et al. 2022 §4.1 (eq. 1), §4.2.1 (eq. 2), §4.2.2; Shoeybi et al. 2019 §3
+
+  - title: "Practical details and pitfalls"
+    body: |
+      - **Dropout RNG.** Dropout *outside* the parallel regions (on the residual stream) acts on replicated tensors, so all TP ranks must draw the *same* mask, or the replicas diverge. Dropout *inside* (on attention probabilities of different heads) must use *different* streams per rank, or the shards' masks would be copies of each other. Megatron keeps a separate per-rank generator for the inside.
+      - **Divisibility.** $t$ must divide $a$, the KV head count (or KV heads get replicated), $F$, and the padded $V$.
+      - **Small matmuls.** Each rank multiplies an $[n,h]$ by an $[h,F/t]$ matrix. At large $t$ these GEMMs get skinny and lose efficiency (`sys.roofline`), on top of the communication cost.
+      - **Overlap.** Async TP, or *collective matmul*, splits each matmul into chunks and communicates one chunk while computing the next, hiding part of the all-reduce. Plain Megatron TP leaves it exposed.
+      - **Composition.** TP groups sit inside a node and DP (or FSDP) runs across nodes. Megatron trained an 8.3B model with 8-way TP × 64-way DP on 512 GPUs. PyTorch builds this as a 2-D device mesh, with `tp` within a host and `dp` across hosts.
+      - **TP vs FSDP.** Both shard weights. FSDP moves *weights*, which can be prefetched and amortised over the whole batch. TP moves *activations* on the critical path, twice per layer per pass. So FSDP tolerates the slower inter-node network, and TP needs NVLink.
+      - **Inference.** In memory-bound decoding, each GPU streams only $1/t$ of the weights per token, so per-token latency falls. The all-reduces carry only $b\times h$ values per token and become latency-bound rather than bandwidth-bound. With about $2L$ of them per token, their latency puts a floor under per-token time, so adding ranks gives diminishing returns.
+    source: Shoeybi et al. 2019 App. B.1–B.2; Narayanan et al. 2021 §3.3.2; Scaling Book Part 3 "How to overlap matmul communication with compute"; Liang et al. 2024 (TorchTitan) AsyncTP; PyTorch TP tutorial "Combine Tensor Parallel with FSDP"; kipply 2022 §model parallelism
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Where are the all-reduces in a Megatron MLP?"** One, after the row-parallel second GEMM, in forward. One before the column-parallel first GEMM, in backward, for $\partial L/\partial X$.
+      - **"Why column first?"** GeLU is nonlinear, so it needs complete pre-activations. A column split makes them complete locally, and the column-sliced output is exactly the row-split input the second GEMM needs.
+      - **"How many all-reduces per step?"** $4L$: two per layer forward, two backward, plus embedding and loss. Add $2L$ with Megatron's full recomputation.
+      - **"How many bytes?"** Each all-reduce carries $bsh$ values. Per layer per micro-batch, each rank sends $4\cdot2\frac{t-1}{t}\cdot bsh=8bsh\frac{t-1}{t}$ elements.
+      - **"Why within a node?"** Per-rank compute shrinks as $1/t$ but per-rank all-reduce traffic does not, and the traffic is on the critical path. Placed one GPU per node (own 50 GB/s NIC), it takes ≈ 5× the compute. Even a sensible cross-node layout only gets $t<F/2475$. So TP stays within one node, at most two.
+      - **"What does TP not shard?"** LayerNorm, dropout and residual activations ($10sbh$ per layer), small replicated parameters, and the communication itself.
+      - **"How is the loss computed?"** Logits stay sharded over $V$. Three all-reduces of $n$ scalars (max, sum of exponentials, target logit) replace gathering $n\times V$ logits.
+      - **"TP or FSDP for a 70B model on 64 GPUs?"** Usually both: 8-way TP inside each node to cut per-GPU weight and activation memory, and FSDP/DP across the 8 nodes, whose weight traffic can be overlapped.
+    source: Shoeybi et al. 2019 §3; Narayanan et al. 2021 §3.2; Korthikanti et al. 2022 §4.2.1; Scaling Book Part 12 "Tensor Parallelism"
+
+  - title: "Key results"
+    body: |
+      - Column-parallel $X[A_0\cdots]$: full input, sliced output, no communication. Row-parallel: sliced input, partial-sum output, all-reduce.
+      - MLP and attention are each one column-parallel layer followed by one row-parallel layer. Attention is split by heads ($t\mid a$).
+      - $f$: identity forward, all-reduce backward. $g$: all-reduce forward, identity backward.
+      - All-reduces: 2 per layer forward, 2 backward, $4L$ per step (more with recomputation). Each carries $bsh$ values:
+
+      $$\text{per rank, per layer: }8bsh\tfrac{t-1}{t}\text{ elements}$$
+
+      - Activation memory per layer with TP:
+
+      $$sbh\Big(10+\frac{24}{t}+\frac{5as}{ht}\Big)\text{ bytes}$$
+
+      - Compute-bound only if $t<FW/C$ ($\approx F/2200$ on H100 NVLink), and the all-reduce is on the critical path unless overlapped. So TP stays within the NVLink domain, typically $t\le8$.
+      - Parallel cross-entropy needs 3 all-reduces of $n$ scalars instead of gathering $n\times V$ logits.
+    source: Shoeybi et al. 2019 §3; Narayanan et al. 2021 §3.2; Korthikanti et al. 2022 §4.2.1; Scaling Book Part 12
+
+quiz:
+  - id: q1
+    prompt: |
+      A Megatron 4-way TP MLP has $h=4096$ and $F=16384$, with $Z=\mathrm{GeLU}(XA)B$. What are rank 0's weight shards?
+    correct: "$A_0$: 4096 × 4096 and $B_0$: 4096 × 4096"
+    wrong:
+      - "$A_0$: 1024 × 16384 and $B_0$: 16384 × 1024"
+      - "$A_0$: 4096 × 4096 and $B_0$: 16384 × 1024"
+      - "$A_0$: 1024 × 16384 and $B_0$: 4096 × 4096"
+    explanation: |
+      $A$ is split by columns ($h\times F/t=4096\times4096$), so GeLU stays local. $B$ is split by rows to match ($F/t\times h=4096\times4096$). The tempting "16384 × 1024" for $B_0$ is a column split of $B$, which would need the full $Y$ on every rank, i.e. an all-gather between the two GEMMs.
+    source: Shoeybi et al. 2019 §3 (MLP)
+
+  - id: q2
+    prompt: |
+      A colleague implements the TP MLP with the *first* GEMM row-parallel (and $X$ split along $h$). What is the consequence?
+    correct: An extra all-reduce is needed before GeLU, since GeLU needs completed sums
+    wrong:
+      - Nothing changes, because GeLU can be applied to each partial sum and then added
+      - The output is wrong but costs no extra communication, a silent bug
+      - The second GEMM must then be column-parallel, which removes all communication
+    explanation: |
+      A row split leaves $X_0A_0+X_1A_1$ as partial sums, and $\mathrm{GeLU}(a+b)\ne\mathrm{GeLU}(a)+\mathrm{GeLU}(b)$ (e.g. $\mathrm{GeLU}(1)+\mathrm{GeLU}(-1)\approx0.68$ vs $\mathrm{GeLU}(0)=0$). A correct implementation must synchronise before the nonlinearity, so it adds a communication point. Applying GeLU per partial sum is exactly the mistake the column split avoids.
+    source: Shoeybi et al. 2019 §3 (eq. 2)
+
+  - id: q3
+    prompt: |
+      A 32-layer transformer is trained with Megatron TP (no activation recomputation). Ignoring the embedding and loss, how many TP all-reduces does each rank perform per training step (one micro-batch)?
+    correct: "128"
+    wrong:
+      - "64"
+      - "192"
+      - "256"
+    explanation: |
+      Each layer has 2 all-reduces in the forward pass (the $g$'s after attention and MLP) and 2 in the backward pass (the $f$'s), so $4\times32=128$. 64 counts only the forward pass, the usual misreading of "two all-reduces per layer". 192 would apply with Megatron's full recomputation, which re-runs the forward, all-reduces included.
+    source: Shoeybi et al. 2019 §3 (Fig. 4); Narayanan et al. 2021 §3.2, §3.5; Korthikanti et al. 2022 §6.3
+
+  - id: q4
+    prompt: |
+      With $t=4$, $b=2$, $s=2048$, $h=4096$ and bf16 activations, how many bytes does each rank send in **one** TP all-reduce, using a ring?
+    correct: ≈ 50 MB
+    wrong:
+      - ≈ 34 MB
+      - ≈ 67 MB
+      - ≈ 8.4 MB
+    explanation: |
+      The tensor is $2bsh=33.6$ MB. A ring all-reduce sends $2\frac{t-1}{t}S=1.5\times33.6\approx50$ MB per rank: a reduce-scatter and an all-gather, each moving $\frac{t-1}{t}S$. 34 MB is the tensor size itself. 67 MB is $2S$, which drops the $(t-1)/t$ factor and is the large-$t$ limit, not the value at $t=4$.
+    source: Narayanan et al. 2021 §3.2; Scaling Book Part 3 "Case 3"
+
+  - id: q5
+    prompt: |
+      Which statement about the memory effect of Megatron TP (without sequence parallelism) is **false**?
+    correct: LayerNorm inputs are divided by $t$, like the activations inside attention
+    wrong:
+      - The MLP weights, their gradients and their Adam moments are divided by $t$
+      - The attention-score activations ($\propto as^2b$) are divided by $t$
+      - The dropout masks on the residual stream are stored in full on every rank
+    explanation: |
+      LayerNorm runs outside the parallel regions on the replicated tensor, so its input ($2sbh$ per LayerNorm) is stored in full on every rank. It is part of the $10sbh$ term that does not shrink with $t$. The attention scores are split, because each rank owns $a/t$ heads, and so are the sharded weights and their optimizer state.
+    source: Korthikanti et al. 2022 §4.2.1–4.2.2
+
+  - id: q6
+    prompt: |
+      Use the TP activation formula $sbh(10+24/t+5as/(ht))$ bytes with $s=2048$, $b=1$, $h=8192$, $a=64$, $t=8$. Roughly how much activation memory does one layer store?
+    correct: ≈ 0.39 GB
+    wrong:
+      - ≈ 0.24 GB
+      - ≈ 1.9 GB
+      - ≈ 0.22 GB
+    explanation: |
+      $5as/(ht)=5\cdot64\cdot2048/(8192\cdot8)=10$, so the bracket is $10+3+10=23$, and $23\times2048\times8192\approx0.39$ GB. 0.24 GB divides the whole no-TP count ($114\,sbh$) by 8, which wrongly shards the replicated $10sbh$. (Sharding it is what sequence parallelism does, in the next lesson.) 1.9 GB is the no-TP value. 0.22 GB drops the attention-score term.
+    source: Korthikanti et al. 2022 §4.2.1 (eq. 2)
+
+  - id: q7
+    prompt: |
+      Using the Scaling Book rule that a TP MLP is compute-bound only if $t<F\,W/C$ (H100 within a node: $C/W\approx2200$), what is the largest power-of-two TP degree that stays compute-bound for $F=14336$?
+    correct: "4"
+    wrong:
+      - "8"
+      - "2"
+      - "16"
+    explanation: |
+      $F/2200\approx6.5$, so $t=4$ satisfies the rule and $t=8$ does not (it would need $F>17{,}600$). Teams do still use $t=8$ for such models when memory demands it, accepting communication overhead. The rule also assumes perfect overlap, which plain Megatron TP does not achieve, so it is optimistic.
+    source: Scaling Book Part 12 "Tensor Parallelism"
+
+  - id: q8
+    prompt: |
+      A 70B model is trained on 64 H100s (8 nodes). Why is the usual layout 8-way TP inside each node and FSDP/DP across nodes, rather than the reverse?
+    correct: TP all-reduces activations on the critical path per layer; FSDP weights are prefetchable
+    wrong:
+      - FSDP moves more bytes than TP per step, so it needs the faster NVLink links in a node
+      - TP has no backward-pass communication, so slow links would only hurt its forward pass
+      - FSDP cannot shard optimizer state across nodes, so it has to stay inside a single node
+    explanation: |
+      TP's all-reduces carry activations, happen twice per layer per pass, and block the next op, so they need NVLink bandwidth. FSDP all-gathers weights that are known in advance, so it can prefetch them behind compute and amortise them over the batch, which suits the slower inter-node network. The "more bytes" distractor misses the point: what matters is whether the traffic can be hidden and how often it happens per unit of compute.
+    source: PyTorch TP tutorial "Combine Tensor Parallel with FSDP"; Narayanan et al. 2021 Takeaway #1; Scaling Book Part 12
+
+  - id: q9
+    prompt: |
+      With vocab-parallel logits ($[n, V/t]$ per rank), what must be communicated to compute the cross-entropy loss for $n$ tokens?
+    correct: Three all-reduces of $n$ scalars each (max, sum-exp, target logit)
+    wrong:
+      - An all-gather of all logits so each rank can run a standard softmax
+      - One all-reduce of the $n\times V/t$ shards to sum the partial logits
+      - A reduce-scatter of the gradient over $V$ followed by an all-gather of logits
+    explanation: |
+      Log-sum-exp decomposes over shards. A max-all-reduce gives the stabiliser $M$, a sum-all-reduce gives $S=\sum e^{z_j-M}$, and the owner of the target supplies $z_y$. Then $\ell=M+\log S-z_y$. Gathering logits works but moves $n\times V$ values (≈1 GB for 4096 tokens and a 128k vocabulary), which is what Megatron's fused loss avoids. The logits are not partial sums (each shard holds complete logits for its columns), so "summing partial logits" is wrong.
+    source: Shoeybi et al. 2019 §3; PyTorch TP tutorial "Apply Loss Parallel"
+
+  - id: q10
+    prompt: |
+      A GQA model has 32 query heads and 8 KV heads. What happens if you use 16-way TP?
+    correct: Each KV head is replicated on two ranks, costing memory and a gradient sync
+    wrong:
+      - Each KV head is split along its head dimension, with no extra communication
+      - Nothing changes, because KV heads are not involved in tensor parallelism at all
+      - The model must be retrained with 16 query heads to match the TP degree
+    explanation: |
+      TP gives each rank whole heads. With 16 ranks and 8 KV heads, each rank has 2 query heads but needs the KV head of their group, so KV heads (and their projection weights) are duplicated, and their gradients must be summed to keep the copies identical. Splitting a head along its dimension would make $QK^\top$ a partial sum that needs a reduction before the softmax.
+    source: Ultra-Scale Playbook "Tensor Parallelism in a Transformer Block"
+
+  - id: q11
+    prompt: |
+      In a column-parallel layer, rank $i$ computes $U_i=XA_i$ from the shared input $X$. In backward, what is $\partial L/\partial X$?
+    correct: $\sum_i(\partial L/\partial U_i)A_i^\top$; the ranks' partial terms are all-reduced
+    wrong:
+      - $(\partial L/\partial U_0)A_0^\top$ alone, since every rank holds the same $X$
+      - The concatenation of the $(\partial L/\partial U_i)A_i^\top$, formed by an all-gather
+      - The average $\frac1t\sum_i(\partial L/\partial U_i)A_i^\top$, as in data parallelism
+    explanation: |
+      $X$ is used in $t$ branches, and the chain rule sums gradients over uses. Each term is a full $n\times h$ matrix that only rank $i$ can compute, because only it holds $A_i$, so an all-reduce (sum) is needed. This is the backward of $f$. Averaging is the DP convention for gradients of replicated *weights* over different data. Here the branches are parts of one computation on the same data, so they add.
+    source: Shoeybi et al. 2019 §3 (f operator, Code 1)
+
+  - id: q12
+    prompt: |
+      All TP ranks seed the dropout generator used *inside* the attention block (on attention probabilities) with the same seed. What is the effect?
+    correct: Different heads get identical masks, so dropout is correlated, not independent
+    wrong:
+      - Training crashes, since the dropout masks no longer match the local tensor shapes
+      - Results become identical to single-GPU training with the same seed
+      - The residual stream diverges across ranks, so the replicas drift apart
+    explanation: |
+      Each rank draws a mask for its $a/t$ heads. With the same seed, rank 0's heads and rank 1's heads get the same pattern, so the dropout noise is no longer independent across the full tensor. Megatron uses a separate, per-rank generator inside parallel regions. The residual-stream failure is the opposite mistake: *different* seeds for dropout outside the parallel regions.
+    source: Shoeybi et al. 2019 App. B.2
+
+  - id: q13
+    prompt: |
+      Within one node (fixed $b$, $s$, $h$), you raise TP from $t=4$ to $t=8$. By roughly what factor does the ratio (per-rank all-reduce time) / (per-rank compute time) change?
+    correct: It rises ≈2.3×, as compute halves and traffic grows 7/6
+    wrong:
+      - It stays the same, as both terms scale with $1/t$
+      - It doubles exactly, as only the compute term changes
+      - It halves, as the all-reduce is split across more ranks
+    explanation: |
+      Compute per rank halves. Per-rank ring traffic goes from $2\cdot\frac34S$ to $2\cdot\frac78S$, a factor of $7/6$. So the ratio grows by $2\times7/6\approx2.33$. "Doubles exactly" ignores the $(t-1)/t$ factor. "Stays the same" wrongly assumes the all-reduce shrinks with $t$, but every rank must still send and receive about $2S$.
+    source: Narayanan et al. 2021 §3.2; Scaling Book Part 12 "Tensor Parallelism"
+
+cards:
+  - id: f1
+    front: Column-parallel vs row-parallel linear layer $Y=XA$. What does each rank hold and what communication finishes it?
+    back: |
+      - **Column-parallel**, $A=[A_0\cdots]$: each rank holds the full $X$ and a column block $A_i$, and outputs the column slice $XA_i$. No communication (gather only if a full $Y$ is needed).
+      - **Row-parallel**, $A=[A_0;A_1;\dots]$: each rank holds a column slice $X_i$ and a row block $A_i$, and outputs the full-size partial sum $X_iA_i$. An **all-reduce** finishes it.
+    source: Shoeybi et al. 2019 §3; Ultra-Scale Playbook "Tensor Parallelism"
+
+  - id: f2
+    front: Define Megatron's $f$ and $g$ operators and where they sit.
+    back: |
+      - $f$ is placed before each column-parallel block. It is the **identity in forward and an all-reduce in backward**, summing $\partial L/\partial X$ over ranks.
+      - $g$ is placed after each row-parallel block. It is an **all-reduce in forward and the identity in backward**.
+      - They are conjugates.
+    source: Shoeybi et al. 2019 §3 (Fig. 3, Code 1)
+
+  - id: f3
+    front: How many TP all-reduces per layer and per step, and how many elements does each rank send per layer per micro-batch?
+    back: |
+      - 2 per layer in forward, 2 in backward: $4L$ per step, plus embedding and loss, and plus $2L$ with Megatron's full recomputation.
+      - Each carries $bsh$ values.
+      - Per rank per layer: $8bsh\frac{t-1}{t}$ elements (×2 bytes in bf16).
+    source: Narayanan et al. 2021 §3.2, §3.5; Korthikanti et al. 2022 §6.3
+
+  - id: f4
+    front: Activation memory per layer under $t$-way TP (Korthikanti), and what the term that does not shrink is.
+    back: |
+      $$sbh\Big(10+\frac{24}{t}+\frac{5as}{ht}\Big)\text{ bytes (bf16)}$$
+
+      $10sbh$ is replicated: two LayerNorm inputs ($4sbh$), the inputs to QKV and to the first MLP GEMM ($2sbh$ each), and two dropout masks ($sbh$ each). Sequence parallelism removes it. Without TP the count is $sbh(34+5as/h)$.
+    source: Korthikanti et al. 2022 §4.1–4.2.2
+
+  - id: f5
+    front: When is a TP MLP compute-bound (Scaling Book rule), and what does it give for an H100 node?
+    back: |
+      $$t<\frac{F\,W}{C}$$
+
+      $F$ is the MLP width, $W$ the per-GPU link bandwidth and $C$ the peak FLOP/s. On H100 NVLink $C/W\approx2200$, so $t<F/2200$ (≈13 for $F=28{,}672$; $F/2475\approx11.6$ if the group spans whole nodes, e.g. 16 GPUs on 2 nodes, at the 400 GB/s node rate). The rule assumes perfect overlap and bf16, so it is optimistic. In practice TP stays within one 8-GPU node.
+    source: Scaling Book Part 12 "Tensor Parallelism"
+
+  - id: f6
+    front: How does vocab-parallel cross-entropy avoid gathering logits?
+    back: |
+      Three all-reduces of $n$ scalars:
+      1. max of the local maxima → $M$;
+      2. sum of local $\sum e^{z_j-M}$ → $S$;
+      3. sum of the target logit, which only its owning rank contributes → $z_y$.
+
+      Then $\ell=M+\log S-z_y$. The backward, $e^{z_j-M}/S-\mathbb{1}[j=y]$, is local.
+    source: Shoeybi et al. 2019 §3; PyTorch TP tutorial "Apply Loss Parallel"
+
+  - id: f7
+    type: open
+    front: Derive where communication is needed in a tensor-parallel transformer MLP, forward and backward.
+    back: |
+      1. $Z=\mathrm{GeLU}(XA)B$. Splitting $A$ by rows gives partial sums, and GeLU is nonlinear, so you would need a sync before it. Split $A$ by **columns** instead: $Y_i=\mathrm{GeLU}(XA_i)$ is local because GeLU is elementwise.
+      2. $Y$ is now split along $F$, the contracting dimension of $YB$. So split $B$ by **rows**: $Z=\sum_iY_iB_i$. Each rank has a partial sum, and **one all-reduce** ($g$) completes $Z$ in forward.
+      3. Backward through $g$: $\partial L/\partial Z_i=\partial L/\partial Z$, identical on all ranks, so no communication.
+      4. Weight gradients $\partial L/\partial B_i=Y_i^\top\partial L/\partial Z$ and $\partial L/\partial A_i=X^\top\partial L/\partial U_i$ are local.
+      5. Input gradient: $X$ feeds every branch, so $\partial L/\partial X=\sum_i\partial L/\partial U_i\,A_i^\top$, an **all-reduce** ($f$'s backward).
+      6. Total: one forward plus one backward all-reduce per MLP. Attention is the same pattern with heads, so a layer has 2 + 2.
+    source: Shoeybi et al. 2019 §3
+
+  - id: f8
+    type: open
+    front: Explain to an interviewer why tensor parallelism is kept within a node. Use numbers.
+    back: |
+      - **Scaling.** Per-rank compute per layer scales as $1/t$. Per-rank all-reduce traffic is $2\frac{t-1}{t}\cdot2bsh$ bytes, which grows towards $4bsh$. So comm/compute rises roughly linearly with $t$.
+      - **Critical path.** The all-reduces sit on the critical path: the next LayerNorm needs the summed output, so unless async TP is used they are not hidden.
+      - **Numbers** ($b=1$, $s=4096$, $h=8192$, $t=8$, H100): forward compute ≈ 0.90 ms per layer. Two all-reduces take ≈ 0.52 ms on NVLink (450 GB/s), but ≈ 4.7 ms if each GPU must use its own 50 GB/s NIC (the group spread one GPU per node), about 5× the compute. A group spanning two full nodes uses the 400 GB/s node egress, and allows $t<F/2475$.
+      - **Roofline.** $t<FW/C\approx F/2200$, so about 8–13 for typical $F$.
+      - **Consequence.** TP within the NVLink domain; PP or FSDP/DP across nodes, where traffic is rarer or can be overlapped.
+    source: Narayanan et al. 2021 §3.2 Takeaway #1; Scaling Book Part 12 "Tensor Parallelism"
+
+  - id: f9
+    type: open
+    front: Compare tensor parallelism with FSDP as ways to shard a large model. What does each communicate, when, and what does each fail to shard?
+    back: |
+      - **TP** shards weights *and* the compute and activations inside each matmul. It communicates **activations** ($bsh$ per all-reduce, $4L$ per step), which are on the critical path and scale with tokens. It needs NVLink and is limited by $t\mid a$ and skinny GEMMs. It does not shard LayerNorm/dropout activations ($10sbh$).
+      - **FSDP/ZeRO-3** shards weights, gradients and optimizer state, but each rank still computes full layers on its own data. It communicates **weights** (all-gather forward and backward, reduce-scatter of gradients). These are known in advance, so they can be prefetched and amortised over the per-GPU batch; compute-bound needs ≈ 2500 tokens/GPU across nodes. It does not shard activations at all, and it needs a large enough global batch.
+      - **In practice** they are combined: TP inside the node, FSDP across nodes (a 2-D mesh). TP lets you scale GPUs without growing the batch.
+    source: PyTorch TP tutorial "When and Why you should apply Tensor Parallel"; Scaling Book Part 12; Korthikanti et al. 2022 §4.2.1
+
+  - id: f10
+    type: open
+    front: Walk through vocab-parallel embeddings and loss in Megatron, including why it matters.
+    back: |
+      - **Input embedding.** The $V\times h$ table is split by rows ($V/t$ per rank). For token $k$ the owning rank emits row $k$ and the others emit 0, then an all-reduce sums them. Pad $V$ to a multiple of $128t$ (50,257 → 51,200 at $t=8$).
+      - **Output layer.** With tied weights, the logits are column-parallel, $[n,V/t]$ per rank. Gathering them would move $nV$ values, about 1 GB for 4096 tokens and a 128k vocabulary in bf16.
+      - **Loss.** Use stable log-sum-exp: an all-reduce-max gives $M$, an all-reduce-sum gives $\sum e^{z-M}$, and an all-reduce of the target logit gives $z_y$. Then $\ell=M+\log S-z_y$. That is three $n$-element reductions.
+      - **Backward.** $\mathrm{softmax}-\text{onehot}$ is computed locally on each shard. The gradient into $X$ goes through an $f$ (all-reduce).
+    source: Shoeybi et al. 2019 §3 and §4.2; PyTorch TP tutorial "Apply Loss Parallel"
+
+reading:
+  - title: "Shoeybi et al. 2019, Megatron-LM, §3 Model Parallel Transformers"
+    url: https://arxiv.org/abs/1909.08053
+    kind: paper
+    note: The original column/row split, f and g operators, and vocab-parallel embedding and loss. Short and clear. Appendix B covers RNG and hybrid DP.
+  - title: "Korthikanti et al. 2022, Reducing Activation Recomputation, §4.1–4.2"
+    url: https://arxiv.org/abs/2205.05198
+    kind: paper
+    note: The itemised activation-memory count, with and without TP, that motivates sequence parallelism.
+  - title: "Narayanan et al. 2021, Efficient Large-Scale LM Training (Megatron-LM), §2.3 and §3.2"
+    url: https://arxiv.org/abs/2104.04473
+    kind: paper
+    note: TP communication volume per layer and the takeaway to keep TP within a node.
+  - title: "How To Scale Your Model, Part 12: How to Think About GPUs (Tensor Parallelism)"
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    kind: book
+    note: The roofline rule t < F·W/C, with H100 bandwidths. See also the sb.tensor-parallelism lesson.
+  - title: "PyTorch tutorial: Large Scale Transformer model training with Tensor Parallel"
+    url: https://docs.pytorch.org/tutorials/intermediate/TP_tutorial.html
+    kind: docs
+    note: ColwiseParallel/RowwiseParallel, loss_parallel and the 2-D FSDP + TP mesh in code.

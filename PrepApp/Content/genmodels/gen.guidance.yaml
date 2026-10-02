@@ -1,0 +1,530 @@
+id: gen.guidance
+area: genmodels
+title: Classifier & Classifier-Free Guidance
+summary: Turning a conditional diffusion model's "hedging" into sharp, on-prompt samples. Bayes' rule on scores, classifier guidance, the CFG derivation via an implicit classifier, the fidelity–diversity trade-off, and why high scales over-saturate (with thresholding, CFG rescale and guidance intervals as fixes).
+order: 170
+level: intermediate
+tags: [diffusion, guidance, classifier-free-guidance, conditioning, sampling]
+prereqs: [gen.diffusion-parameterizations]
+
+explainer:
+  - title: "The problem: conditional models hedge"
+    body: |
+      We train a diffusion model on (image, label) or (image, caption) pairs, so it learns $p(x\mid c)$. Sampling from it faithfully often gives images that only loosely match $c$: the model spreads probability over everything plausibly consistent with the label. We want a **knob that trades diversity for fidelity to $c$**, like truncation in BigGAN or low temperature in Glow.
+
+      The obvious knobs fail for diffusion. Scaling the score up or shrinking the noise injected at each reverse step gives blurry, low-quality samples (Dhariwal & Nichol, as reported by Ho & Salimans §3). Guidance is the knob that works.
+
+      **Notation for this lesson.** Noisy sample $x_t=\alpha_t x_0+\sigma_t\epsilon$, $\epsilon\sim\mathcal N(0,I)$, with $t=0$ data and large $t$ noise. In DDPM notation $\alpha_t=\sqrt{\bar\alpha_t}$ and $\sigma_t=\sqrt{1-\bar\alpha_t}$. A network $\epsilon_\theta(x_t,t,c)$ predicts the noise; $t$ is dropped from the notation from now on.
+
+      **Refresher: noise prediction is a scaled score.** For one data point, $q(x_t\mid x_0)=\mathcal N(\alpha_tx_0,\sigma_t^2I)$, so
+
+      $$\nabla_{x_t}\log q(x_t\mid x_0)=-\frac{x_t-\alpha_tx_0}{\sigma_t^2}=-\frac{\epsilon}{\sigma_t}.$$
+
+      The marginal score is the posterior average of this, because $\nabla p_t(x)=\int\nabla q(x\mid x_0)p(x_0)dx_0$; divide by $p_t(x)$:
+
+      $$\begin{aligned}\nabla\log p_t(x_t)&=-\frac{\mathbb E[\epsilon\mid x_t]}{\sigma_t}\\&\approx-\frac{\epsilon_\theta(x_t)}{\sigma_t}.\end{aligned}$$
+
+      The approximation holds because the minimiser of the $\epsilon$-MSE is the conditional mean $\mathbb E[\epsilon\mid x_t]$. So **any operation on scores is the same operation on $\epsilon$-predictions, times $-\sigma_t$**. The denoised estimate is $\hat x_0=(x_t-\sigma_t\hat\epsilon)/\alpha_t$.
+    source: Ho & Salimans 2022 §2–3; Dhariwal & Nichol 2021 §4.2 (eq. 11); Luo 2022, "Guidance" (p.20–21)
+
+  - title: "Bayes' rule on scores → classifier guidance"
+    body: |
+      Bayes: $p_t(x\mid y)=p_t(x)\,p_t(y\mid x)/p(y)$. Take logs and the gradient in $x$:
+
+      $$\begin{aligned}\nabla\log p_t(x\mid y)&=\nabla\log p_t(x)+\nabla\log p_t(y\mid x)\\&\quad-\underbrace{\nabla\log p(y)}_{=0}\end{aligned}$$
+
+      $p(y)$ does not depend on $x$, so its gradient vanishes. The normaliser never has to be computed: scores ignore constants. The second term pushes $x$ toward regions a classifier calls class $y$.
+
+      **Classifier guidance** (Dhariwal & Nichol 2021) adds a trained classifier's gradient, scaled by $s$, to a diffusion model's score. In $\epsilon$ form (multiply scores by $-\sigma_t$):
+
+      $$\hat\epsilon=\epsilon_\theta(x_t)-s\,\sigma_t\nabla_{x_t}\log p_\phi(y\mid x_t)$$
+
+      Use $\hat\epsilon$ in any sampler (DDIM, Heun…). For the stochastic ancestral sampler with step $p_\theta(x_{t-1}\mid x_t)=\mathcal N(\mu,\Sigma)$, the same idea is a **mean shift**. Taylor-expand $\log p_\phi(y\mid x_{t-1})\approx C+(x_{t-1}-\mu)^\top g$ around $\mu$, with $g=\nabla\log p_\phi(y\mid x)|_{x=\mu}$, and complete the square:
+
+      $$\begin{aligned}&-\tfrac12(x-\mu)^\top\Sigma^{-1}(x-\mu)+(x-\mu)^\top g\\&=-\tfrac12(x-\mu-\Sigma g)^\top\Sigma^{-1}(x-\mu-\Sigma g)+C'\end{aligned}$$
+
+      So sample from $\mathcal N(\mu+s\Sigma g,\Sigma)$. The Taylor step is fine when $\Sigma$ is small relative to the classifier's curvature (many small steps).
+
+      **The classifier must be trained on noisy inputs $x_t$ at every noise level**, conditioned on $t$. Early in sampling $x_t$ is mostly noise. A clean-image classifier has never seen such inputs, so its gradients there are meaningless. Dhariwal & Nichol train the classifier on the diffusion model's own noising distribution.
+    source: Dhariwal & Nichol 2021 §4.1–4.2, Alg. 1–2; Murphy PML2 §25.6.2; Dieleman 2022, "Classifier guidance"
+
+  - title: "What the scale does: a sharpened classifier"
+    body: |
+      Why $s>1$? Because $s\nabla\log p(y\mid x)=\nabla\log\big[p(y\mid x)^s/Z\big]$ for any constant $Z$. Guidance with scale $s$ follows the score of
+
+      $$\tilde p(x\mid y)\propto p(x)\,p(y\mid x)^s.$$
+
+      Raising the classifier to a power $s>1$ is like lowering its temperature. Inputs it is fairly sure about gain weight relative to ambiguous ones. $s=1$ recovers $p(x\mid y)$ exactly; $s=0$ ignores $y$.
+
+      ![Synthetic 1-D toy: two unit Gaussians at ±1, so $p(+\mid x)=\sigma(2x)$ exactly. As $s$ grows, mass leaves the ambiguous region near 0 and the density narrows (sd 1.0 → 0.80 → 0.68 for s = 1, 3, 10).](gen.guidance/sharpening)
+
+      In this toy the tilted density has mean 1.00, 1.44 and 1.84 for $s=1,3,10$, and $P(x<0)$ falls from 16% to 2.5% to 0.01%. Fidelity (class confidence) goes up and diversity goes down.
+
+      **Which base model?** Guiding a *conditional* model with weight $w$ and guiding an *unconditional* model with weight $w+1$ target the same density:
+
+      $$p(x\mid y)\,p(y\mid x)^{w}\propto p(x)\,p(y\mid x)^{w+1}$$
+
+      Empirically, Dhariwal & Nichol got their best results guiding an already class-conditional model. With an unconditional model and $s=1$, their classifier gave the right class only about 50% probability and samples didn't look like the class. Scaling the gradient pushed it to nearly 100%.
+
+      **Downsides.** You need an extra noise-aware classifier, so off-the-shelf classifiers can't be plugged in. A classifier can predict $y$ from a few features while ignoring most of $x$, so its input-gradient can point in arbitrary, adversarial-example-like directions. Ho & Salimans also ask whether the IS/FID gains partly come from attacking classifier-based metrics.
+    source: Dhariwal & Nichol 2021 §4.3, Table 4; Ho & Salimans 2022 §1, §3.1; Dieleman 2022, "Classifier guidance"
+
+  - title: "Classifier-free guidance: training and sampling"
+    body: |
+      **Training** (Ho & Salimans 2022, Alg. 1). Use one network for both tasks. For each example, replace $c$ by a learned null token $\varnothing$ with probability $p_{\text{uncond}}$, then take the usual $\epsilon$-MSE step:
+
+      ```python
+      x, c = sample_data()
+      if rand() < p_uncond: c = NULL     # 0.1-0.2 works
+      t, eps = sample_t(), randn_like(x)
+      x_t = alpha(t) * x + sigma(t) * eps
+      loss = ((eps_net(x_t, t, c) - eps) ** 2).mean()
+      ```
+
+      Now $\epsilon_\theta(x_t,c)=:\epsilon_c$ is the conditional model and $\epsilon_\theta(x_t,\varnothing)=:\epsilon_u$ the unconditional one. Ho & Salimans found $p_{\text{uncond}}\in\{0.1,0.2\}$ about equally good, and 0.5 worse along the whole FID/IS frontier: the unconditional task needs little capacity.
+
+      **Sampling** (Alg. 2). At every step, run both passes and extrapolate from unconditional toward conditional:
+
+      $$\tilde\epsilon=\epsilon_u+s\,(\epsilon_c-\epsilon_u)$$
+
+      Then use $\tilde\epsilon$ in any sampler (ancestral, DDIM, ODE solvers).
+
+      **Convention clash (check every paper):**
+      - This lesson, Stable-Diffusion-style "CFG scale", Dieleman's and Luo's $\gamma$, and Imagen's and Kynkäänniemi's $w$ all mean $s$: **$s=1$ is no guidance**.
+      - Ho & Salimans eq. 6 writes $\tilde\epsilon=(1+w)\epsilon_c-w\epsilon_u$: **$w=0$ is no guidance**, and $s=1+w$.
+      - Dhariwal's classifier scale also multiplies a gradient, but the gradient of a separate classifier.
+
+      So Ho's $w=3$ is CFG scale 4. Ho's best ImageNet FID at $w=0.1$–$0.3$ is $s=1.1$–$1.3$.
+
+      Special values: $s=0$ is the unconditional model, $s=1$ plain conditional sampling, and $s>1$ moves *away* from $\epsilon_u$.
+    source: Ho & Salimans 2022 §3.2, Alg. 1–2, eq. 6, §4.2; Saharia et al. 2022 §2.2 eq. 2; Luo 2022, "Classifier-Free Guidance" (p.21–22)
+
+  - title: "Deriving CFG: the implicit classifier"
+    body: |
+      Classifier-free guidance builds the classifier out of the generative model. Apply Bayes the other way round:
+
+      $$p_t(c\mid x)=\frac{p_t(x\mid c)\,p(c)}{p_t(x)}$$
+
+      Take the gradient. $\log p(c)$ again drops out because it has no $x$-dependence:
+
+      $$\begin{aligned}\nabla\log p_t(c\mid x)&=\nabla\log p_t(x\mid c)-\nabla\log p_t(x)\\&=-\frac{\epsilon^*_c-\epsilon^*_u}{\sigma_t}\end{aligned}$$
+
+      Here $\epsilon^*$ denotes exact noise predictions. Now do classifier guidance on the **unconditional** model with scale $s$, using this implicit classifier:
+
+      $$\begin{aligned}\tilde\epsilon&=\epsilon_u-s\,\sigma_t\nabla\log p_t(c\mid x)\\&=\epsilon_u+s(\epsilon_c-\epsilon_u)\end{aligned}$$
+
+      This is exactly the CFG rule. Equivalently, it is weight $w=s-1$ on the conditional model, giving Ho's $(1+w)\epsilon_c-w\epsilon_u$. The density it heuristically targets:
+
+      $$\begin{aligned}\tilde p(x\mid c)&\propto p(x)\,p(c\mid x)^s\\&\propto p(x\mid c)^s\,p(x)^{1-s}\end{aligned}$$
+
+      For $s>1$ the unconditional density has a *negative* exponent. Guidance raises the conditional likelihood and lowers the unconditional likelihood: it steers toward images that are typical of $c$ but atypical overall.
+
+      **Caveats an interviewer expects you to know** (Ho & Salimans §3.2):
+      - With learned networks, $\epsilon_\theta(x,c)-\epsilon_\theta(x)$ need not be the gradient of *any* scalar function. Unconstrained networks give non-conservative fields. So CFG is "inspired by" an implicit classifier, not identical to guidance with one. It also cannot be read as an adversarial attack on a classifier, since there is no classifier gradient.
+      - Classifiers obtained by inverting a misspecified generative model with Bayes' rule have no performance guarantees. That CFG works is an empirical finding.
+      - You can skip the unconditional pass for a few known classes: $p(x)=\sum_cp(x\mid c)p(c)$. This costs one pass per class.
+    source: Ho & Salimans 2022 §3.2, §5; Murphy PML2 §25.6.3; Dieleman 2022, "Classifier-free guidance"
+
+  - title: "The trade-off, and what guidance is not"
+    body: |
+      ![Synthetic 2-D toy with exact scores, sampled with the guided probability-flow ODE. Class A has a major mode and a minor mode (30% of A) next to class B. As s grows, class confidence saturates while the minor mode empties, far faster than exact sampling from $p(x)p(A|x)^s$ would (dashed).](gen.guidance/tradeoff-toy)
+
+      **On real models.** Ho & Salimans swept $w\in\{0,0.1,\dots,4\}$ on class-conditional ImageNet:
+      - **IS rises monotonically** with guidance.
+      - **FID is U-shaped**: best at small guidance ($w=0.1$ at 64×64, $w=0.3$ at 128×128), then steadily worse.
+      - Dhariwal & Nichol's classifier guidance showed the same split in their precision/recall columns: **precision up, recall down**.
+
+      Text-to-image samplers run much stronger guidance for prompt adherence. SD3 evaluates at CFG scale 5.0, and Lin et al. use 7.5 on Stable Diffusion 2.1. FID-optimal settings are lower: Imagen reports COCO FID with scale 1.35 at 64×64. Treat these as examples, not universal constants.
+
+      **Guidance does not exactly sample $p(x)p(c\mid x)^s$.** At noise level $t$ we tilt by the *noisy* classifier $p_t(c\mid x_t)=\int p(c\mid x_0)\,p(x_0\mid x_t)\,dx_0$. Raising to a power doesn't commute with this averaging, so the tilted $p_t(x)p_t(c\mid x)^s$ at time $t$ is not the noised version of the tilted clean density. In general the guided fields are not the scores of any single diffusion process.
+
+      In the toy at $s=3$:
+      - the minor mode keeps **4%** of guided samples;
+      - it would keep **20%** under the exact tilted density, against 30% in the data.
+
+      Kynkäänniemi et al. show the same effect with exact denoisers in 1-D: strong guidance at high noise steers trajectories outside the data distribution and drops a mode (their Fig. 2). Dieleman notes a related subtlety, the time-dependence of the distributions being guided.
+    source: Ho & Salimans 2022 §4.1, Tables 1–2; Dhariwal & Nichol 2021 Table 4; Kynkäänniemi et al. 2024 §2–3; Saharia et al. 2022 Table 1; Esser et al. 2024 App. B.3; Lin et al. 2024 §3.4; Dieleman 2022, "Update / correction"
+
+  - title: "Over-saturation: a worked example and the mechanism"
+    body: |
+      **Worked example** (one pixel, data range $[-1,1]$). Let $\alpha_t=0.6$, $\sigma_t=0.8$, $x_t=0.5$, $\epsilon_u=0.55$ and $\epsilon_c=0.25$. Then:
+
+      $$\begin{aligned}\hat x_0^{u}&=(0.5-0.8\cdot0.55)/0.6=0.1\\ \hat x_0^{c}&=(0.5-0.8\cdot0.25)/0.6=0.5\end{aligned}$$
+
+      Both are in range. With $s=4$, $\tilde\epsilon=0.55+4(0.25-0.55)=-0.65$, so
+
+      $$\hat x_0=(0.5+0.8\cdot0.65)/0.6=1.7.$$
+
+      With $s=7.5$ you get 3.1.
+
+      **Why.** $\hat x_0$ is affine in $\hat\epsilon$, so the guided prediction is the same extrapolation in $x_0$-space:
+
+      $$\begin{aligned}\tilde x_0&=\hat x_0^{u}+s\,(\hat x_0^{c}-\hat x_0^{u}),\\ \hat x_0^{c}-\hat x_0^{u}&=-\tfrac{\sigma_t}{\alpha_t}(\epsilon_c-\epsilon_u)\end{aligned}$$
+
+      An $\epsilon$-disagreement is amplified by $s\,\sigma_t/\alpha_t$ (here $4\cdot1.33$), and $\sigma_t/\alpha_t$ is largest at high noise. At high noise, $\hat x_0^{u}$ is about the dataset mean and $\hat x_0^{c}$ about the class mean. The guided prediction lands at mean + $s$·(class mean − mean): far beyond any real image.
+
+      ![Synthetic 1-D toy, exact scores, data in [−1, 1]. Left: median and 10–90% band of the guided $\hat x_0$ along the sampling path. At high noise it sits near s × (class mean 0.575): 1.7 for s = 3, 4.3 for s = 7.5. Right: final samples pile up at the extreme mode and spill past the edge (12% beyond 1 at s = 7.5).](gen.guidance/oversaturation)
+
+      **Why it compounds** (Saharia et al. §2.3). Each step's $\hat x_0$ is fed back to make the next $x_t$. Out-of-range predictions create inputs the network never saw in training (a train–test mismatch). Errors accumulate, giving over-saturated, unnatural images that can even diverge. The toy uses exact scores, so it shows the extrapolation and the push to the extremes but not the network's failure on off-distribution inputs.
+    source: Saharia et al. 2022 §2.3; Ho & Salimans 2022 Fig. 3; Lin et al. 2024 §3.4
+
+  - title: "Fixes: thresholding, CFG rescale, guidance intervals"
+    body: |
+      **Static thresholding.** Clip $\hat x_0$ elementwise to $[-1,1]$ at every step before the sampler update. Saharia et al. found it essential at large guidance, since it prevents blank images. But images still get over-saturated and lose detail as the scale grows: every out-of-range pixel collapses onto exactly ±1.
+
+      **Dynamic thresholding** (Saharia et al. 2022). At each step, per sample:
+      1. Let $q$ be the $p$-th percentile of $|\hat x_0|$ (Imagen shows $p=99.5$).
+      2. If $q>1$, clip $\hat x_0$ to $[-q,q]$ and divide by $q$.
+
+      Example with $q=1.6$: pixels $(1.6,\,0.8,\,-2.0)\mapsto(1,\,0.5,\,-1)$. Static clipping gives $(1,\,0.8,\,-1)$. Dividing by $q$ pulls near-saturated pixels inwards and keeps their relative contrast. Imagen reports better photorealism and text alignment at high guidance. It needs a known pixel range, so it is designed for pixel-space models.
+
+      **CFG rescale** (Lin et al. 2024 §3.4). This also works for latent models. Let $x_{\text{pos}}$ be the conditional network output and $x_{\text{cfg}}$ the guided one. Compute per-sample standard deviations $\sigma_{\text{pos}},\sigma_{\text{cfg}}$ over all pixels, then
+
+      $$\begin{aligned}x_{\text{resc}}&=x_{\text{cfg}}\cdot\sigma_{\text{pos}}/\sigma_{\text{cfg}}\\ x_{\text{final}}&=\phi\,x_{\text{resc}}+(1-\phi)\,x_{\text{cfg}}\end{aligned}$$
+
+      Fully rescaling ($\phi=1$) gave overly plain images. They use $w=7.5$, $\phi=0.7$, with $\phi\in[0.5,0.75]$ working well. They found CFG most sensitive to over-exposure when the schedule's terminal SNR is near zero.
+
+      **Guidance interval** (Kynkäänniemi et al. 2024). Use scale $s$ only for $\sigma\in(\sigma_{lo},\sigma_{hi}]$ and plain conditional sampling ($s=1$) elsewhere:
+      - at **high noise**, guidance collapses variation toward a few "template" images and causes mode drops;
+      - at **low noise**, it is largely unnecessary;
+      - in the **middle**, it gives the crisp, decisive features.
+
+      On ImageNet-512 this improved EDM2-XXL's FID from 1.81 to 1.40 (interval $(0.19,1.61]$, with a larger optimal weight, 2.0 vs 1.2). It also saves the unconditional pass outside the interval.
+    source: Saharia et al. 2022 §2.3, Fig. A.31; Lin et al. 2024 §3.4, Alg. 2, §5.3; Kynkäänniemi et al. 2024 §1, §3.1, Table 1
+
+  - title: "Costs, variants, and guidance for flows"
+    body: |
+      **Cost.** CFG needs two network evaluations per step (conditional and unconditional), usually batched together. So at a fixed step budget it costs about 2× an unguided sampler. Ho & Salimans point out that their T = 128 run, not T = 256, is the compute-fair comparison with classifier-guided ADM-G at about 256 steps. Guidance distillation (named here) trains a student to reproduce the guided output in one pass (see gen.distillation).
+
+      **Negative prompts.** Replace $\epsilon_u$ by the prediction for an "anti-goal" prompt: $\tilde\epsilon=\epsilon_{neg}+s(\epsilon_c-\epsilon_{neg})$. CFG is the special case where the negative prompt is "nothing".
+
+      **Flow-matching velocities.** For a Gaussian path with $x_t=t\,x_1+(1-t)\,x_0$ (Lipman's time: $t=1$ is data), the optimal velocity is affine in the score with the *same* coefficients for every condition:
+
+      $$u_t(x)=\frac{x+(1-t)\nabla\log p_t(x)}{t}$$
+
+      (derived in gen.flow-matching). So
+
+      $$u_u+s(u_c-u_u)=\frac{x+(1-t)\,\tilde{\text{score}}}{t},$$
+
+      where $\tilde{\text{score}}=\nabla\log p_t(x)+s(\nabla\log p_t(x\mid c)-\nabla\log p_t(x))$. CFG on velocities is CFG on scores with the same $s$. Rectified-flow transformers (SD3) apply it this way.
+
+      **Autoregressive models.** You can mix conditional and unconditional logits the same way, but you are guiding each factor $p(x_i\mid x_{<i},c)$ separately. Dieleman shows this redistributes mass differently from guiding the joint $p(x\mid c)$, so the two are not equivalent.
+
+      **Other conditioning (pointers).** Inpainting and inverse problems replace the classifier with a measurement likelihood $\nabla\log p(y\mid x_t)$ (named only). How $c$ enters the network (class embeddings, cross-attention) is covered in gen.latent-diffusion.
+    source: Ho & Salimans 2022 §4.3, §5; Kynkäänniemi et al. 2024 §1; Dieleman 2022, "Guidance for autoregressive models"; Lipman et al. 2023 §4.1; Esser et al. 2024 App. B.3
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Derive classifier guidance."** Bayes on $p_t(x\mid y)$, take $\nabla_x\log$, and $p(y)$ vanishes. Convert to $\epsilon$ with $\text{score}=-\epsilon/\sigma_t$: $\hat\epsilon=\epsilon-s\sigma_t\nabla\log p_\phi(y\mid x_t)$.
+      - **"Why can't I use a pretrained ResNet?"** It was trained on clean images. Guidance needs $\nabla\log p(y\mid x_t)$ at every noise level.
+      - **"Derive CFG."** Invert Bayes: $\nabla\log p_t(c\mid x)=-(\epsilon_c-\epsilon_u)/\sigma_t$. Plug into classifier guidance on $\epsilon_u$ with scale $s$ to get $\epsilon_u+s(\epsilon_c-\epsilon_u)$. Target $\propto p(x\mid c)^s p(x)^{1-s}$.
+      - **"Is CFG sampling from that target?"** No. The noisy-classifier tilt doesn't commute with noising, and learned $\epsilon_c-\epsilon_u$ need not be a gradient. It is a heuristic with a good empirical trade-off.
+      - **"$w$ or $s$?"** Ho's $w$ = $s-1$. Always state which.
+      - **"What does $p_{\text{uncond}}$ do?"** It sets how often the shared network learns the unconditional task. 0.1–0.2 is good, and 0.5 hurt in Ho & Salimans.
+      - **"Why do images get blown out at scale 10?"** The guided $\hat x_0$ extrapolates past the data range, amplified by $s\sigma_t/\alpha_t$. Next-step inputs go off-distribution. Fixes: dynamic thresholding (pixel space), CFG rescale (any space), a guidance interval (skip high noise).
+      - **"Cost?"** 2× NFE per step. Mitigate with batching, guidance intervals or guidance distillation.
+      - **"Does it work for flow matching?"** Yes. Velocity is affine in the score, so the same linear combination applies.
+    source: Ho & Salimans 2022 §3; Dhariwal & Nichol 2021 §4; Saharia et al. 2022 §2.3; Lin et al. 2024 §3.4; Kynkäänniemi et al. 2024 §3
+
+  - title: "Key results"
+    body: |
+      - Score/noise link: $\nabla\log p_t(x_t)\approx-\epsilon_\theta(x_t)/\sigma_t$, and $\hat x_0=(x_t-\sigma_t\hat\epsilon)/\alpha_t$.
+      - Bayes on scores:
+
+        $$\nabla\log p_t(x\mid y)=\nabla\log p_t(x)+\nabla\log p_t(y\mid x)$$
+
+      - Classifier guidance: $\hat\epsilon=\epsilon_\theta-s\,\sigma_t\nabla\log p_\phi(y\mid x_t)$, or ancestral mean $\mu+s\Sigma g$. It targets $\propto p(x)\,p(y\mid x)^s$, with a noise-aware classifier.
+      - CFG (train with $c\to\varnothing$ w.p. 0.1–0.2):
+
+        $$\tilde\epsilon=\epsilon_u+s(\epsilon_c-\epsilon_u)$$
+
+        Here $s=1$ is unguided. Ho's form is $(1+w)\epsilon_c-w\epsilon_u$ with $w=s-1$.
+      - Implicit classifier: $\nabla\log p_t(c\mid x)=-(\epsilon_c-\epsilon_u)/\sigma_t$. Heuristic target:
+
+        $$p(x\mid c)^s\,p(x)^{1-s}\propto p(x)\,p(c\mid x)^s$$
+
+      - Trade-off: IS and precision up, recall down, FID U-shaped (ImageNet best at $s\approx1.1$–$1.3$). Text-to-image examples run much higher (SD3 evaluates at 5.0; Lin et al. use 7.5).
+      - Over-saturation: $\tilde x_0-\hat x_0^u=s(\hat x_0^c-\hat x_0^u)$, amplified by $\sigma_t/\alpha_t$. Fixes: static/dynamic thresholding, CFG rescale ($\phi\approx0.7$), guidance interval (mid noise only).
+      - Cost: 2 NFE per step.
+    source: Ho & Salimans 2022 §3–4; Dhariwal & Nichol 2021 §4; Saharia et al. 2022 §2.3; Lin et al. 2024 §3.4; Kynkäänniemi et al. 2024 §3
+
+quiz:
+  - id: q1
+    prompt: |
+      A paper reports results with Ho & Salimans's guidance weight $w=3$ in $\tilde\epsilon=(1+w)\epsilon_c-w\epsilon_u$. What is the equivalent Stable-Diffusion-style CFG scale $s$ in $\epsilon_u+s(\epsilon_c-\epsilon_u)$?
+    correct: "$s=4$"
+    wrong:
+      - "$s=3$"
+      - "$s=2$"
+      - "$s=0.75$"
+    explanation: |
+      $\epsilon_u+s(\epsilon_c-\epsilon_u)=s\,\epsilon_c-(s-1)\epsilon_u$. Matching with $(1+w)\epsilon_c-w\epsilon_u$ gives $s=1+w=4$. Answering $s=3$ assumes both papers use the same convention. That is the classic mistake: in Ho's form $w=0$ means no guidance, while in the $s$ form $s=1$ does.
+    source: Ho & Salimans 2022 eq. 6; Saharia et al. 2022 eq. 2
+
+  - id: q2
+    prompt: |
+      At one step, for one coordinate, $\epsilon_u=0.2$ and $\epsilon_c=0.5$. What guided noise prediction does CFG scale $s=3$ (with $s=1$ meaning unguided) produce?
+    correct: "$1.1$"
+    wrong:
+      - "$1.4$"
+      - "$1.5$"
+      - "$-0.4$"
+    explanation: |
+      $\tilde\epsilon=0.2+3(0.5-0.2)=1.1$. The value 1.4 comes from plugging $s=3$ into Ho's $(1+w)\epsilon_c-w\epsilon_u$, i.e. treating it as $w=3$ ($s=4$). The value 1.5 is $s\,\epsilon_c$, which forgets the unconditional term. The value −0.4 extrapolates in the wrong direction (toward $\epsilon_u$).
+    source: Ho & Salimans 2022 eq. 6
+
+  - id: q3
+    prompt: |
+      In deriving the implicit classifier, we write $\log p_t(c\mid x)=\log p_t(x\mid c)+\log p(c)-\log p_t(x)$ and take $\nabla_x$. Why does $\log p(c)$ disappear?
+    correct: "It does not depend on $x$, so its gradient with respect to $x$ is zero"
+    wrong:
+      - "Class priors are uniform in ImageNet, so it equals a known constant"
+      - 'It cancels against the normaliser of $p_t(x\mid c)$ at each noise level'
+      - "Condition dropout trains it to zero through the null token"
+    explanation: |
+      The gradient is taken with respect to the image, and $p(c)$ is a function of the label only. So $\nabla_x\log p(c)=0$ whatever the prior is. The "uniform prior" option gives a sufficient but irrelevant condition: the term would vanish for any prior, uniform or not. Scores in general never need normalisers, which is what makes Bayes' rule usable here.
+    source: Ho & Salimans 2022 §3.2; Dieleman 2022, "Classifier-free guidance"
+
+  - id: q4
+    prompt: |
+      Someone implements classifier guidance with an off-the-shelf ImageNet classifier trained on clean images, applied unchanged at every sampling step. What is the main problem?
+    correct: "At high noise its inputs are far off its training distribution, so the gradients carry little class signal"
+    wrong:
+      - 'Its gradient has the opposite sign convention to the $\epsilon$-prediction, so it must first be negated'
+      - "Its softmax saturates on near-clean images, so its gradient vanishes during the final denoising steps"
+      - "It doubles the number of diffusion-network evaluations per sampling step, exactly as CFG does"
+    explanation: |
+      Early in sampling, $x_t$ is mostly Gaussian noise. A clean-image classifier has never seen such inputs, so $\nabla\log p(y\mid x_t)$ is uninformative or adversarial exactly when global structure is being decided. That is why Dhariwal & Nichol train $p_\phi(y\mid x_t,t)$ on the noising distribution. The sign option is wrong: the guidance formula already handles the sign ($\hat\epsilon=\epsilon-s\sigma\nabla\log p$). The cost option is wrong too: classifier guidance needs one diffusion pass plus a classifier backward pass, not two diffusion passes.
+    source: Dhariwal & Nichol 2021 §4, §4.3; Ho & Salimans 2022 §1, §5
+
+  - id: q5
+    prompt: |
+      Which statement about classifier-free guidance is **false**?
+    correct: 'It needs a separate noise-aware classifier to supply $\nabla\log p(c\mid x_t)$'
+    wrong:
+      - "One network can serve as both models by feeding a null token for the unconditional pass"
+      - "With $s=1$ (SD-style scale) it reduces to ordinary conditional sampling"
+      - "Each sampling step needs both a conditional and an unconditional forward pass"
+    explanation: |
+      CFG's point is that the "classifier" is implicit, $\nabla\log p(c\mid x)\propto-(\epsilon_c-\epsilon_u)$, so no classifier is trained. The other three are true. Joint training with $p_{\text{uncond}}$ gives both models in one network. $s=1$ gives $\tilde\epsilon=\epsilon_c$. Two passes per step is CFG's main cost.
+    source: Ho & Salimans 2022 §3.2, §5
+
+  - id: q6
+    prompt: |
+      On class-conditional ImageNet, you sweep CFG from $s=1$ (unguided) to $s=5$. Which pattern matches what Ho & Salimans (FID, IS) and Dhariwal & Nichol (precision, recall) report for guidance?
+    correct: "IS rises steadily, FID dips then worsens, precision rises and recall falls"
+    wrong:
+      - "IS and FID both improve monotonically, as samples become more class-consistent"
+      - "FID improves monotonically, while IS peaks at small guidance and then falls"
+      - "Precision and recall both rise, because guidance removes the off-class samples"
+    explanation: |
+      IS rewards confident, class-consistent samples, so it keeps rising. FID also penalises lost diversity, so it is best at small guidance (Ho: $w=0.1$–$0.3$, i.e. $s\approx1.1$–$1.3$) and then degrades. Precision (sample fidelity) rises and recall (coverage) falls. The tempting "both improve" option ignores that FID measures distribution match, not just per-sample quality.
+    source: Ho & Salimans 2022 §4.1, Tables 1–2; Dhariwal & Nichol 2021 Table 4
+
+  - id: q7
+    prompt: |
+      A pixel-space text-to-image model sampled at a very high CFG scale produces blown-out, over-saturated colours. Which diagnosis and fix fit best?
+    correct: 'Guided $\hat x_0$ leaves the training range $[-1,1]$; dynamically threshold $\hat x_0$ at each step'
+    wrong:
+      - "The noisy sample $x_t$ has too little noise at the end; increase the final noise level and resample"
+      - 'The unconditional model is too weak; raise $p_{\text{uncond}}$ to 0.5 and retrain'
+      - "The text encoder saturates; clip the conditioning embedding norm before cross-attention"
+    explanation: |
+      High guidance extrapolates $\hat x_0$ past the data range, amplified by $s\sigma_t/\alpha_t$. The sampler then feeds these values back, a train–test mismatch that compounds. Dynamic thresholding (percentile clip, then rescale) addresses it directly. CFG rescale or a guidance interval are alternatives. Raising $p_{\text{uncond}}$ to 0.5 made Ho & Salimans's models worse across the frontier, and it does nothing about the extrapolation.
+    source: Saharia et al. 2022 §2.3; Ho & Salimans 2022 §4.2
+
+  - id: q8
+    prompt: |
+      Dynamic thresholding at one step: the 99.5th percentile of $|\hat x_0|$ for this sample is $q=1.25$. What does a pixel with $\hat x_0=0.9$ become?
+    correct: "$0.72$"
+    wrong:
+      - "$0.9$"
+      - "$1.0$"
+      - "$0.576$"
+    explanation: |
+      Since $q>1$, clip to $[-1.25,1.25]$ (0.9 is unchanged), then divide by 1.25, giving 0.72. Answering 0.9 is static thresholding, which only clips to $[-1,1]$ and leaves in-range pixels alone. Dynamic thresholding rescales *all* pixels, pulling near-saturated ones inward. (0.576 divides by $q$ twice.)
+    source: Saharia et al. 2022 §2.3, Fig. A.31
+
+  - id: q9
+    prompt: |
+      CFG rescale (Lin et al.) with $\phi=0.7$. For one sample, the conditional output has standard deviation half that of the guided output ($\sigma_{\text{pos}}/\sigma_{\text{cfg}}=0.5$). By what factor is $x_{\text{cfg}}$ multiplied?
+    correct: "$0.65$"
+    wrong:
+      - "$0.5$"
+      - "$0.85$"
+      - "$0.35$"
+    explanation: |
+      $x_{\text{final}}=\phi\,x_{\text{cfg}}(\sigma_{\text{pos}}/\sigma_{\text{cfg}})+(1-\phi)x_{\text{cfg}}$, i.e. a factor $0.7\cdot0.5+0.3=0.65$. Answering 0.5 is full rescaling ($\phi=1$), which Lin et al. found makes images overly plain. Answering 0.85 swaps the roles of $\phi$ and $1-\phi$.
+    source: Lin et al. 2024 §3.4, eqs. 13–16, Alg. 2
+
+  - id: q10
+    prompt: |
+      To cut cost, you may apply CFG at only part of the sampling chain and use plain conditional sampling elsewhere. Following Kynkäänniemi et al. (2024), which part should keep guidance?
+    correct: "Intermediate noise levels only, with guidance off at both the highest and lowest noise"
+    wrong:
+      - "The highest noise levels, where global layout is decided and guidance matters most"
+      - "The lowest noise levels, where fine detail is formed and guidance sharpens textures"
+      - "Every other step across the whole chain, which halves the cost with the same effect"
+    explanation: |
+      Their analysis found guidance at high noise harmful: it collapses variation toward template images and drops modes. At low noise it is largely unnecessary, and the benefit sits in the middle. The "highest noise" option is tempting because layout is decided there, but that is exactly where strong guidance does the damage. Restricting the interval improved EDM2-XXL's ImageNet-512 FID from 1.81 to 1.40.
+    source: Kynkäänniemi et al. 2024 §1, §3, Table 1
+
+  - id: q11
+    prompt: |
+      With exact scores, CFG with scale $s$, $\epsilon_u+s(\epsilon_c-\epsilon_u)$, is the same as classifier guidance using the implicit classifier $p_t(c\mid x)\propto p_t(x\mid c)/p_t(x)$ with…
+    correct: "scale $s$ applied to the unconditional model"
+    wrong:
+      - "scale $s$ applied to the conditional model"
+      - "scale $s+1$ applied to the unconditional model"
+      - "scale $s-1$ applied to the unconditional model"
+    explanation: |
+      Classifier guidance on $\epsilon_u$ gives $\epsilon_u-s\sigma\nabla\log p_t(c\mid x)=\epsilon_u+s(\epsilon_c-\epsilon_u)$. (Equivalently, scale $s-1$ on the *conditional* model, since $p(x\mid c)p(c\mid x)^{s-1}\propto p(x)p(c\mid x)^s$.) Scale $s$ on the conditional model over-counts the classifier once: it gives $\epsilon_c+s(\epsilon_c-\epsilon_u)$, which is CFG scale $s+1$.
+    source: Ho & Salimans 2022 §3.1–3.2
+
+  - id: q12
+    prompt: |
+      Which statement about guidance is **false**?
+    correct: 'With exact scores, integrating the guided probability-flow ODE yields exact samples from $p(x)\,p(c\mid x)^s/Z$'
+    wrong:
+      - 'The classifier used at noise level $t$ is $p_t(c\mid x_t)$, a noise-averaged version of the clean $p(c\mid x_0)$'
+      - 'The learned difference $\epsilon_\theta(x,c)-\epsilon_\theta(x)$ need not be the gradient of any scalar function'
+      - "For Gaussian flow-matching paths, CFG on velocities equals CFG on scores with the same scale"
+    explanation: |
+      Tilting by $p_t(c\mid x_t)^s$ at each noise level does not produce the noised versions of the tilted clean density, because powers don't commute with the averaging over $x_0$. So the guided ODE is not the probability flow of $p(x)p(c\mid x)^s$. In the lesson's toy at $s=3$, the minor mode keeps 4% of samples versus 20% under the exact tilt. The other statements are true: the noisy classifier is $\int p(c\mid x_0)p(x_0\mid x_t)dx_0$; Ho & Salimans make the non-conservative point; velocity is affine in the score with condition-independent coefficients.
+    source: Ho & Salimans 2022 §3.2; Kynkäänniemi et al. 2024 §2–3; Lipman et al. 2023 §4
+
+cards:
+  - id: f1
+    front: Write Bayes' rule on scores and say why the prior term vanishes.
+    back: |
+      $$\nabla_x\log p_t(x\mid y)=\nabla_x\log p_t(x)+\nabla_x\log p_t(y\mid x)$$
+
+      $\log p(y)$ has no $x$-dependence, so $\nabla_x\log p(y)=0$. Scores never need normalising constants.
+    source: Dhariwal & Nichol 2021 §4.2; Luo 2022, "Classifier Guidance" (p.21)
+
+  - id: f2
+    front: Classifier guidance with scale $s$, in $\epsilon$ form and in ancestral (mean-shift) form.
+    back: |
+      $$\hat\epsilon=\epsilon_\theta(x_t)-s\,\sigma_t\nabla_{x_t}\log p_\phi(y\mid x_t)$$
+
+      Ancestral: $x_{t-1}\sim\mathcal N(\mu+s\Sigma g,\Sigma)$ with $g=\nabla\log p_\phi(y\mid x)|_{\mu}$. The classifier must be trained on noisy $x_t$. It targets $\propto p(x)\,p(y\mid x)^s$.
+    source: Dhariwal & Nichol 2021 Alg. 1–2, §4.3
+
+  - id: f3
+    front: Write the CFG sampling rule and say what scales $s=0$, $s=1$ and $s>1$ do.
+    back: |
+      $$\tilde\epsilon=\epsilon_u+s(\epsilon_c-\epsilon_u)$$
+
+      $s=0$: the unconditional model. $s=1$: plain conditional sampling. $s>1$: extrapolate past $\epsilon_c$, away from $\epsilon_u$. A negative prompt replaces $\epsilon_u$ with $\epsilon_{neg}$.
+    source: Ho & Salimans 2022 eq. 6; Kynkäänniemi et al. 2024 §1
+
+  - id: f4
+    front: How is a CFG model trained, and what $p_{\text{uncond}}$ works?
+    back: |
+      Train one network with the usual $\epsilon$-MSE, but replace $c$ by a null token with probability $p_{\text{uncond}}$. 0.1 and 0.2 work about equally well. 0.5 was worse across the whole FID/IS frontier (Ho & Salimans, ImageNet 64×64).
+    source: Ho & Salimans 2022 Alg. 1, §4.2
+
+  - id: f5
+    front: Show that the CFG target $p(x\mid c)^s\,p(x)^{1-s}$ is a tilted classifier.
+    back: |
+      Substitute $p(x\mid c)=p(x)\,p(c\mid x)/p(c)$:
+
+      $$\begin{aligned}p(x\mid c)^sp(x)^{1-s}&=\frac{p(x)^s\,p(c\mid x)^s}{p(c)^s}\,p(x)^{1-s}\\&\propto p(x)\,p(c\mid x)^s\end{aligned}$$
+
+      It is the data density reweighted by the implicit classifier at inverse temperature $s$.
+    source: Ho & Salimans 2022 §3.1–3.2; Dieleman 2022, "Classifier guidance"
+
+  - id: f6
+    front: State dynamic thresholding precisely.
+    back: |
+      At each step, per sample: let $q$ be the $p$-th percentile of $|\hat x_0|$ (e.g. $p=99.5$). If $q>1$, clip $\hat x_0$ to $[-q,q]$ and divide by $q$, then take the sampler step. Static thresholding just clips to $[-1,1]$.
+    source: Saharia et al. 2022 §2.3, Fig. A.31
+
+  - id: f7
+    front: State CFG rescale (Lin et al. 2024).
+    back: |
+      $x_{\text{cfg}}=x_{\text{neg}}+w(x_{\text{pos}}-x_{\text{neg}})$. Rescale by the ratio of per-sample standard deviations, $x_{\text{resc}}=x_{\text{cfg}}\,\sigma_{\text{pos}}/\sigma_{\text{cfg}}$, then blend: $\phi x_{\text{resc}}+(1-\phi)x_{\text{cfg}}$. They use $w=7.5$, $\phi=0.7$; $\phi=1$ looks plain.
+    source: Lin et al. 2024 §3.4
+
+  - id: f8
+    type: open
+    front: Derive classifier-free guidance from classifier guidance, and state the caveats.
+    back: |
+      1. Score–noise link: $\nabla\log p_t(x)=-\mathbb E[\epsilon\mid x_t]/\sigma_t\approx-\epsilon_\theta/\sigma_t$.
+      2. Classifier guidance on the unconditional model: $\hat\epsilon=\epsilon_u-s\sigma_t\nabla\log p_t(c\mid x)$.
+      3. Implicit classifier via Bayes: $\nabla\log p_t(c\mid x)=\nabla\log p_t(x\mid c)-\nabla\log p_t(x)=-(\epsilon_c-\epsilon_u)/\sigma_t$. $\log p(c)$ has no $x$-dependence.
+      4. Substitute: $\tilde\epsilon=\epsilon_u+s(\epsilon_c-\epsilon_u)$. Equivalently, weight $s-1$ on the conditional model, which is Ho's $(1+w)\epsilon_c-w\epsilon_u$.
+      5. Target $\propto p(x\mid c)^sp(x)^{1-s}$: raise conditional likelihood, lower unconditional.
+      6. Training: one network, condition dropped w.p. 0.1–0.2.
+
+      Caveats: learned fields are non-conservative, so this is not guidance by any real classifier, and no adversarial-gradient interpretation applies. Bayes-inverted classifiers carry no guarantees. The noisy-classifier tilt isn't the noised tilt, so it doesn't exactly sample the target. It costs 2 passes per step. And there is the $w$/$s$ convention.
+    source: Ho & Salimans 2022 §3; Murphy PML2 §25.6.3
+
+  - id: f9
+    type: open
+    front: An interviewer shows you over-saturated images from a model sampled at CFG scale 12. Explain the mechanism and three fixes with their trade-offs.
+    back: |
+      **Mechanism.** $\hat x_0=(x_t-\sigma_t\hat\epsilon)/\alpha_t$ is affine in $\hat\epsilon$, so $\tilde x_0=\hat x_0^u+s(\hat x_0^c-\hat x_0^u)$. The cond/uncond gap is $(\sigma_t/\alpha_t)$ times the $\epsilon$-gap, which is large at high noise. There $\hat x_0^u\approx$ dataset mean and $\hat x_0^c\approx$ class mean, so $s=12$ lands far outside $[-1,1]$. The sampler feeds this back (a train–test mismatch), errors compound, and colours and contrast blow out. Static clipping alone stops blank or diverged images but still saturates.
+
+      **Fixes:**
+      1. **Dynamic thresholding.** Percentile clip of $\hat x_0$, then divide by $q$. Keeps contrast and works well at large scales, but needs a known pixel range (pixel-space models).
+      2. **CFG rescale.** Match the guided output's per-sample std to the conditional's and blend with $\phi\approx0.7$. Works for latent models too. Full rescaling looks flat.
+      3. **Guidance interval.** Guide only at mid noise. This avoids high-noise extrapolation and mode collapse and saves compute, but adds two hyperparameters ($\sigma_{lo},\sigma_{hi}$).
+
+      Also: simply lower $s$, trading prompt adherence.
+    source: Saharia et al. 2022 §2.3; Lin et al. 2024 §3.4; Kynkäänniemi et al. 2024 §3
+
+  - id: f10
+    type: open
+    front: Compare classifier guidance and classifier-free guidance as you would for an interviewer choosing one for a new text-to-image model.
+    back: |
+      **Classifier guidance:**
+      - Needs a separate noise-aware classifier for every condition type. That is hard for free-form text, and off-the-shelf models don't work.
+      - Its gradients can be adversarial (a classifier ignores most of $x$), and it raises the question of gaming classifier-based metrics.
+      - Cheap per step: one diffusion pass plus a small classifier's backward pass.
+      - Can condition a pretrained unconditional model after the fact.
+
+      **Classifier-free guidance:**
+      - One network trained with condition dropout, a one-line change.
+      - The implicit classifier comes from a generative model, which can't ignore parts of $x$, so its signal is more robust (Dieleman).
+      - Works for any conditioning, including text, and the same trick extends to negative prompts.
+      - Costs 2 diffusion passes per step.
+      - Needs the conditioning decided at training time.
+
+      **Verdict for text-to-image: CFG**, plus a rescale or interval for high scales, and distillation if latency matters.
+    source: Ho & Salimans 2022 §1, §5; Dieleman 2022; Dhariwal & Nichol 2021 §4
+
+  - id: f11
+    type: open
+    front: Show that classifier-free guidance applied to flow-matching velocities is the same as CFG on scores.
+    back: |
+      Take the Gaussian path $x_t=t\,x_1+(1-t)\,x_0$ with $x_0\sim\mathcal N(0,I)$. Then:
+      - $x_t\mid x_1\sim\mathcal N(tx_1,(1-t)^2I)$, so $\nabla\log p_t(x)=-\mathbb E[x_0\mid x_t]/(1-t)$.
+      - From $x=t\,\mathbb E[x_1\mid x_t]+(1-t)\mathbb E[x_0\mid x_t]$, the marginal velocity is
+
+      $$u_t(x)=\mathbb E[x_1-x_0\mid x_t]=\frac{x+(1-t)\nabla\log p_t(x)}{t}.$$
+
+      The coefficients don't depend on $c$, so $u_u+s(u_c-u_u)$ equals the same expression with the guided score $\nabla\log p_t(x)+s(\nabla\log p_t(x\mid c)-\nabla\log p_t(x))$. The guidance scale carries over unchanged.
+    source: Lipman et al. 2023 §4; Gao et al. 2024 (blog), "How do we choose what the network should output?"
+
+reading:
+  - title: "Ho & Salimans 2022, Classifier-Free Diffusion Guidance, §3 and §4"
+    url: https://arxiv.org/abs/2207.12598
+    kind: paper
+    note: The original CFG paper. §3.2 has the implicit-classifier argument and its caveats, and Tables 1–2 the w sweeps behind the FID/IS trade-off.
+  - title: "Dhariwal & Nichol 2021, Diffusion Models Beat GANs on Image Synthesis, §4"
+    url: https://arxiv.org/abs/2105.05233
+    kind: paper
+    note: Classifier guidance. The Taylor-expansion mean shift, the DDIM version, and why scales above 1 were needed.
+  - title: "Dieleman 2022, Guidance: a cheat code for diffusion models"
+    url: https://sander.ai/2022/05/26/guidance.html
+    kind: blog
+    note: The temperature view of guidance, why CFG beats classifier guidance, and why autoregressive guidance differs.
+  - title: "Saharia et al. 2022 (Imagen), §2.3 Large guidance weight samplers"
+    url: https://arxiv.org/abs/2205.11487
+    kind: paper
+    note: The train–test-mismatch explanation of over-saturation, plus static vs dynamic thresholding with reference code (Fig. A.31).
+  - title: "Kynkäänniemi et al. 2024, Applying Guidance in a Limited Interval"
+    url: https://arxiv.org/abs/2404.07724
+    kind: paper
+    note: A 1-D picture of how high-noise guidance causes mode drop, and the guidance-interval fix. Lin et al. 2024 §3.4 (arXiv 2305.08891) covers CFG rescale.

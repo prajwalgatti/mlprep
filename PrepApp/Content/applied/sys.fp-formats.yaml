@@ -1,0 +1,485 @@
+id: sys.fp-formats
+area: applied
+title: "Floating-point formats: bits, range and precision"
+summary: How fp32, fp16, bf16, tf32 and the two fp8 formats encode numbers, and how to derive each one's range, precision and failure modes from its exponent and mantissa bit counts.
+order: 10
+level: core
+tags: [numerics, floating-point, bf16, fp16, fp8, tf32, mixed-precision]
+prereqs: []
+
+explainer:
+  - title: "The problem: one bit budget for numbers from 1e-8 to 1e4"
+    body: |
+      A training step touches numbers of wildly different sizes: gradients of $10^{-8}$, weights around $10^{-2}$, activations and logits in the hundreds or thousands. We want to store them in as few bits as possible, because fewer bits mean less memory, less communication, and faster matrix units.
+
+      **Why fixed point fails.** A fixed-point format puts a uniform grid on the line. Take 16 bits with 8 of them after the binary point: the step is $2^{-8}\approx0.0039$ and the largest signed value is about $128$. A gradient of $10^{-5}$ is stored as 0, and a logit of 300 overflows. A uniform grid must trade range against resolution, and 16 bits cannot buy both.
+
+      **The floating-point idea.** Use scientific notation in base 2. What we usually need is a fixed *relative* precision (a few significant digits) over a huge range of magnitudes. A **normal** floating-point number is
+
+      $$x=(-1)^S\times 1.M_2\times 2^{E-\text{bias}}$$
+
+      - $S$ is the sign bit.
+      - $E$ is the **exponent field**, an unsigned integer stored in $e$ bits.
+      - $M$ is the **mantissa** (the trailing significand field), $m$ bits written after an implicit leading "1.". So $1.M_2$ is a number in $[1,2)$.
+      - The **bias** is a constant that lets $E-\text{bias}$ be negative.
+
+      **The one idea to keep.** Exponent bits buy **range**: how many powers of two you can reach. Mantissa bits buy **precision**: each interval $[2^k,2^{k+1})$, called a **binade**, is cut into $2^m$ equal steps. Every format in this lesson (fp32, fp16, bf16, tf32, E5M2, E4M3) is just a choice of $(e,m)$ plus a few conventions for special values.
+
+    source: Goldberg 1991 "Rounding Error › Floating-point Formats"; Micikevicius et al. 2022 §3
+
+  - title: "Encoding: sign, biased exponent, hidden bit"
+    body: |
+      ![Bit layouts aligned on the binary point. bf16 keeps fp32's 8 exponent bits and cuts the mantissa; fp16 spends its bits the other way round.](sys.fp-formats/bit-layouts)
+
+      **Three fields.** A format with $e$ exponent bits and $m$ mantissa bits uses $1+e+m$ bits in total.
+      - **Biased exponent.** The field stores $E\in\{0,\dots,2^e-1\}$ and the true exponent is $E-\text{bias}$, with $\text{bias}=2^{e-1}-1$. That is 15 for fp16 and 127 for fp32 and bf16. Biasing, rather than storing a signed exponent, means that non-negative floats sort in the same order as their bit patterns read as integers.
+      - **Hidden bit.** A normalised binary number always starts with 1, so that bit is not stored. The significand therefore has $p=m+1$ bits of precision. fp32 stores 23 bits but has $p=24$.
+      - **Reserved exponents (IEEE).** $E=0$ is reserved for zero and subnormals, and $E=2^e-1$ (all ones) for $\pm\infty$ (mantissa 0) and NaN (mantissa $\neq0$). Normal numbers use $E=1,\dots,2^e-2$.
+
+      **Decode by hand** (fp16: 1 + 5 + 10 bits, bias 15).
+      - `0 01111 0100000000`: $E=15$, so the exponent is $0$. Significand $1.01_2=1.25$. The value is $1.25$.
+      - `0 10010 1010000000`: $E=18$, exponent $3$. Significand $1.101_2=1.625$. The value is $1.625\times8=13$.
+      - `0 11110 1111111111` (largest normal): $E=30$, exponent 15. Significand $2-2^{-10}$. The value is
+
+      $$(2-2^{-10})\times2^{15}=65504.$$
+
+      A common slip is to forget the hidden 1: reading `1010000000` as $0.625$ gives $5$ instead of $13$.
+    source: Goldberg 1991 "The IEEE Standard › Formats and Operations", "Special Quantities" (Table D-2); Micikevicius et al. 2022 §3
+
+  - title: "Deriving range and precision from (e, m)"
+    body: |
+      **Largest normal.** The largest normal field value is $E=2^e-2$, so the largest exponent is
+
+      $$\begin{aligned}E_{max}&=2^e-2-\text{bias}\\&=2^{e-1}-1=\text{bias}.\end{aligned}$$
+
+      The largest significand is $1.11\dots1_2=2-2^{-m}$, so
+
+      $$x_{max}=(2-2^{-m})\,2^{\text{bias}}.$$
+
+      **Smallest normal.** Field $E=1$ with significand $1.0$ gives $x_{min}=2^{1-\text{bias}}$.
+
+      **Smallest subnormal** (next card): $2^{1-\text{bias}-m}$.
+
+      **Spacing inside a binade.** In $[2^k,2^{k+1})$ the $2^m$ significands $1,\,1+2^{-m},\,\dots$ are evenly spaced. The gap between neighbours, one **ulp** ("unit in the last place"), is
+
+      $$\mathrm{ulp}=2^{k-m}.$$
+
+      At $x=1$ the gap is $2^{-m}$. This is **machine epsilon** $\varepsilon$ as returned by `numpy.finfo(...).eps` and `torch.finfo(...).eps`.
+
+      **Relative rounding error.** Round-to-nearest is off by at most half a gap. For $x\in[2^k,2^{k+1})$:
+
+      $$\frac{|\mathrm{fl}(x)-x|}{|x|}\le\frac{2^{k-m-1}}{2^k}=2^{-(m+1)}=u.$$
+
+      $u$ is the **unit roundoff**. Numerical analysts, Goldberg included, call $u$ "machine epsilon", so the two conventions differ by a factor of 2. This lesson uses $\varepsilon=2^{-m}$ for the gap at 1 and $u=2^{-(m+1)}$ for the error bound.
+
+      **Decimal digits.** $p$ bits of significand carry about $p\log_{10}2=(m+1)\times0.301$ decimal digits. That is 7.2 for fp32, 3.3 for fp16 and 2.4 for bf16. So bf16 has "about 2.4 digits", not 3.
+
+      **Check on fp16** ($e=5$, $m=10$, bias 15): $x_{max}=(2-2^{-10})2^{15}=65504$, $x_{min}=2^{-14}\approx6.10\times10^{-5}$, $\varepsilon=2^{-10}\approx9.77\times10^{-4}$, $u\approx4.88\times10^{-4}$.
+    source: Goldberg 1991 "Relative Error and Ulps"; PyTorch torch.finfo (verified numerically)
+
+  - title: "The format zoo"
+    body: |
+      ![Representable magnitudes on a log axis (faded = subnormal). The shaded band is illustrative. fp16's floor sits inside it; bf16 covers it with room to spare.](sys.fp-formats/number-line)
+
+      All numbers below follow from the formulas on the previous card ($\varepsilon=2^{-m}$).
+      - **fp32** (1, 8, 23): max $3.40\times10^{38}$, min normal $1.18\times10^{-38}$, $\varepsilon=1.19\times10^{-7}$.
+      - **fp16** (1, 5, 10): max $65504$, min normal $6.10\times10^{-5}$, min subnormal $5.96\times10^{-8}$, $\varepsilon=9.77\times10^{-4}$.
+      - **bf16** (1, 8, 7): max $3.39\times10^{38}$, min normal $1.18\times10^{-38}$, $\varepsilon=7.81\times10^{-3}$. It is exactly the top 16 bits of fp32. Converting from fp32 means dropping 16 mantissa bits (with rounding), and converting back means appending zeros. The range is fp32's.
+      - **tf32** (1, 8, 10): not a storage type. Tensors stay fp32 in memory. On NVIDIA Ampere and later, tensor cores round each fp32 input to 10 mantissa bits, multiply, and accumulate in fp32. (The PyTorch docs say both "rounding" and "reads only the first 10 bits"; this lesson says rounded.) The result has fp32's range and fp16's precision, using 19 of the 32 bits.
+      - **E5M2** (1, 5, 2): max $57344$, $\varepsilon=0.25$. This is fp16 with the mantissa cut to 2 bits, and it keeps IEEE's special values.
+      - **E4M3** (1, 4, 3), as in the OCP (Open Compute Project) fp8 spec adopted by NVIDIA, Arm and Intel: max $448$, min normal $2^{-6}$, min subnormal $2^{-9}$, $\varepsilon=0.125$. It has no infinity (two cards on).
+
+      **fp16 vs bf16.** Both use 16 bits. fp16 puts 3 more bits in the mantissa, so it is $2^3=8\times$ finer within its range. bf16 puts those 3 bits in the exponent, so its normal range is $2^{-126}$ to $2^{128}$ instead of $2^{-14}$ to $2^{16}$. fp16 is more precise but overflows above 65504, loses precision below $6.1\times10^{-5}$ and rounds to 0 below $3\times10^{-8}$. bf16 almost never overflows or underflows, but it rounds 8× more coarsely.
+
+      **TF32 in PyTorch** is set with `torch.set_float32_matmul_precision("high")` or the `allow_tf32` / `fp32_precision` flags. It is off by default for matmuls since 1.12 and on for cuDNN convolutions.
+    source: Kalamkar et al. 2019 §3 (Table 1); Micikevicius et al. 2022 §3 (Table 1); PyTorch "CUDA semantics › TensorFloat-32 (TF32) on Ampere (and later) devices"; PyTorch "Numerical accuracy › TensorFloat-32"
+
+  - title: "Ulps, spacing and swamping"
+    body: |
+      ![Gap between neighbouring numbers against magnitude. It doubles every binade. bf16's staircase sits 8× above fp16's, and fp16's flattens into a fixed gap in the subnormal range.](sys.fp-formats/spacing)
+
+      **The gap grows with the number.** In $[2^k,2^{k+1})$ the gap is $2^{k-m}$, so at magnitude $x$ it lies between $x\,2^{-m-1}$ and $x\,2^{-m}$. Absolute precision gets worse as numbers grow; relative precision stays roughly constant.
+
+      **Integers.** Every integer with at most $p=m+1$ significant bits is exact. So all integers up to $2^{m+1}$ are representable, and in $[2^{m+1},2^{m+2})$ the gap is 2.
+      - fp16: exact up to 2048.
+      - bf16: exact up to 256.
+      - fp32: exact up to $2^{24}=16{,}777{,}216$.
+
+      **Swamping.** If $|b|$ is below half an ulp of $a$, then $a+b$ rounds back to $a$.
+      - bf16: half-ulp at 1 is $2^{-8}\approx0.0039$. So `1 + 0.001 = 1`, while `1 + 0.004 = 1.0078125`, the next bf16 number.
+      - fp16: half-ulp at 1 is $2^{-11}\approx4.9\times10^{-4}$, so `1 + 1e-4 = 1`. `2048 + 1 = 2048`.
+      - bf16: `256 + 1 = 256`. The true sum lies exactly halfway between 256 and 258, and the tie goes to the even pattern, 256.
+
+      **Consequences in training code.**
+      - Never keep counters, step numbers, token ids or position indices in half precision. A bf16 step counter sticks at 256 forever. Token id 50257 becomes 50176 in bf16 and 50272 in fp16, and position 4097 becomes 4096 in bf16.
+      - A running sum kept in low precision stops growing once the increments fall below half its ulp. This is why reductions and matmul accumulators use fp32 (more in `sys.fp-error`).
+      - A weight update $\eta g$ smaller than half an ulp of the weight $w$ is lost entirely. This is the reason for fp32 master weights (`sys.mixed-precision`).
+    source: Goldberg 1991 "Relative Error and Ulps"; Micikevicius et al. 2018 §3.1; examples verified in PyTorch
+
+  - title: "Subnormals and special values"
+    body: |
+      **The gap at zero.** With normal numbers only, the smallest positive value is $2^{1-\text{bias}}$, while the spacing just above it is $2^{1-\text{bias}-m}$, which is $2^m$ times smaller. Anything that lands in between is flushed to 0. Then two different numbers can have $x-y=0$, and code like `if x != y: z = 1/(x-y)` divides by zero (Goldberg's example).
+
+      **Subnormals** (also called denormals) fill the gap. The field $E=0$ with $M\neq0$ means
+
+      $$x=(-1)^S\times0.M_2\times2^{1-\text{bias}}.$$
+
+      The exponent is pinned at the smallest normal exponent and there is no hidden 1. That gives evenly spaced points from $2^{1-\text{bias}-m}$ up to the smallest normal, so $x-y=0$ holds exactly when $x=y$. This is **gradual underflow**.
+      - **Cost 1: precision.** A subnormal with leading zeros in $M$ has fewer significant bits. The smallest has only one. In fp16, `1e-6` is stored as $1.013\times10^{-6}$, a 1.3% error, and anything below half the smallest subnormal ($2^{-25}\approx2.98\times10^{-8}$) becomes 0.
+      - **Cost 2: speed.** Some hardware and kernels **flush to zero** (FTZ on outputs, DAZ on inputs) for speed. For example, AMD MI200 fp16/bf16 matrix instructions flush denormals. So fp16 values below $6.1\times10^{-5}$ are fragile.
+
+      **Special values** (IEEE).
+      - $\pm0$ compare equal, but the sign survives multiplication.
+      - $\pm\infty$ comes from overflow or $x/0$ with $x\neq0$.
+      - NaN comes from $0/0$, $\infty-\infty$, $0\times\infty$ and $\sqrt{-1}$. Any arithmetic involving a NaN gives NaN, and $\text{NaN}\neq\text{NaN}$, which is why `x != x` tests for it.
+
+
+      **E4M3 bends the rules.** It has no $\infty$ and only one NaN mantissa pattern, `S.1111.111`. Exponent field 1111 is therefore free for normal numbers, which adds a binade with the 7 values 256, 288, …, 448:
+
+      $$x_{max}=1.110_2\times2^{15-7}=1.75\times2^8=448.$$
+
+      Under IEEE conventions the top field would be reserved and the max would be $(2-2^{-3})\,2^{7}=240$. E5M2 keeps the IEEE specials.
+    source: Goldberg 1991 "Denormalized Numbers", "Special Quantities", "NaNs", "Infinity", "Signed Zero"; Micikevicius et al. 2022 §3.1; PyTorch "Numerical accuracy › Reduced Precision FP16 and BF16 GEMMs and Convolutions on AMD Instinct MI200 devices"
+
+  - title: "Rounding on conversion"
+    body: |
+      Every time a value is narrowed (fp32 → bf16 or fp8 for the input of a matrix multiply, a "GEMM"), it must be rounded to a neighbouring representable number.
+
+      **Round to nearest, ties to even (RNE)** is the IEEE default. Pick the nearer neighbour. On an exact tie, pick the neighbour whose last mantissa bit is 0. Why not "ties round up"? Ties would then always move in the same direction, and long sums would drift. Ties-to-even goes up half the time and down half the time.
+      - bf16: 257 is exactly between 256 and 258, so it rounds to 256. 259 rounds to 260.
+      - fp16: 65519 rounds to 65504, but 65520 becomes $\infty$. 65520 is exactly halfway between 65504 and $65536=2^{16}$, which would be the next value if the exponent could grow. The tie goes to the even pattern, 65536, which is out of range and so overflows.
+
+      **Truncation (chopping).** The cheapest fp32 → bf16 conversion just drops the low 16 bits. That always rounds toward zero, so it is **biased**. For example, $2/3\approx0.66667$ chops to $0.6640625$ (error $2.6\times10^{-3}$), while RNE gives $0.66796875$ (error $1.3\times10^{-3}$). Kalamkar et al.'s bf16 emulation uses RNE.
+
+      **Stochastic rounding** (round up with probability equal to the fractional distance) is unbiased in expectation and is used for low-precision weight updates (`sys.fp-error`).
+
+      **Overflow on fp8 casts.** A **saturating** cast clamps out-of-range values to $\pm x_{max}$ (448 or 57344). A **non-saturating** cast turns values that round past $x_{max}$ into NaN (E4M3) or $\infty$ (E5M2). Micikevicius et al. recommend multiplying by a per-tensor scale factor before the cast and saturating whatever still overflows. The fp16 recipe of skipping steps on overflow would skip too often given fp8's narrow range. Watch out: `.to(torch.float8_e4m3fn)` is non-saturating. It rounds first, so 449–464 still give 448, but values that would round to 480 (e.g. 500) become NaN (checked in PyTorch 2.1). fp8 code therefore clamps explicitly.
+    source: Goldberg 1991 "Rounding Modes"; Kalamkar et al. 2019 §1; Micikevicius et al. 2022 §2; Zamirai et al. 2020 §1; values verified in PyTorch 2.1
+
+  - title: "Which format where in deep learning"
+    body: |
+      - **fp32**: master weights, optimizer state (Adam's $m$ and $v$), accumulators inside matmuls and reductions, and the loss. Anything that sums many small contributions or receives tiny updates.
+      - **bf16**: the default for activations, the working copy of the weights, and gradients on A100/H100 GPUs and TPUs. It has fp32's range, so gradients rarely underflow. Kalamkar et al. trained CNNs, speech, translation, GAN and recommender workloads in bf16 without loss scaling or hyperparameter changes. But it has only 8 significant bits, so small weight updates are swamped. bf16 training still keeps fp32 master weights.
+      - **fp16**: 3 more mantissa bits than bf16, but a narrow range.
+        - Small gradients lose precision below $6.1\times10^{-5}$ and round to 0 below $3\times10^{-8}$, which motivates loss scaling (`sys.mixed-precision`). $e^x$ overflows for $x>11.09$.
+        - Adam's default $\epsilon=10^{-8}$ rounds to 0 in fp16.
+        - fp16 survives in inference, where values are bounded and its extra precision helps, and on Volta and Turing GPUs, whose tensor cores were built for fp16 inputs.
+      - **tf32**: a switch that speeds up fp32 matmuls with no code change, at fp16-level input precision.
+      - **fp8**: the recommended split is E4M3 for weights and activations (one more mantissa bit) and E5M2 for gradients (more binades: 32 including subnormals, against E4M3's 18). It is used with per-tensor scale factors on the *inputs* of matmuls, while outputs stay in higher precision. Covered in `sys.fp8-training`.
+
+      **Integer formats are a different design.** int8 and int4 use a *uniform* grid with a per-tensor or per-channel scale (and zero-point). Every value then gets the same absolute precision, which suits bounded weights at inference but not quantities spanning many orders of magnitude. Quantization is covered in `llm.quantization`.
+
+      **Scope.** "bf16 needs no loss scaling" is an empirical finding for the workloads studied, not a theorem. A model whose gradients fall below $10^{-38}$ would still underflow. "fp32 master weights" is about the *update*. It does not make the forward pass more accurate.
+    source: Kalamkar et al. 2019 §1, §3; Micikevicius et al. 2022 §2–3; Micikevicius et al. 2018 §3; NVIDIA Train With Mixed Precision §2.2; PyTorch "CUDA semantics › TensorFloat-32"
+
+  - title: "What interviewers probe"
+    body: |
+      - *"What is bf16's machine epsilon?"* $2^{-7}\approx0.0078$ as the gap above 1. The unit roundoff is $2^{-8}\approx0.0039$. Say which convention you mean.
+      - *"Largest fp16 value?"* $(2-2^{-10})\cdot2^{15}=65504$. Derive it: the top exponent field is reserved, so $E_{max}=30-15=15$.
+      - *"Why bf16 for training and fp16 sometimes for inference?"* Training gradients span many orders of magnitude, and bf16's range removes underflow and overflow without loss scaling. Inference activations are bounded and calibrated, where fp16's 3 extra mantissa bits help and the range is enough.
+      - *"What is TF32?"* A tensor-core *compute* mode, not a dtype. fp32 inputs are rounded to 10 mantissa bits and accumulated in fp32. It gives fp32's range with fp16's precision, and it is off by default for PyTorch matmuls.
+      - *"E4M3 vs E5M2?"* Precision vs range. E4M3 reaches 448 by giving up $\infty$ and keeping one NaN pattern; E5M2 reaches 57344 and is IEEE-like. Use E4M3 for forward tensors and E5M2 for gradients.
+      - *"Why does a bf16 step counter break the LR schedule?"* Integers above 256 are not all representable, and $256+1$ rounds back to 256 (tie to even), so the counter freezes.
+      - *"What are subnormals for, and what do they cost?"* Gradual underflow guarantees $x-y=0\iff x=y$. The cost is reduced precision near zero, and slow paths or flush-to-zero on some hardware.
+      - *"Does bf16 halve the precision of fp32?"* No. It keeps 8 of 24 significand bits, about 2.4 decimal digits against 7.2.
+    source: Goldberg 1991 "Relative Error and Ulps", "Denormalized Numbers"; Micikevicius et al. 2022 §3; PyTorch "Numerical accuracy › TensorFloat-32"
+
+  - title: "Key results"
+    body: |
+      - Normal value: $(-1)^S\,1.M_2\,2^{E-\text{bias}}$ with $\text{bias}=2^{e-1}-1$. Subnormal value: $(-1)^S\,0.M_2\,2^{1-\text{bias}}$.
+      - From $(e,m)$, IEEE conventions:
+
+      $$\begin{aligned}x_{max}&=(2-2^{-m})\,2^{\text{bias}}\\x_{min}&=2^{1-\text{bias}}\\x_{sub}&=2^{1-\text{bias}-m}\end{aligned}$$
+
+      - Gap at $x\in[2^k,2^{k+1})$ is $2^{k-m}$. $\varepsilon=2^{-m}$ (finfo.eps), $u=2^{-(m+1)}$ (relative rounding bound). Decimal digits $\approx(m+1)\log_{10}2$.
+      - fp32 (8, 23), fp16 (5, 10), bf16 (8, 7), tf32 (8, 10; compute mode only), E5M2 (5, 2), E4M3 (4, 3).
+      - Max values: fp16 65504; bf16 $3.39\times10^{38}$; E5M2 57344; E4M3 448 (no $\infty$; 240 under IEEE rules).
+      - $\varepsilon$: fp16 $9.77\times10^{-4}$, bf16 $7.81\times10^{-3}$, fp32 $1.19\times10^{-7}$.
+      - fp16 floor: min normal $6.1\times10^{-5}$, min subnormal $5.96\times10^{-8}$, so values below $2.98\times10^{-8}$ become 0.
+      - Integers are exact up to $2^{m+1}$: fp16 2048, bf16 256, fp32 $2^{24}$.
+      - RNE ties go to the even pattern. Chopping is biased toward zero. fp8 casts should scale, then saturate.
+    source: Goldberg 1991; Micikevicius et al. 2022 §3; Kalamkar et al. 2019 Table 1
+
+quiz:
+  - id: q1
+    prompt: |
+      A format has 1 sign bit, 6 exponent bits and 9 mantissa bits, with IEEE conventions (hidden bit, top and bottom exponent fields reserved). What are its largest finite value and its machine epsilon $\varepsilon$ (the gap above 1)?
+    correct: 'max ≈ $4.3\times10^{9}$, $\varepsilon=2^{-9}\approx2.0\times10^{-3}$'
+    wrong:
+      - 'max ≈ $4.3\times10^{9}$, $\varepsilon=2^{-10}\approx9.8\times10^{-4}$'
+      - 'max ≈ $1.8\times10^{19}$, $\varepsilon=2^{-9}\approx2.0\times10^{-3}$'
+      - 'max ≈ $2.1\times10^{9}$, $\varepsilon=2^{-9}\approx2.0\times10^{-3}$'
+    explanation: |
+      $\text{bias}=2^5-1=31$ and $E_{max}=2^6-2-31=31$, so $x_{max}=(2-2^{-9})\,2^{31}\approx4.29\times10^9$. The gap above 1 is $2^{-m}=2^{-9}$. The hidden bit gives $p=10$ bits of *precision*, but the gap is still $2^{-m}$ (that is the $2^{-10}$ trap). $1.8\times10^{19}$ forgets the bias, and $2.1\times10^9$ uses $E_{max}=30$.
+    source: Goldberg 1991 "Formats and Operations"; formulas from "Relative Error and Ulps"
+
+  - id: q2
+    prompt: |
+      Decode the fp16 bit pattern `0 10010 1010000000` (sign, 5-bit exponent, 10-bit mantissa, bias 15).
+    correct: '13'
+    wrong:
+      - '5'
+      - '6.5'
+      - '26'
+    explanation: |
+      $E=10010_2=18$, so the exponent is $18-15=3$. The significand is $1.101_2=1.625$, so the value is $1.625\times8=13$. Forgetting the hidden 1 gives $0.625\times8=5$. Using bias 16 gives 6.5, and bias 14 gives 26.
+    source: Goldberg 1991 "Formats and Operations"; Micikevicius et al. 2022 §3
+
+  - id: q3
+    prompt: |
+      A training loop stores its step counter in bf16 and computes the LR schedule from it. What happens after step 256?
+    correct: The counter stays at 256, so the schedule freezes
+    wrong:
+      - The counter counts by 2 (258, 260, …), so the schedule runs at double speed
+      - The counter overflows to inf at 65504, so the LR becomes NaN
+      - The counter is exact until $2^{24}$, so nothing goes wrong
+    explanation: |
+      bf16 has $p=8$ significand bits, so integers are exact only up to $2^8=256$. Above that the gap is 2. $256+1=257$ is an exact tie between 256 and 258, and ties-to-even picks 256, so every increment is lost. Counting by 2 would need the sum to round up, which it never does here. $2^{24}$ is the fp32 limit.
+    source: Goldberg 1991 "Relative Error and Ulps"; verified in PyTorch
+
+  - id: q4
+    prompt: |
+      Which statement is **false**?
+    correct: bf16 has more mantissa precision than fp16
+    wrong:
+      - bf16 and fp32 have the same exponent range
+      - In fp16, $10^{-6}$ is stored as a subnormal
+      - E4M3 has no encoding for infinity
+    explanation: |
+      bf16 has 7 mantissa bits and fp16 has 10, so fp16 is 8× finer within its range. bf16 trades those bits for fp32's 8-bit exponent. $10^{-6}$ is below fp16's smallest normal ($6.1\times10^{-5}$) and above its smallest subnormal, so it is stored as a subnormal (with 1.3% error). E4M3 reuses the infinity patterns for normal numbers.
+    source: Kalamkar et al. 2019 Table 1; Micikevicius et al. 2022 §3.1
+
+  - id: q5
+    prompt: |
+      In the OCP (Open Compute Project) fp8 recipe, why is E4M3 recommended for weights and activations but E5M2 for gradients?
+    correct: Gradients need more binades; forward tensors need the extra mantissa bit
+    wrong:
+      - E5M2 has the finer mantissa, which tiny gradient values need most
+      - E4M3 keeps infinities, which the forward pass needs to flag overflows
+      - Gradients are larger than activations, so they need the 448 maximum
+    explanation: |
+      E5M2 covers 32 binades (including subnormals) against E4M3's 18. Gradient magnitudes vary over a much wider range than activations or weights, so range matters more for them. Forward tensors fit a narrower range after per-tensor scaling and benefit from E4M3's 3 mantissa bits. E4M3 has *no* infinities, and its max is 448, below E5M2's 57344.
+    source: Micikevicius et al. 2022 §3, §3.1
+
+  - id: q6
+    prompt: |
+      E4M3 has 4 exponent bits (bias 7) and 3 mantissa bits. If it followed IEEE conventions, reserving the all-ones exponent for inf and NaN, what would its largest finite value be?
+    correct: '240'
+    wrong:
+      - '448'
+      - '480'
+      - '256'
+    explanation: |
+      With the top field reserved, $E_{max}=14-7=7$ and $x_{max}=(2-2^{-3})\,2^7=1.875\times128=240$. The real E4M3 keeps exponent 1111 for normals and reserves only mantissa 111 there for NaN, giving $1.75\times2^8=448$. 480 would need `S.1111.111`, which E4M3 keeps as NaN (for both signs) so that integer compare and sort still work. It gives up 480 instead.
+    source: Micikevicius et al. 2022 §3.1
+
+  - id: q7
+    prompt: |
+      What does the fp32 value 65520 become when cast to fp16 with round-to-nearest-even?
+    correct: '+inf'
+    wrong:
+      - '65504'
+      - '65520'
+      - '65536'
+    explanation: |
+      The fp16 gap in $[2^{15},2^{16})$ is 32, so 65520 lies exactly halfway between 65504 (mantissa all ones, odd) and $2^{16}=65536$ (even). Ties go to even, so the result is 65536, which exceeds the largest fp16 value and overflows to $+\infty$. 65519 would round to 65504. 65536 itself cannot be stored in fp16.
+    source: Goldberg 1991 "Rounding Modes"; verified in PyTorch
+
+  - id: q8
+    prompt: |
+      An Adam implementation keeps $\epsilon=10^{-8}$ in fp16. What happens to $\epsilon$?
+    correct: It rounds to 0, so steps where $\sqrt{v}\approx0$ can blow up
+    wrong:
+      - It rounds up to $5.96\times10^{-8}$, the smallest subnormal
+      - It is stored exactly, because fp16 has subnormals
+      - It saturates to the smallest normal, $6.1\times10^{-5}$
+    explanation: |
+      The smallest fp16 subnormal is $2^{-24}\approx5.96\times10^{-8}$. Values below half of it, $2.98\times10^{-8}$, round to 0, and $10^{-8}$ is below that. With $\epsilon=0$, the update $m/(\sqrt v+\epsilon)$ divides by a near-zero number for parameters with tiny second moments. Rounding goes to the *nearest* value, which is 0, not up to the subnormal.
+    source: Goldberg 1991 "Denormalized Numbers"; verified in PyTorch
+
+  - id: q9
+    prompt: |
+      The value 1000.3 is cast to bf16 and to fp16 (both round to nearest). What are the results?
+    correct: 'bf16: 1000; fp16: 1000.5'
+    wrong:
+      - 'bf16: 1000.5; fp16: 1000'
+      - 'bf16: 1000; fp16: 1000.25'
+      - 'bf16: 1004; fp16: 1000.5'
+    explanation: |
+      1000 lies in $[2^9,2^{10})$. The gap there is $2^{9-7}=4$ for bf16 and $2^{9-10}=0.5$ for fp16. bf16's neighbours are 1000 and 1004, so 1000.3 rounds to 1000. fp16's neighbours are 1000 and 1000.5, and 1000.3 is closer to 1000.5. 0.25 is the gap you get by using $p=11$ in place of $m=10$.
+    source: Goldberg 1991 "Relative Error and Ulps"; verified in PyTorch
+
+  - id: q10
+    prompt: |
+      Which statement about TF32 is **false**?
+    correct: TF32 tensors take 19 bits each in GPU memory
+    wrong:
+      - Tensor cores round each fp32 input to 10 mantissa bits
+      - TF32 matmuls accumulate their products in fp32
+      - TF32 has the same exponent range as fp32
+    explanation: |
+      TF32 is a compute mode, not a storage dtype. Tensors stay 32-bit fp32 in memory. The tensor core rounds each input to 10 mantissa bits (1 + 8 + 10 = 19 bits matter) and accumulates in fp32. The 8 exponent bits are fp32's, so the range is the same.
+    source: PyTorch "CUDA semantics › TensorFloat-32 (TF32) on Ampere (and later) devices"
+
+  - id: q11
+    prompt: |
+      A kernel runs with flush-to-zero enabled. In fp16, $x=1.0\times10^{-4}$ and $y=0.7\times10^{-4}$ are both normal numbers. The code does `if x != y: z = 1/(x - y)`. What happens?
+    correct: '$x-y$ is flushed to 0, so $z$ becomes inf'
+    wrong:
+      - '$x-y\approx3\times10^{-5}$ is kept, so $z\approx3.3\times10^{4}$'
+      - '$y$ is flushed to 0 first, so $z=1/x=10^{4}$'
+      - The comparison fails, because $x$ and $y$ round to the same value
+    explanation: |
+      $x-y\approx3\times10^{-5}$ is below fp16's smallest normal ($6.1\times10^{-5}$), so the exact result is a subnormal. FTZ replaces it with 0, and $1/0=\infty$. This is Goldberg's argument for gradual underflow: with subnormals kept, you would get $z\approx3.3\times10^4$, which fits in fp16. FTZ touches only subnormal values, and $y=7\times10^{-5}$ is normal. $x$ and $y$ are distinct in fp16.
+    source: Goldberg 1991 "Denormalized Numbers"
+
+  - id: q12
+    prompt: |
+      A pipeline converts fp32 tensors to bf16 by chopping the low 16 bits instead of rounding to nearest. What does this do to the sum of many converted positive values?
+    correct: It biases the sum downward, since each value moves toward zero
+    wrong:
+      - It is unbiased on average but adds more variance than rounding
+      - It biases the sum upward, since chopping rounds away from zero
+      - Nothing, since bf16 has the same exponent range as fp32
+    explanation: |
+      Dropping bits of the mantissa always decreases the magnitude, so every positive value moves down, by up to one ulp. Those errors all have the same sign and add up. Round-to-nearest-even errs in both directions, by at most half an ulp, with ties split evenly. The shared exponent range is irrelevant: this is a mantissa effect.
+    source: Kalamkar et al. 2019 §1; Goldberg 1991 "Rounding Modes"
+
+  - id: q13
+    prompt: |
+      In an fp16 forward pass, one logit is $+\infty$ going into a softmax computed in the stable form $e^{z_i-\max z}/\sum_j e^{z_j-\max z}$. Which step first produces a NaN?
+    correct: 'Subtracting the max, since $\infty-\infty$ is NaN'
+    wrong:
+      - 'Taking $e^{\infty}$ for the overflowed logit'
+      - 'Dividing by the sum, since $1/\infty$ is NaN'
+      - No step; the softmax returns a one-hot vector
+    explanation: |
+      $\max z=+\infty$, so the overflowed entry computes $\infty-\infty=\text{NaN}$ (the others give $-\infty$, then $e^{-\infty}=0$). The NaN enters the sum, and every output becomes NaN. $e^{\infty}=\infty$ is not a NaN, and $1/\infty=0$. The one-hot answer is the mathematical limit, but IEEE arithmetic does not take limits. LayerNorm fails the same way, through its mean subtraction.
+    source: Goldberg 1991 "NaNs", "Infinity"
+
+cards:
+  - id: f1
+    front: Write the value of a normal and of a subnormal floating-point number with $e$ exponent and $m$ mantissa bits.
+    back: |
+      $$\begin{aligned}\text{normal: }&(-1)^S\,1.M_2\,2^{E-\text{bias}}\\ \text{subnormal: }&(-1)^S\,0.M_2\,2^{1-\text{bias}}\end{aligned}$$
+
+      $\text{bias}=2^{e-1}-1$. Normal fields are $E=1,\dots,2^e-2$. $E=0$ means zero or a subnormal; all ones means inf or NaN (IEEE).
+    source: Goldberg 1991 "Formats and Operations", "Denormalized Numbers"
+
+  - id: f2
+    front: From $(e,m)$, give the largest normal, smallest normal and smallest subnormal (IEEE conventions).
+    back: |
+      $$\begin{aligned}x_{max}&=(2-2^{-m})\,2^{\text{bias}}\\x_{min}&=2^{1-\text{bias}}\\x_{sub}&=2^{1-\text{bias}-m}\end{aligned}$$
+
+      $E_{max}=2^e-2-\text{bias}$ equals the bias. fp16: 65504, $6.10\times10^{-5}$, $5.96\times10^{-8}$.
+    source: Goldberg 1991 "Formats and Operations"; Kalamkar et al. 2019 Table 1
+
+  - id: f3
+    front: Machine epsilon vs unit roundoff, with values for fp16, bf16, fp32.
+    back: |
+      $\varepsilon=2^{-m}$ is the gap between 1 and the next number (`finfo.eps`). $u=2^{-(m+1)}$ bounds the relative error of round-to-nearest. Goldberg and numerical analysts call $u$ "machine epsilon".
+      - fp16: $\varepsilon=9.77\times10^{-4}$
+      - bf16: $\varepsilon=7.81\times10^{-3}$
+      - fp32: $\varepsilon=1.19\times10^{-7}$
+    source: Goldberg 1991 "Relative Error and Ulps"
+
+  - id: f4
+    front: (sign, exponent, mantissa) bits for fp32, fp16, bf16, tf32, E5M2, E4M3.
+    back: |
+      - fp32: 1, 8, 23
+      - fp16: 1, 5, 10
+      - bf16: 1, 8, 7
+      - tf32: 1, 8, 10 (compute mode, stored as fp32)
+      - E5M2: 1, 5, 2
+      - E4M3: 1, 4, 3
+
+      Exponent bits set the range, mantissa bits set the precision.
+    source: Micikevicius et al. 2022 §1, §3; Kalamkar et al. 2019 Table 1
+
+  - id: f5
+    front: Compare E4M3 and E5M2 (max, special values, recommended use).
+    back: |
+      - **E4M3**: max 448, no infinities, one NaN mantissa pattern (`S.1111.111`). The extra binade comes from reclaiming the inf/NaN exponent; under IEEE rules the max would be 240. Use it for weights and activations.
+      - **E5M2**: max 57344, IEEE infinities and NaNs (fp16 with 2 mantissa bits). Use it for gradients.
+    source: Micikevicius et al. 2022 §3, §3.1
+
+  - id: f6
+    front: Up to what integer are all integers exactly representable in fp16, bf16 and fp32, and why?
+    back: |
+      Up to $2^{m+1}$, because the significand holds $p=m+1$ bits. Beyond that the gap is 2.
+      - fp16: 2048
+      - bf16: 256
+      - fp32: $2^{24}=16{,}777{,}216$
+    source: Goldberg 1991 "Relative Error and Ulps"
+
+  - id: f7
+    front: What is TF32, and how is it controlled in PyTorch?
+    back: |
+      A tensor-core compute mode on Ampere and later. fp32 inputs are rounded to 10 mantissa bits (8 exponent bits kept), multiplied, and accumulated in fp32. Tensors stay fp32 in memory. Use `torch.backends.cuda.matmul.allow_tf32` or `torch.set_float32_matmul_precision("high")`. It is off by default for matmuls (since 1.12) and on for cuDNN convolutions. In the docs' A100 benchmark it is about 7× faster than fp32 for a $10240^2$ matmul, with relative error $2.2\times10^{-3}$ instead of $3.9\times10^{-5}$.
+    source: PyTorch "CUDA semantics › TensorFloat-32 (TF32) on Ampere (and later) devices"
+
+  - id: f8
+    type: open
+    front: Compare bf16 and fp16 for storing a gradient of $10^{-9}$ and an activation of $10^{5}$, and explain why bf16 became the training default.
+    back: |
+      1. **Gradient $10^{-9}$.** fp16 rounds it to 0, since it is below half the smallest subnormal ($2.98\times10^{-8}$). bf16 stores it as a normal number with 8 significant bits, because its range goes down to $1.18\times10^{-38}$.
+      2. **Activation $10^5$.** It exceeds fp16's max of 65504, so fp16 gives $+\infty$. bf16 stores it with a relative error of at most $2^{-8}$: the gap at $10^5$ is $2^{16-7}=512$.
+      3. **Why bf16 won.** Training values span many orders of magnitude, and bf16 keeps fp32's 8-bit exponent. Gradients rarely underflow and activations rarely overflow, so no loss scaling is needed (Kalamkar et al., empirically, across many workloads).
+      4. **Conversion is trivial.** bf16 is the top half of fp32, so a cast is a shift plus rounding.
+      5. **The price** is precision: 8 significand bits against fp16's 11 (8× coarser). Small weight updates are swamped, which `sys.mixed-precision` handles with fp32 master weights.
+      6. **fp16 still wins** where values are bounded and precision matters, e.g. calibrated inference.
+    source: Kalamkar et al. 2019 §1, §3; Goldberg 1991 "Denormalized Numbers"
+
+  - id: f9
+    type: open
+    front: Derive E4M3's maximum value, and explain how and why it departs from IEEE conventions.
+    back: |
+      - E4M3 has 4 exponent bits with bias $2^3-1=7$, and 3 mantissa bits.
+      - **IEEE version.** The all-ones field (15) is reserved, so $E_{max}=14-7=7$. The largest significand is $1.111_2=1.875$, so the max is $1.875\times2^7=240$.
+      - **Actual E4M3.** It drops infinities and keeps only one NaN pattern, `S.1111.111`. Exponent field 15 then holds normals with mantissas 000–110, so the max is $1.110_2\times2^{8}=1.75\times256=448$.
+      - **What it buys.** One extra binade (17 → 18) and the seven values 256, 288, …, 448. With only 3 mantissa bits, range is the scarce resource.
+      - **Why not 480?** Keeping $\pm$NaN and $\pm0$ preserves sign symmetry, so integer-based compare and sort still work.
+      - **Cost.** Overflow cannot produce inf, so casts saturate (scale first, clamp to 448), or return NaN if non-saturating.
+    source: Micikevicius et al. 2022 §2, §3.1 (Table 1)
+
+  - id: f10
+    type: open
+    front: List the number-format mechanisms by which an fp16 computation can turn into NaN, with one example of each.
+    back: |
+      1. **Overflow to inf.** Any result above 65504 becomes $+\infty$, for example $e^x$ for $x>11.09$, or a squared norm of activations in the hundreds. Inf is not yet NaN.
+      2. **Inf meets inf or zero.** $\infty-\infty$ (max-subtraction in softmax, mean-subtraction in LayerNorm), $0\cdot\infty$ and $\infty/\infty$ give NaN.
+      3. **Underflow to 0, then division.** Adam's $\epsilon=10^{-8}$ becomes 0, and a variance of tiny values rounds to 0. Then $0/0$ gives NaN and $x/0$ gives inf, leading back to step 2.
+      4. **Log or sqrt of an invalid input.** A probability underflows to 0, so $\log0=-\infty$, which feeds step 2. A tiny negative from rounding gives $\sqrt{-\delta}=\text{NaN}$.
+      5. **Propagation.** Any NaN operand gives NaN, so one bad element spreads to the whole tensor, and after an optimizer step to the whole model.
+      6. **Format-level fixes.** Compute the op in fp32, use stable forms (subtract the max, $\log$-sum-exp), keep $\epsilon$ in fp32, or use bf16 for range.
+    source: Goldberg 1991 "NaNs", "Infinity", "Special Quantities"
+
+  - id: f11
+    type: open
+    front: Decode the fp16 pattern `0 11110 1111111111` and explain each step, then say what changes for the pattern `0 11111 0000000000`.
+    back: |
+      1. Sign 0 means positive.
+      2. Exponent field $11110_2=30$. It is not all ones, so the number is normal. The exponent is $30-15=15$.
+      3. Mantissa all ones gives significand $1.1111111111_2=2-2^{-10}$ (hidden 1 included).
+      4. The value is $(2-2^{-10})\times2^{15}=65504$, the largest finite fp16 number.
+
+      Exponent field $11111$ (all ones) is reserved. With mantissa 0 the pattern means $+\infty$, and any nonzero mantissa means NaN. E5M2 shares this layout. E4M3 does not: it uses its top exponent for normals.
+    source: Goldberg 1991 "Formats and Operations", "Special Quantities"; Micikevicius et al. 2022 §3
+
+reading:
+  - title: "Goldberg (1991), What Every Computer Scientist Should Know About Floating-Point Arithmetic: Rounding Error, The IEEE Standard"
+    url: https://docs.oracle.com/cd/E19957-01/806-3568/ncg_goldberg.html
+    kind: paper
+    note: The classic reference for ulps, relative error, the hidden bit, special values and gradual underflow. Read "Relative Error and Ulps" and "Denormalized Numbers".
+  - title: "Micikevicius et al. (2022), FP8 Formats for Deep Learning, §2–3"
+    url: https://arxiv.org/abs/2209.05433
+    kind: paper
+    note: Table 1 defines E4M3 and E5M2. §3.1 explains the 448 maximum, and §2 covers scaling and saturating casts.
+  - title: "Kalamkar et al. (2019), A Study of BFLOAT16 for Deep Learning Training, §1 and §3"
+    url: https://arxiv.org/abs/1905.12322
+    kind: paper
+    note: Why bf16's fp32 range removes loss scaling, the RNE conversion, and the mixed bf16/fp32 data flow.
+  - title: "PyTorch docs: Numerical accuracy (TF32 and reduced-precision reductions)"
+    url: https://docs.pytorch.org/docs/stable/notes/numerical_accuracy.html
+    kind: docs
+    note: What TF32 does to matmul inputs, its defaults, and reduced-precision accumulation flags for fp16 and bf16 GEMMs.

@@ -1,0 +1,7 @@
+// Copy to Config/Local.xcconfig (git-ignored), fill in, then reopen Xcode.
+// Team ID: Xcode → Settings → Accounts → select your Apple ID → the 10-character ID next to "Personal Team"
+// (or just pick your team once in Signing & Capabilities and copy it from there).
+DEVELOPMENT_TEAM = ABCDE12345
+
+// Must be unique per Apple ID. Anything reverse-DNS-shaped works, e.g. io.github.<your-github-username>
+BUNDLE_ID_PREFIX = io.github.yourname

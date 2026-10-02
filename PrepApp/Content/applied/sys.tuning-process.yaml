@@ -1,0 +1,408 @@
+id: sys.tuning-process
+area: applied
+title: "Tuning Playbook: The Incremental Strategy"
+summary: How to start a deep learning project and improve it by controlled experiments, using scientific, nuisance and fixed hyperparameters.
+order: 310
+level: intermediate
+tags: [tuning, experimentation, hyperparameters, tuning-playbook]
+prereqs: [fund.adam]
+
+explainer:
+  - title: "The problem: tuning is a confounded experiment"
+    body: |
+      This lesson series follows the *Deep Learning Tuning Playbook* (Godbole, Dahl, Gilmer, Shallue & Nado, Google Research, 2023, CC-BY 4.0). We adapt it in our own words and add the reasoning behind its advice.
+
+      **The goal.** We want the configuration (architecture, optimizer, regularization, schedule, …) that maximises the validation metric, or ultimately the deployed model's usefulness. The space of configurations is huge, and no search algorithm can explore it without human guidance. So in practice we run a sequence of small experiments and change one thing at a time.
+
+      **Why this is hard.** Every experiment compares a few settings of the thing we care about, for example "4 layers vs 8 layers". The outcome also depends on dozens of other settings, such as the learning rate. That makes each comparison a *confounded* experiment, and it can fail in two ways.
+      - **Lucky adoption.** One configuration wins because of a favourable seed or a lucky draw of the other settings, not because the change helps. If we adopt it, the pipeline gains complexity for nothing.
+      - **Unfair comparison.** One setting was paired with better-suited values of the other knobs, so we reach the wrong scientific conclusion.
+
+      The playbook's answer is a disciplined loop of experiments. Each round has one narrow goal and treats the other settings explicitly, and a change is adopted only on strong evidence.
+
+      **Terminology.** The playbook notes that "hyperparameter" properly means a parameter of a prior in Bayesian modelling. Learning rates and layer counts would better be called *metaparameters*. It keeps "hyperparameter" because it is universal, and so do we.
+    source: Tuning Playbook §"Why a tuning playbook?", §"The incremental tuning strategy", FAQ "Why do you call the learning rate … hyperparameters?"
+
+  - title: "Starting a project: architecture, optimizer, first configuration"
+    body: |
+      Before any tuning we need a working pipeline and a starting point. The playbook assumes that problem formulation, data cleaning and metric choice are already done, and that the metric resembles what will be measured in deployment.
+
+      **Architecture: reuse something that works.** Pick a well-established architecture, ideally one from a paper on a problem close to yours, and reproduce it. You can build a custom model later. Choosing an architecture really means choosing a *family* of models: depth, width and activation are still hyperparameters to set.
+
+      **Optimizer: use the most popular one for this problem type.** No optimizer is best everywhere, and comparing optimizers fairly is itself hard. Popular choices come with known-good settings. Sensible defaults are SGD with Nesterov momentum and Adam/NAdam. Be ready to tune *all* of the optimizer's hyperparameters, since Adam's four can all matter. Early on, fix the extra ones (Adam's $\beta_1$, $\beta_2$, $\epsilon$) and tune only the learning rate, because every extra knob costs trials.
+
+      **Initial configuration: simple, fast, cheap, and "reasonable".**
+      - *Simple*: no bells and whistles. Use a constant learning rate before any decay schedule. Every extra feature added now is one more thing to tune, and it may never have helped.
+      - *Fast and cheap*: a smaller model, so that each trial is quick and many can run.
+      - *Reasonable*: clearly better than chance on validation, even if not yet deployable.
+
+      **The step budget is a tension.** More steps usually improve results and make tuning easier. Fewer steps make each trial cheaper, so more experiments fit in. And a budget that is too large is hard to shrink later, once the schedule has been tuned to it.
+
+      Batch size is chosen for *speed*, not for validation performance. That is the subject of a later lesson.
+    source: Tuning Playbook §"Choosing the model architecture", §"Choosing the optimizer", §"Choosing the initial configuration"
+
+  - title: "The incremental loop, and why insight comes first"
+    body: |
+      ![One round of the incremental strategy. Most rounds aim at insight; only the last ones are greedy. ("Best per value" means the best trial for each scientific setting; the next lesson covers it.)](sys.tuning-process/incremental-loop)
+
+      The playbook's strategy is to start simple and add improvements one at a time, building understanding as you go. Each round repeats four steps:
+      1. **Pick a narrow goal.** For example: "does adding dropout help?" or "how does the activation function matter?". If a round adds several features at once, their effects can't be separated.
+      2. **Design and run experiments** that make progress on that goal.
+      3. **Learn** what the results say, and check that the experiment itself was sound.
+      4. **Decide whether to launch**, meaning whether to adopt the new best configuration as the baseline. A launch needs evidence that the gain is real and not one lucky configuration, so that no needless complexity creeps in.
+
+      **Exploration vs exploitation.** You might expect most time to go into pushing validation error down. The playbook says the opposite: most rounds should be *exploration*, aimed at understanding the problem. Insight pays off later because it lets you:
+      - avoid adopting changes that merely happened to be present in good runs;
+      - learn which hyperparameters the metric is sensitive to, which ones interact (and must be re-tuned together), and which can be fixed;
+      - spot what to try next (e.g. a regularizer if you see overfitting);
+      - remove features that don't help;
+      - notice when tuning gains have saturated;
+      - narrow search spaces, so future studies are cheaper.
+
+      Only near the end, with a well-understood search space, do you switch to *exploitation*: greedily minimising validation error, for example with Bayesian optimisation (an adaptive search method, covered in the next lesson).
+    source: Tuning Playbook §"The incremental tuning strategy", §"Exploration vs exploitation", §"Choosing the goal for the next round of experiments"
+
+  - title: "Scientific, nuisance and fixed hyperparameters"
+    body: |
+      For a given round, every hyperparameter gets one of three roles.
+      - **Scientific**: the hyperparameter whose effect we want to measure. Example: the number of layers, if the goal is "do more layers reduce validation error?".
+      - **Nuisance**: the ones we must *optimise over* so that the comparison of scientific values is fair. The learning rate is nuisance here, because the best LR depends on depth. The term echoes nuisance parameters in statistics.
+      - **Fixed**: held at one value for the whole round. Each fixed value adds a *caveat*: the conclusion may hold only at that value.
+
+      **The role depends on the goal, not on the hyperparameter.** The activation function can be scientific ("is ReLU better than tanh here?"), nuisance ("is the best 5-layer net better than the best 6-layer net, letting each pick its activation?") or fixed ("for ReLU nets, does batch norm at this position help?").
+
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - title: "Rules of thumb: which role each kind of hyperparameter gets"
+    body: |
+      The role always depends on the goal, but some categories have typical roles:
+      - **Optimizer hyperparameters** (LR, momentum, Adam's betas, schedule parameters) are usually *nuisance*, because they interact with almost every other change. The reason is mechanical. The usable LR is capped by curvature (gradient descent on a quadratic is stable only for $\eta<2/\lambda_{max}$, with $\lambda_{max}$ the largest Hessian eigenvalue), and the best LR also grows with the batch size relative to the gradient noise (see the batch-size lesson). Depth, width, normalization, batch size, augmentation and regularization all move the curvature or the noise, so the best LR moves with them. "What is the best LR for the current pipeline?" is therefore a poor scientific question: the answer changes with the next change. We also have no *a priori* reason to prefer one value, because they don't change compute cost.
+      - **The choice of optimizer** is *scientific* (when comparing optimizers) or *fixed* (when earlier work shows it doesn't interact, its curves are easier to read, or it uses less memory).
+      - **Regularizers**: *whether* to include one (e.g. dropout, which adds code) is scientific or fixed; its *strength* (the dropout rate) is nuisance. Once adopted, the rate stays nuisance in later rounds.
+      - **Architecture** (e.g. the number of layers) is usually scientific or fixed, because it changes training cost, latency and memory, which are not things to optimise away.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - title: "Why nuisance hyperparameters must be optimised away"
+    body: |
+      ![Illustrative curves, not real data. Each depth has its own best LR (stars). Compared at one shared LR, the conclusion reverses.](sys.tuning-process/fixed-vs-tuned)
+
+      **Setup.** Let $s$ be the scientific hyperparameter (depth), $\eta$ a nuisance one (learning rate), and $f(s,\eta)$ the validation error. A naive experiment compares $f(s_1,\eta_0)$ with $f(s_2,\eta_0)$ at a shared default $\eta_0$. The fair comparison is
+
+      $$\min_{\eta} f(s_1,\eta) \quad\text{vs}\quad \min_{\eta} f(s_2,\eta).$$
+
+      **Why they disagree.** The two comparisons agree only if the best nuisance value $\eta^*(s)=\arg\min_\eta f(s,\eta)$ is the same for every $s$. That is exactly what "interaction" means. In the (illustrative) figure, $\eta^*$ is about $10^{-3}$ for 8 layers and $5\times10^{-3}$ for 4 layers. At the default $10^{-2}$, the 8-layer model sits on the steep side of its curve, so the naive experiment says "deeper is worse". Each tuned model, though, reaches 0.26 vs 0.30, so deeper is better. A smaller best LR for the deeper model is typical: more layers usually mean larger curvature $\lambda_{max}$, and stability needs $\eta<2/\lambda_{max}$.
+
+      **Nuisance vs fixed is a budget decision.** With unlimited compute, every non-scientific hyperparameter would be nuisance, and conclusions would carry no caveats. But each extra nuisance dimension makes the search less thorough per scientific value. An under-searched nuisance space can also produce a wrong conclusion. So we convert a nuisance hyperparameter to fixed when, in our judgement, the caveat costs less than tuning it.
+
+      **How much a fixed value hurts depends on how strongly it interacts with $s$.** Example: the best weight decay usually depends on model size. Comparing model sizes at one fixed weight decay mostly measures which size suits that weight decay. Fixing something that barely interacts with $s$ (say, a logging interval) costs nothing.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters", §"Creating a set of studies"
+
+  - title: "Studies, trials and conditional hyperparameters"
+    body: |
+      **Vocabulary.** A *study* is a set of hyperparameter configurations to run. Each configuration is a *trial*. Creating a study means choosing which hyperparameters vary, their ranges (the *search space*), the number of trials, and a search algorithm to pick the trials. You can also list trials by hand.
+
+      **Simplest design: one study per scientific value.** Each study searches over the nuisance hyperparameters. You then compare the *best* trial of each study. To compare Nesterov momentum with Adam, run one study over $\{\eta,\gamma\}$ and another over $\{\eta,\beta_1,\beta_2,\epsilon\}$.
+
+      **Many scientific values: one mixed study.** If there are too many scientific values for separate studies, put them in the same search space as the nuisance hyperparameters. The algorithm must then sample the scientific values *uniformly*, or some get a better-searched nuisance space than others. This is one reason to prefer non-adaptive quasi-random search during exploration: an adaptive optimiser deliberately samples unevenly.
+
+      **Conditional hyperparameters** exist only for some scientific values: momentum $\gamma$ only for Nesterov, $\epsilon$ only for Adam. A mixed study handles them awkwardly, because the search space is hard to define when the nuisance set changes with $s$.
+
+      **Same name, different hyperparameter.** "learning_rate" under Nesterov and under Adam plays a similar role, but the good ranges typically differ by *orders of magnitude*. That follows from the update rules. The momentum step is roughly $\eta\,g/(1-\gamma)$, so it scales with the gradient. Adam's step $\alpha\,\hat m/(\sqrt{\hat v}+\epsilon)$ is roughly $\alpha$ per coordinate whatever the gradient's scale. Give each optimizer its own range.
+    source: Tuning Playbook §"Creating a set of studies", §"Identifying scientific, nuisance, and fixed hyperparameters"; Choi et al. 2019 §3
+
+  - title: "Spending the budget: three desiderata"
+    body: |
+      A study's compute has to buy three things:
+      1. **Enough scientific values**, to broaden what we learn.
+      2. **A wide enough nuisance search space** (more nuisance hyperparameters, wider ranges). This raises our confidence that a good nuisance setting *exists* in the space for every scientific value.
+      3. **Dense enough sampling** of that space. This raises our confidence that the search actually *finds* the good setting, rather than one scientific value getting luckier draws than another.
+
+      Improving any one costs more trials, or comes at the expense of the other two.
+
+      **Worked arithmetic.** Suppose 120 trials fit in the budget, the round compares 3 depths, and there are 3 nuisance hyperparameters (LR, weight decay, $\beta_1$).
+      - One study per depth gives $120/3 = 40$ trials per study.
+      - A grid would need $40^{1/3}\approx 3.4$ values per axis, so only about 3 learning rates per depth.
+      - Quasi-random sampling instead tests 40 *distinct* values on every axis (next lesson). It still covers a 3-D space only thinly, because a typical gap between neighbouring points scales like $40^{-1/3}$ of each range.
+      - Dropping a scientific value (two depths) gives 60 trials each; fixing $\beta_1$ removes a dimension. Each choice trades scope or caveats for density.
+
+      How to allocate depends on domain knowledge, so the playbook's safeguard is to *check afterwards*. After every study, ask whether the nuisance space was wide and dense enough for a fair comparison. That is done with axis plots, boundary checks and training curves, covered in the next lessons.
+    source: Tuning Playbook §"Striking a balance between informative and affordable experiments", §"Extracting insight from experimental results"
+
+  - title: "What interviewers probe"
+    body: |
+      - *"How would you test whether a new regularizer helps?"* The scientific hyperparameter is regularizer on/off. Its strength and the LR are nuisance, tuned *separately* for each arm, with the baseline tuned equally well. Compare the best trial of each study. Check search-space boundaries and training curves, retrain the winners with several seeds, and adopt only if the gain beats the seed noise and is worth the added code.
+      - *"Why not compare at the default learning rate?"* Because $\eta^*$ depends on the change, a shared LR measures how well each arm suits that LR.
+      - *"Is the LR ever a scientific hyperparameter?"* Rarely, because its best value shifts with every pipeline change. It is almost always nuisance.
+      - *"What is a conditional hyperparameter?"* One that exists only for some scientific values, like Adam's $\epsilon$. Same-named ones (Adam's LR vs SGD's) are different hyperparameters with different ranges.
+      - *"Why start simple?"* Each feature adds tuning dimensions and may never have helped. Constant LR, small model, popular optimizer with fixed extras.
+      - *"Why spend most time exploring?"* Insight tells you which knobs matter, interact or saturate, which makes later searches cheaper and keeps lucky accidents out of the pipeline.
+      - *"When is a fixed hyperparameter dangerous?"* When it interacts strongly with the scientific one, e.g. one weight decay for all model sizes.
+    source: Tuning Playbook §"A scientific approach to improving model performance"
+
+  - title: "Key results"
+    body: |
+      - Start from a working architecture and the most popular optimizer for the problem, with a simple, fast, "reasonable" configuration (constant LR, small model).
+      - Repeat: narrow goal → design → learn → launch only on strong evidence. Spend most rounds on exploration (insight), and exploit at the end.
+      - Roles per round: **scientific** (measured), **nuisance** (optimised over), **fixed** (each adds a caveat). The role depends on the goal.
+      - Fair comparison:
+
+      $$\min_\eta f(s_1,\eta)\ \text{vs}\ \min_\eta f(s_2,\eta),$$
+
+      not a comparison at a shared $\eta_0$. The two disagree whenever $\eta^*(s)$ depends on $s$.
+      - Optimizer hyperparameters are nuisance, because curvature and gradient noise set the best LR and most changes move them. The optimizer choice is scientific or fixed. Including a regularizer is scientific or fixed; its strength is nuisance. Architecture is scientific or fixed.
+      - Conditional hyperparameters: Adam's LR and SGD's LR are different hyperparameters with different ranges.
+      - The budget buys (number of scientific values) × (nuisance range) × (sampling density). Check afterwards that the nuisance search was adequate.
+    source: Tuning Playbook §"Guide for starting a new project", §"A scientific approach to improving model performance"
+
+quiz:
+  - id: q1
+    prompt: |
+      Goal: "Does adding dropout reduce validation error?" Which assignment of roles follows the playbook?
+    correct: Dropout on/off is scientific; dropout rate and learning rate are nuisance
+    wrong:
+      - Dropout rate is scientific; dropout on/off and learning rate are fixed
+      - Learning rate is scientific; dropout on/off is nuisance
+      - Dropout on/off and dropout rate are both fixed at their defaults
+    explanation: |
+      Including the regularizer is the question being asked, so it is scientific. Its strength must be optimised for the comparison to be fair, so it is nuisance, and so is the LR, which interacts with nearly everything. Making the rate scientific answers a different question ("which rate is best?").
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - id: q2
+    prompt: |
+      You compare a 4-layer and an 8-layer model, both at the team's default LR $10^{-2}$. The 4-layer model wins by 2 points. Tuned separately, the best 8-layer model beats the best 4-layer one. What explains the reversal?
+    correct: The best LR depends on depth, so a shared LR favours one model
+    wrong:
+      - The 8-layer model overfits at every learning rate in the sweep
+      - Deeper models always need larger learning rates
+      - The default LR was tuned for neither model, so both results are noise
+    explanation: |
+      When $\eta^*(s)$ depends on $s$, comparing $f(s,\eta_0)$ measures how well each model suits $\eta_0$, not which model is better. Optimising the LR away for each depth gives $\min_\eta f(s,\eta)$. Deeper models often have larger curvature and so need *smaller* LRs ($\eta<2/\lambda_{max}$), which is why "always larger" is wrong.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - id: q3
+    prompt: |
+      You add batch norm to a network and double the batch size. Why should you expect the best learning rate to move?
+    correct: Both change the curvature or gradient noise that set the best LR
+    wrong:
+      - The best LR depends only on the optimizer, so it should not move
+      - Batch norm changes the cost of each step, which rescales the LR
+      - The LR must always scale exactly linearly with the batch size
+    explanation: |
+      The usable LR is capped by curvature ($\eta<2/\lambda_{max}$), and the best LR also grows with the batch size relative to the gradient noise. Normalization changes the curvature, and a bigger batch cuts the noise, so $\eta^*$ moves. This is why optimizer hyperparameters are nuisance in almost every study. Exact linear scaling is a heuristic that often fails, as the batch-size lesson shows.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - id: q4
+    prompt: |
+      A team compares model sizes 50M, 200M and 800M parameters, all at weight decay 0.1, which was tuned for the 200M model. What is the main problem?
+    correct: Best weight decay varies with size, so the comparison favours 200M
+    wrong:
+      - Weight decay should be a scientific hyperparameter in any size study
+      - Weight decay has no effect on models above 100M parameters
+      - Fixing any hyperparameter invalidates the whole experiment
+    explanation: |
+      A fixed hyperparameter is harmless only if it barely interacts with the scientific one. Weight decay interacts with model size, so this experiment partly measures which size suits 0.1. Fixing hyperparameters is legitimate and adds caveats; how damaging it is depends on the interaction.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - id: q5
+    prompt: |
+      Which statement about conditional hyperparameters is **false**?
+    correct: Adam's LR and SGD's LR can share one search range, as they share a name
+    wrong:
+      - Nesterov's momentum coefficient $\gamma$ exists only when the optimizer is Nesterov
+      - They make a single mixed study harder to specify than separate studies
+      - Adam's $\epsilon$ is conditional on the optimizer being Adam or a relative of it
+    explanation: |
+      Same name does not mean same hyperparameter. Momentum's step scales with the gradient ($\approx\eta g/(1-\gamma)$), while Adam's per-coordinate step is about $\alpha$ regardless of gradient scale, so good ranges often differ by orders of magnitude. The other three statements are true.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - id: q6
+    prompt: |
+      120 trials, 3 depths (one study each), nuisance = LR, weight decay, $\beta_1$. To search more densely you fix $\beta_1$. If each study were laid out as a grid, about how many LR values would it now test?
+    correct: About 6
+    wrong:
+      - About 3
+      - About 20
+      - About 40
+    explanation: |
+      Each study still has $120/3=40$ trials, now over 2 axes, so a grid has $40^{1/2}\approx6.3$ values per axis, up from $40^{1/3}\approx3.4$ with three axes. The price is a caveat: the conclusion holds at the fixed $\beta_1$. Dropping a depth instead would give 60 trials per study over 3 axes, about 3.9 per axis.
+    source: Tuning Playbook §"Striking a balance between informative and affordable experiments"; Bergstra & Bengio 2012 §1
+
+  - id: q7
+    prompt: |
+      In a single study that samples both the scientific hyperparameter (5 activation functions) and the nuisance hyperparameters, why must the scientific values be sampled uniformly?
+    correct: Otherwise some values get better-searched nuisance spaces and win unfairly
+    wrong:
+      - Non-uniform sampling makes the trials impossible to run in parallel
+      - Uniform sampling of the scientific value removes the need to tune the LR
+      - Bayesian optimisation cannot handle categorical hyperparameters at all
+    explanation: |
+      Each scientific value's best trial depends on how well its nuisance space was searched. If an adaptive algorithm concentrates trials on values that looked good early, those values get searched more densely, which confounds the comparison. This is one reason the playbook prefers quasi-random search during exploration.
+    source: Tuning Playbook §"Creating a set of studies"
+
+  - id: q8
+    prompt: |
+      A colleague's starting configuration has a cosine schedule, six augmentations, three regularizers and the largest model that fits. What is the playbook's main objection?
+    correct: Each feature adds knobs to tune and may never have helped
+    wrong:
+      - Cosine schedules are known to underperform constant learning rates
+      - Augmentation should only be added after the test set is evaluated
+      - Large models cannot reach a reasonable result without a schedule
+    explanation: |
+      Start simple (constant LR before schedules, no bells and whistles) and fast (small model). Enabling everything at once bakes in features that may not help, multiplies the tuning dimensions, and makes every trial slow. Schedules are not worse than a constant LR; they are just something to add once the basics work.
+    source: Tuning Playbook §"Choosing the model architecture", §"Choosing the initial configuration"
+
+  - id: q9
+    prompt: |
+      To save trials early on, you compare two depths with Adam's $\beta_1$, $\beta_2$, $\epsilon$ fixed at defaults and only the LR tuned. What caveat does the conclusion carry?
+    correct: It may not hold if the best betas or ε differ between the depths
+    wrong:
+      - None, because the LR was tuned separately for each depth
+      - It is invalid, because all four Adam knobs must always be tuned
+      - It only holds for SGD, since Adam's defaults are untuned
+    explanation: |
+      Fixing hyperparameters is a legitimate way to save trials (the playbook suggests it early on), but each fixed value adds a caveat. The conclusion is safe only to the extent that the fixed betas and ε don't interact with depth. Tuning the LR removes the biggest confound, not all of them.
+    source: Tuning Playbook §"Choosing the optimizer", FAQ "How should Adam's hyperparameters be tuned?"
+
+  - id: q10
+    prompt: |
+      A candidate change beats the baseline by 0.3% in one run. What does the playbook require before a "launch"?
+    correct: A gain beyond run-to-run variance that is worth its added complexity
+    wrong:
+      - A p-value below 0.05 from a test on the validation set alone
+      - Nothing more, since any improvement in validation error should be kept
+      - A full re-tune of every hyperparameter around the new configuration
+    explanation: |
+      Launches must rest on strong evidence, not one lucky configuration, so you characterise retrain variance (e.g. rerun the best trial with several seeds). Even a real gain is adopted only if it is worth its complexity. The playbook warns that seed variance alone can produce "significant" differences between identical configs, so a single test is not enough.
+    source: Tuning Playbook §"The incremental tuning strategy", §"Determining whether to adopt a training pipeline change or hyperparameter configuration"
+
+  - id: q11
+    prompt: |
+      Over five exploration rounds, widening or re-centring the LR and weight-decay ranges never moves the best validation error by more than seed noise. Which benefit of exploration is this an example of?
+    correct: Recognising that gains from tuning have saturated
+    wrong:
+      - Identifying hyperparameters that interact and must be re-tuned together
+      - Finding a feature that doesn't help and can be removed
+      - Narrowing the search space around the optimum
+    explanation: |
+      Repeated studies that can't beat seed noise signal saturation: further tuning of these knobs is unlikely to pay, so effort should go elsewhere (architecture, data, regularization). Interactions would show up as a best value of one knob that moves when another changes, which is not what was observed here.
+    source: Tuning Playbook §"Exploration vs exploitation"
+
+  - id: q12
+    prompt: |
+      Goal: "For ReLU networks, does adding batch norm after each conv layer help?" What role does the activation function play in this round?
+    correct: Fixed, with the caveat that the result holds for ReLU
+    wrong:
+      - Scientific, because it changes the network's output
+      - Scientific, because the round compares network variants
+      - Nuisance, because its best value may differ with and without BN
+    explanation: |
+      The goal explicitly restricts attention to ReLU nets, so the activation is fixed and the result is caveated accordingly. In other rounds the same hyperparameter could be scientific or nuisance; the role comes from the goal.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+cards:
+  - id: f1
+    front: Define scientific, nuisance and fixed hyperparameters.
+    back: |
+      - **Scientific**: whose effect the round measures.
+      - **Nuisance**: optimised over separately for each scientific value, so the comparison is fair.
+      - **Fixed**: held constant this round; each one adds a caveat to the conclusion.
+
+      The role depends on the experimental goal, not on the hyperparameter.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - id: f2
+    front: Write the fair comparison of scientific values $s_1, s_2$ with nuisance $\eta$. When does it agree with comparing at a fixed $\eta_0$?
+    back: |
+      $$\min_\eta f(s_1,\eta)\ \text{vs}\ \min_\eta f(s_2,\eta)$$
+
+      It agrees with the fixed-$\eta_0$ comparison only when $\eta^*(s)=\arg\min_\eta f(s,\eta)$ does not depend on $s$, i.e. there is no interaction.
+    source: Tuning Playbook §"Creating a set of studies"
+
+  - id: f3
+    front: The playbook's four steps of one round of incremental tuning.
+    back: |
+      1. Pick a narrow goal.
+      2. Design and run experiments toward it.
+      3. Learn from the results, including checks that the experiment was sound.
+      4. Decide whether to launch (adopt the new best configuration), only on strong evidence.
+    source: Tuning Playbook §"The incremental tuning strategy"
+
+  - id: f4
+    front: Typical roles of optimizer hyperparameters, optimizer choice, regularizers, and architecture?
+    back: |
+      - Optimizer hyperparameters (LR, momentum, betas): **nuisance**.
+      - Choice of optimizer: **scientific or fixed**.
+      - Whether to include a regularizer: **scientific or fixed**; its strength: **nuisance**.
+      - Architecture (e.g. depth): **scientific or fixed**, since it changes cost and memory.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - id: f5
+    front: What makes an initial configuration good, per the playbook?
+    back: |
+      Simple (no bells and whistles; constant LR first), fast and cheap (smaller model), and "reasonable" (clearly better than chance on validation). Reuse a working architecture and the most popular optimizer for the problem type.
+    source: Tuning Playbook §"Choosing the initial configuration"
+
+  - id: f6
+    front: What three things must a study's budget cover?
+    back: |
+      1. Enough scientific values.
+      2. A wide enough nuisance search space (a good setting *exists* in it).
+      3. Dense enough sampling (the search *finds* it).
+
+      Improving one costs trials or one of the others.
+    source: Tuning Playbook §"Striking a balance between informative and affordable experiments"
+
+  - id: f7
+    front: What is a conditional hyperparameter? Give an example and the trap.
+    back: |
+      A hyperparameter that exists only for some scientific values, e.g. Adam's $\epsilon$ or Nesterov's momentum. The trap: same-named conditional hyperparameters (Adam's LR vs SGD's LR) are different hyperparameters, whose good ranges can differ by orders of magnitude.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"
+
+  - id: f8
+    type: open
+    front: "Design the experiment: does switching from ReLU to GELU help our transformer?"
+    back: |
+      - **Scientific**: activation ∈ {ReLU, GELU}.
+      - **Nuisance**: LR (log scale), warmup length, weight decay, perhaps $\beta_2$, each tuned separately per activation, because the best LR can shift with the activation.
+      - **Fixed**: depth, width, batch size, step budget. State the caveat: "at this size and budget".
+      - **Studies**: one quasi-random study per activation with equal trial counts and identical search spaces.
+      - **Checks**: is each best point inside the search space? Enough good-region points? Any problematic overfitting in the best trials?
+      - **Decision**: compare the best trial per activation (an isolation-style comparison, next lesson), rerun each winner with several seeds, and adopt GELU only if the gap beats seed variance.
+    source: Tuning Playbook §"Designing the next round of experiments", §"Extracting insight from experimental results"
+
+  - id: f9
+    type: open
+    front: Explain to an interviewer why you would spend most of a tuning budget on exploration rather than greedily minimising validation error.
+    back: |
+      - **The core argument:** a greedy result is invalidated by the next pipeline change, because the best hyperparameters move whenever curvature or gradient noise moves. Insight (which knobs matter, which interact, which ranges are sensible) transfers to the next change.
+      - Concretely, exploration tells you which hyperparameters to re-tune together and which to fix, which shrinks every later search.
+      - It keeps features that merely rode along in good runs out of the pipeline, and it shows when tuning has saturated.
+      - Once the space is understood, a short greedy phase (e.g. Bayesian optimisation) extracts the last gains.
+    source: Tuning Playbook §"Exploration vs exploitation"
+
+  - id: f10
+    type: open
+    front: "Interviewer: 'We compared Adam and SGD with the same LR grid and Adam lost. Conclusion?' Critique it."
+    back: |
+      - The LR is a conditional hyperparameter. Adam's per-coordinate step is ≈ $\alpha$ regardless of gradient scale, while SGD's step scales with $\eta\,g$. A shared grid almost certainly misplaces one optimizer's good region.
+      - Adam's other hyperparameters ($\beta_1$, $\epsilon$, …) were presumably fixed, which adds caveats. Choi et al. 2019 show rankings flip with the tuning protocol, and a well-tuned, more general optimizer (Adam ⊇ momentum) does not lose.
+      - The fix: separate studies with optimizer-specific search spaces, equal budgets, boundary checks on each, and a comparison of the best trials across seeds.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters"; Choi et al. 2019 §1, §4
+
+reading:
+  - title: "Deep Learning Tuning Playbook: 'A scientific approach to improving model performance'"
+    url: https://github.com/google-research/tuning_playbook#a-scientific-approach-to-improving-model-performance
+    kind: docs
+    note: The source for this lesson (CC-BY 4.0). Read the scientific/nuisance/fixed section in full.
+  - title: "Deep Learning Tuning Playbook: 'Guide for starting a new project'"
+    url: https://github.com/google-research/tuning_playbook#guide-for-starting-a-new-project
+    kind: docs
+    note: Architecture, optimizer and initial-configuration advice.
+  - title: "Choi et al. 2019, On Empirical Comparisons of Optimizers for Deep Learning"
+    url: https://arxiv.org/abs/1910.05446
+    kind: paper
+    note: A worked demonstration that tuning protocols decide optimizer rankings (§4).
+  - title: "Karpathy 2019, A Recipe for Training Neural Networks"
+    url: https://karpathy.github.io/2019/04/25/recipe/
+    kind: blog
+    note: A complementary practitioner's checklist that also argues for starting simple and adding complexity one step at a time.

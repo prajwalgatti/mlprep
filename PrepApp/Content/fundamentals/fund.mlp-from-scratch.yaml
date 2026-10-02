@@ -1,0 +1,552 @@
+id: fund.mlp-from-scratch
+area: fundamentals
+title: "Implementing an MLP: Forward & Backward"
+summary: Why hidden layers are needed, the vectorised forward and backward equations with every shape, a hand-worked 2-2-1 example, a tested numpy implementation, and what MLPs can and can't represent.
+order: 470
+level: core
+tags: [mlp, backprop, implementation, deep-learning]
+prereqs: [fund.backprop, fund.logistic-regression]
+
+explainer:
+  - title: "Why hidden layers? The XOR problem"
+    body: |
+      ![XOR is not linearly separable in $x$. After DLB's two ReLU units, the two class-1 inputs collapse onto one point and a line separates the classes.](fund.mlp-from-scratch/xor-solution)
+
+      **The problem.** XOR labels $(0,0)$ and $(1,1)$ as 0, and $(0,1)$ and $(1,0)$ as 1. Can a linear classifier $\hat y=[w_1x_1+w_2x_2+b>t]$ do it? It would need:
+      - $b<t$, for $(0,0)$
+      - $w_1+b>t$ and $w_2+b>t$, for the two 1s
+      - $w_1+w_2+b<t$, for $(1,1)$
+
+      Adding the middle two gives $w_1+w_2+2b>2t$. Adding the first and last gives $w_1+w_2+2b<2t$. That's a contradiction, so no line works.
+
+      **Stacking linear layers doesn't help:**
+
+      $$W_2(W_1x+b_1)+b_2=(W_2W_1)x+(W_2b_1+b_2)$$
+
+      which is still affine. Depth only adds power if a **nonlinearity** sits between the layers.
+
+      **One hidden ReLU layer suffices.** Goodfellow et al. use $f(x)=w^\top\max(0,W^\top x+c)+b$ with
+
+      $$W=\begin{pmatrix}1&1\\1&1\end{pmatrix},\quad c=\begin{pmatrix}0\\-1\end{pmatrix}$$
+
+      $$w=\begin{pmatrix}1\\-2\end{pmatrix},\quad b=0$$
+
+      Trace the four inputs:
+      1. $W^\top x$ gives $(0,0)$, $(1,1)$, $(1,1)$, $(2,2)$.
+      2. Adding $c$ gives $(0,-1)$, $(1,0)$, $(1,0)$, $(2,1)$.
+      3. ReLU gives $(0,0)$, $(1,0)$, $(1,0)$, $(2,1)$.
+      4. Finally $h_1-2h_2$ gives $0,1,1,0$. Correct.
+
+      The hidden layer is a *learned feature map* in which the classes become linearly separable. Gradient descent won't usually find such tidy integer weights, but this solution sits at a global minimum of the loss. (DLB writes $W^\top x$ with $W$ shaped (in, out). PyTorch stores (out, in) and computes $xW^\top$. Same maths, transposed storage.)
+    source: Goodfellow DL §6.1; Murphy PML1 §13.2.1
+
+  - title: "The forward pass, vectorised, with shapes"
+    body: |
+      **Conventions (PyTorch layout).**
+      - A batch is a matrix $X\in\mathbb{R}^{B\times n_0}$ with one example per *row*.
+      - Layer $l$ has weights $W^{(l)}\in\mathbb{R}^{n_l\times n_{l-1}}$, stored (out, in), and bias $b^{(l)}\in\mathbb{R}^{n_l}$.
+      - $\phi$ is an elementwise nonlinearity (ReLU here).
+
+      Set $A^{(0)}=X$. For $l=1,\dots,L$:
+
+      $$\begin{aligned} Z^{(l)} &= A^{(l-1)}W^{(l)\top}+b^{(l)}\\ A^{(l)} &= \phi(Z^{(l)}) \end{aligned}$$
+
+      $Z^{(l)}$ (pre-activations) and $A^{(l)}$ (activations) are $B\times n_l$, and $b^{(l)}$ is broadcast across the $B$ rows. The last layer skips $\phi$: $Z^{(L)}$ are the **logits** that the loss consumes.
+
+      **Shape bookkeeping:** $(B\times n_{l-1})(n_{l-1}\times n_l)=B\times n_l$. Writing the shape next to every line is the cheapest way to catch transposition bugs.
+
+      **What to cache.** Backward will need $A^{(l-1)}$ (for the weight gradient) and $Z^{(l)}$ (for $\phi'$). So training holds $\sum_l B\,n_l$ extra numbers per step, the activation memory from the previous lesson.
+
+      **Other conventions you'll meet.**
+      - CS229 and Bishop push one column vector through: $z=Wa+b$ with $W$ shaped (out, in).
+      - Goodfellow et al. write $h=g(W^\top x+c)$ with $W$ shaped (in, out).
+
+      All three compute the same thing; only the transposes move. Translate to shapes before copying a formula.
+
+      **Parameter count:** $\sum_l(n_{l-1}n_l+n_l)$. For a 784-256-10 classifier that's $200{,}960+2{,}570=203{,}530$.
+
+      **Cost:** a forward pass is about $2\times$(#weights) FLOPs per example (one multiply and one add per weight). The backward pass does two matmuls per layer, about $4\times$, which is where the "6 FLOPs per parameter per example" rule for training comes from.
+    source: CS229 notes §7.5; Goodfellow DL §6.5.4; EleutherAI Transformer Math 101 §Compute
+
+  - title: "Output layer and loss: where the error signal starts"
+    body: |
+      Backward starts from $\delta^{(L)}=\partial L/\partial Z^{(L)}$, the gradient with respect to the logits. Define $\delta^{(l)}=\partial L/\partial Z^{(l)}$ at every layer. (Some notes define $\delta$ as $\partial L/\partial A$ instead, so check.)
+
+      **Multiclass:** softmax + cross-entropy, averaged over the batch. Let $P$ be the $B\times K$ matrix of softmax probabilities and $Y$ the one-hot labels. The per-example gradient is $p-y$ (previous lesson), and the mean contributes $1/B$:
+
+      $$\delta^{(L)}=\frac{P-Y}{B}$$
+
+      **Binary:** one logit, sigmoid + binary cross-entropy. Again $\delta=(p-y)/B$.
+
+      **Regression:** identity output with $L=\frac{1}{2B}\sum_i\lVert\hat y_i-y_i\rVert^2$ gives $\delta=(\hat Y-Y)/B$.
+
+      The same "prediction minus target" form appears in all three because each pairs the output with its matching likelihood (the canonical link; see fund.logistic-regression).
+
+      **Why not sigmoid + squared error for classification?** With $p=\sigma(z)$ and $L=\frac12(p-y)^2$:
+
+      $$\frac{\partial L}{\partial z}=(p-y)\,\sigma'(z)=(p-y)\,p(1-p)$$
+
+      The factor $p(1-p)\le\frac14$ vanishes when the unit saturates. A confidently *wrong* prediction ($p\approx0$, $y=1$) therefore gets almost no gradient, which is exactly when it needs one most. Cross-entropy's $\log$ cancels the saturation.
+
+      **Mean vs sum reduction.** Summing instead of averaging multiplies every gradient by $B$. With SGD that's the same as multiplying the learning rate by $B$, so the learning rate silently depends on batch size. Average, and write the $1/B$ into $\delta^{(L)}$ exactly once.
+    source: CS229 notes §7.4.3; Goodfellow DL §6.2.2.2–6.2.2.3; Bishop PRML §5.2
+
+  - title: "The backward pass, layer by layer"
+    body: |
+      ![Shapes for a 784-256-10 MLP at batch 64. Every gradient has its variable's shape. Dashed arrows are the cached forward values the backward pass reads.](fund.mlp-from-scratch/shapes-diagram)
+
+      Suppose we hold $\delta^{(l)}$, of shape $B\times n_l$. Layer $l$ computes $Z^{(l)}=A^{(l-1)}W^{(l)\top}+b^{(l)}$. That's a matmul, a broadcast and (one layer down) an elementwise $\phi$, so the three VJPs from fund.backprop give everything:
+
+      $$\begin{aligned} \bar W^{(l)} &= \delta^{(l)\top}A^{(l-1)}\\ \bar b^{(l)} &= \textstyle\sum_{\text{rows}}\delta^{(l)}\\ \bar A^{(l-1)} &= \delta^{(l)}W^{(l)}\\ \delta^{(l-1)} &= \bar A^{(l-1)}\odot\phi'(Z^{(l-1)}) \end{aligned}$$
+
+      **Line by line:**
+      - **Weights.** The matmul rule says $\partial L/\partial(W^\top)=A^\top\delta$. Transposing gives $\delta^\top A$, shape $(n_l\times B)(B\times n_{l-1})$, the (out, in) shape of $W$. Written per example, it is a sum of outer products $\sum_i\delta_i a_i^\top$: (error at the output of the layer) × (activity at its input).
+      - **Bias.** $b$ is broadcast over rows, so its adjoint sums over rows.
+      - **Previous activations.** This is the matmul VJP for the left factor.
+      - **Through $\phi$.** An elementwise function's Jacobian is diagonal, so it becomes a Hadamard product. For ReLU, $\phi'(Z)=[Z>0]$. A unit that was off for an example passes back nothing, and its whole row of $W$ gets no gradient from that example.
+
+      Iterate from $l=L$ down to 1. Each layer's backward is two matmuls ($\delta^\top A$ and $\delta W$) against one in its forward.
+
+      **Column-vector form** (CS229, Goodfellow Alg. 6.4): $\delta^{(l-1)}=(W^{(l)\top}\delta^{(l)})\odot\phi'(z^{(l-1)})$ and $\bar W^{(l)}=\delta^{(l)}a^{(l-1)\top}$. It's the same equations, transposed.
+    source: CS229 notes §7.4.4 (Alg. 3), §7.5; Goodfellow DL §6.5.4 (Alg. 6.4); Murphy PML1 §13.3.2
+
+  - title: "Worked example: a 2-2-1 network by hand"
+    body: |
+      ![Inputs, weights (on edges) and forward values. Biases are zero.](fund.mlp-from-scratch/worked-2-2-1)
+
+      Take input $x=(2,1)$, ReLU hidden units, a sigmoid output, binary cross-entropy and target $y=1$. The weights are
+
+      $$W_1=\begin{pmatrix}0.5&0\\-0.25&1\end{pmatrix},\quad w_2=\begin{pmatrix}1\\-2\end{pmatrix}$$
+
+      with all biases zero. Here $W_1$'s rows belong to hidden units and its columns to inputs.
+
+      **Forward:**
+
+      $$\begin{aligned} z_1 &= W_1x=(1.0,\ 0.5)\\ h &= \mathrm{ReLU}(z_1)=(1.0,\ 0.5)\\ z_2 &= w_2^\top h=1-1=0\\ p &= \sigma(0)=0.5,\quad L=\ln 2=0.693 \end{aligned}$$
+
+      **Backward** (batch of one, so no $1/B$):
+
+      $$\begin{aligned} \delta_2 &= p-y=-0.5\\ \bar w_2 &= \delta_2h=(-0.5,\ -0.25),\ \ \bar b_2=-0.5\\ \bar h &= \delta_2w_2=(-0.5,\ 1.0)\\ \delta_1 &= \bar h\odot[z_1>0]=(-0.5,\ 1.0) \end{aligned}$$
+
+      $$\bar W_1=\delta_1x^\top=\begin{pmatrix}-1&-0.5\\2&1\end{pmatrix},\quad \bar b_1=\delta_1$$
+
+      **Read it.**
+      - $\delta_2<0$: raising $z_2$ lowers the loss (we want $p\to1$).
+      - $h_2$ feeds the output through weight $-2$, so its error signal $\delta_{1,2}=+1$ says "lower $h_2$". Gradient descent subtracts $\eta\bar W_1$, which shrinks the weights into unit 2 in proportion to the inputs (2 and 1).
+      - Both hidden units are active. Had $z_{1,2}$ been negative, the ReLU mask would have zeroed $\delta_{1,2}$ and the whole second row of $\bar W_1$.
+
+      PyTorch autograd (`binary_cross_entropy_with_logits`) reproduces every number here.
+    source: Bishop PRML §5.3.2; CS229 notes §7.4.4
+
+  - title: "A reference implementation in numpy"
+    body: |
+      ```python
+      import numpy as np
+
+      def init(sizes, rng):
+          # one (W, b) per layer; W has PyTorch layout (n_out, n_in)
+          return [(rng.normal(0, np.sqrt(2 / n_in), (n_out, n_in)), np.zeros(n_out))
+                  for n_in, n_out in zip(sizes[:-1], sizes[1:])]
+
+      def forward(params, X):
+          cache, A = [], X                              # X: (B, n_0)
+          for l, (W, b) in enumerate(params):
+              Z = A @ W.T + b                           # (B, n_l)
+              cache.append((A, Z))                      # A_{l-1}, Z_l for backward
+              A = np.maximum(Z, 0) if l < len(params) - 1 else Z
+          return A, cache                               # final A = logits
+
+      def loss_and_grads(params, X, y):
+          logits, cache = forward(params, X)
+          B = X.shape[0]
+          z = logits - logits.max(axis=1, keepdims=True)    # stable log-softmax
+          logp = z - np.log(np.exp(z).sum(axis=1, keepdims=True))
+          loss = -logp[np.arange(B), y].mean()
+          delta = np.exp(logp)                              # P
+          delta[np.arange(B), y] -= 1                       # P - Y
+          delta /= B                                        # mean loss -> 1/B
+          grads = [None] * len(params)
+          for l in reversed(range(len(params))):
+              A_prev, _ = cache[l]
+              W, _ = params[l]
+              grads[l] = (delta.T @ A_prev, delta.sum(axis=0))  # (out,in), (out,)
+              if l > 0:
+                  Z_prev = cache[l - 1][1]
+                  delta = (delta @ W) * (Z_prev > 0)        # delta_{l-1}
+          return loss, grads
+
+      def sgd_step(params, grads, lr):
+          return [(W - lr * dW, b - lr * db)
+                  for (W, b), (dW, db) in zip(params, grads)]
+      ```
+
+      **Notes.**
+      - `init` uses He scaling, $\mathrm{std}=\sqrt{2/n_{in}}$, for ReLU (explained in fund.initialization).
+      - The loss subtracts the row max before exponentiating, the log-sum-exp trick, so large logits can't overflow.
+      - $\delta^{(L)}=(P-Y)/B$ is built in place, and the loop applies the card-4 equations top-down.
+      - The mask uses $Z^{(l-1)}$ from the *previous* layer's cache entry.
+
+      Checked: it matches PyTorch's autograd to about $10^{-16}$ in float64, and SGD with lr 0.5 drives a 2-32-2 net to 100% training accuracy on XOR-style data ($y=[x_1x_2>0]$).
+    source: CS229 notes §7.4.4, §7.5; Goodfellow DL §6.5.7
+
+  - title: "Verifying it, and where the bugs hide"
+    body: |
+      **Gradient check** against centred differences (the `grad_check` from fund.backprop) on a tiny net with *unequal* widths:
+
+      ```python
+      rng = np.random.default_rng(0)
+      params = init([5, 4, 3], rng)
+      X, y = rng.normal(size=(8, 5)), rng.integers(0, 3, 8)
+      loss, grads = loss_and_grads(params, X, y)
+      W0 = params[0][0]               # grad_check perturbs W0 in place
+      err = grad_check(lambda _: loss_and_grads(params, X, y)[0], W0, grads[0][0])
+      print(err)                      # ~1e-9 in float64
+      ```
+
+      **Compare with autograd:** copy the same weights into torch tensors with `requires_grad=True`, compute `F.cross_entropy`, call `backward()`, and diff the gradients layer by layer. The first layer that disagrees localises the bug.
+
+      **Where bugs hide** (each with its symptom):
+      - **Transposed weight gradient** (`A_prev.T @ delta`). It crashes on a non-square layer but is *silent* on a square one, which then gets $\bar W^\top$. Test with widths like 5-4-3 so every transpose error crashes.
+      - **Missing $1/B$.** The analytic gradient comes out exactly $B\times$ the numeric one, and training behaves as if the learning rate were $B\times$ larger.
+      - **Mask from the wrong layer** (`cache[l]` instead of `cache[l-1]`). It crashes if the widths differ and is silently wrong if they match.
+      - **Unstable softmax** (no max subtraction). Large logits overflow `exp`, giving `inf` and then `NaN`.
+      - **Applying ReLU to the logits.** Negative logits get clamped and their gradients die.
+      - **Target shapes $(N,)$ vs $(N,1)$** broadcasting in a regression loss. See fund.training-loop.
+
+      After the gradients pass, check that the model can drive the loss near zero on a handful of examples. A correct gradient attached to a broken loss would still fail that test.
+    source: Goodfellow DL §11.5; Karpathy 2019 §2
+
+  - title: "What MLPs can represent, and their symmetries"
+    body: |
+      **Universal approximation.** Take a network with a linear output and one hidden layer whose activation is "squashing" (Hornik, Cybenko) or, more generally, any non-polynomial function including ReLU (Leshno et al.). It can approximate any continuous function on a closed, bounded set to any accuracy, *given enough hidden units*. It does **not** promise:
+      - a reasonable width (worst case exponential in the input dimension),
+      - that gradient descent will find the weights,
+      - that the fit generalises.
+
+      **Depth buys efficiency.** A one-hidden-layer ReLU net on a scalar input is piecewise linear with at most one kink per unit, so $m$ units make at most $m+1$ linear pieces. Now take the "tent"
+
+      $$t(x)=2\,\mathrm{ReLU}(x)-4\,\mathrm{ReLU}(x-\tfrac12)$$
+
+      which maps $[0,1]$ onto $[0,1]$ twice, up then down. Composing it $k$ times doubles the pieces each time: $2^k$ pieces from $2k$ units in $k$ layers. A single hidden layer needs at least $2^k-1$ units for the same function. Montúfar et al. show this in general: the number of linear regions grows exponentially with depth.
+
+      **Weight-space symmetries.** In a layer of $M$ tanh units:
+      - Permuting the units, together with their in- and out-weights, leaves the function unchanged: $M!$ ways.
+      - tanh is odd, so flipping the signs of one unit's incoming weights, its bias *and* its outgoing weight also leaves it unchanged: $2^M$ ways.
+
+      That gives $M!\,2^M$ equivalent weight vectors per layer. For ReLU the sign flip fails, but $\mathrm{ReLU}(\alpha z)=\alpha\,\mathrm{ReLU}(z)$ for $\alpha>0$ gives a continuous rescaling symmetry instead.
+
+      **Consequences.**
+      - *Non-convexity.* If $\theta^\ast$ is a minimiser, so is any permutation $\theta'$. If the loss were convex, the midpoint $\frac12(\theta^\ast+\theta')$ would also be a minimiser. But the midpoint averages distinct hidden units together and is generically worse.
+      - *Symmetric initialisation fails.* If two hidden units start with identical weights, they see the same $z$ and the same outgoing weight, so they get the same $\delta$ and the same update. They stay clones forever. Random initialisation breaks the tie (fund.initialization).
+    source: Goodfellow DL §6.4.1; Bishop PRML §5.1.1; Murphy PML1 §13.2.5
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Write forward and backward for a 2-layer MLP."** Give the four equations: $\bar W=\delta^\top A_{prev}$, $\bar b=\sum_{\text{rows}}\delta$, $\bar A_{prev}=\delta W$, $\delta_{prev}=\bar A_{prev}\odot\phi'(Z_{prev})$, starting from $\delta^{(L)}=(P-Y)/B$. Say the shapes aloud.
+      - **"Why do we need a nonlinearity?"** Affine maps compose to an affine map, and XOR shows that's not enough.
+      - **"What shape is $\partial L/\partial W$?"** The shape of $W$. Derive the order of the product from that.
+      - **"Why the $1/B$?"** It comes from the mean loss. Without it the effective learning rate scales with batch size.
+      - **"Why fuse softmax and cross-entropy?"** The gradient becomes $p-y$, and the computation is stable via log-sum-exp.
+      - **"How do you know your backward is right?"** A float64 centred-difference check on a tiny net with unequal widths, plus a layer-by-layer diff against autograd.
+      - **"Why not initialise all weights to zero?"** Hidden units stay identical, and with zero outgoing weights the earlier layers get no gradient at all.
+      - **"Is one hidden layer enough?"** For representation, yes in principle (universal approximation). For efficiency, no: some functions need exponentially more units when shallow.
+      - **"Why is the loss non-convex?"** Weight-space symmetries give many equivalent minima whose averages are worse.
+      - **"FLOPs per training step?"** About $6\times$ parameters $\times$ examples: $2\times$ forward plus $4\times$ backward.
+    source: CS229 notes §7.4–7.5; Goodfellow DL §6.1, §6.4.1, §11.5; Bishop PRML §5.1.1
+
+  - title: "Key results"
+    body: |
+      - **Forward:** $Z^{(l)}=A^{(l-1)}W^{(l)\top}+b^{(l)}$ and $A^{(l)}=\phi(Z^{(l)})$, with $W^{(l)}$ shaped $(n_l,n_{l-1})$.
+      - **Output error:** $\delta^{(L)}=(P-Y)/B$ for mean softmax-CE (also sigmoid-BCE, and identity with $\frac12$MSE).
+      - **Backward:**
+
+      $$\begin{aligned} \bar W^{(l)} &= \delta^{(l)\top}A^{(l-1)},\ \ \bar b^{(l)}=\textstyle\sum_{\text{rows}}\delta^{(l)}\\ \delta^{(l-1)} &= (\delta^{(l)}W^{(l)})\odot\phi'(Z^{(l-1)}) \end{aligned}$$
+
+      - **Parameters:** $\sum_l(n_{l-1}n_l+n_l)$. **Training FLOPs:** about $6$ per parameter per example.
+      - **XOR:** impossible for any linear model, solved by 2 ReLU units.
+      - **Universal approximation:** one wide hidden layer suffices to represent; depth can be exponentially more efficient (tent map: $2^k$ pieces from $2k$ units).
+      - **Symmetries:** $M!\,2^M$ per tanh layer, which makes the loss non-convex and symmetric initialisation useless.
+    source: CS229 notes §7.4–7.5; Goodfellow DL §6.1, §6.4.1, §6.5.4; Bishop PRML §5.1.1
+
+quiz:
+  - id: q1
+    prompt: |
+      PyTorch layout: $X$ is (64, 784) and the first layer's $W_1$ is (256, 784), so $Z_1=XW_1^\top+b_1$. You hold $\delta_1=\partial L/\partial Z_1$ of shape (64, 256), already including the $1/64$ from the mean loss. What is $\partial L/\partial W_1$?
+    correct: '$\delta_1^\top X$, shape (256, 784)'
+    wrong:
+      - '$X^\top\delta_1$, shape (784, 256)'
+      - '$\delta_1^\top X/64$, shape (256, 784)'
+      - '$\delta_1W_1$, shape (64, 784)'
+    explanation: |
+      The gradient must match $W_1$'s (out, in) shape. Transposing the matmul rule $\partial L/\partial W^\top=X^\top\delta$ gives $\delta^\top X$. $X^\top\delta_1$ is the right numbers in the wrong layout: it suits a $W$ stored (in, out). Dividing by 64 again double-counts the mean. $\delta_1W_1$ is $\partial L/\partial X$, not the weight gradient.
+    source: CS229 notes §7.5; Murphy PML1 §13.3.3
+
+  - id: q2
+    prompt: |
+      ![Same network as the worked example: ReLU hidden layer, sigmoid output, zero biases.](fund.mlp-from-scratch/worked-2-2-1)
+
+      Keep these weights and inputs, but train with squared error $L=\frac12(p-y)^2$ and target $y=1$. What is $\partial L/\partial W_1[2,1]$, the weight from $x_1$ into $h_2$?
+    correct: '$0.5$'
+    wrong:
+      - '$2$'
+      - '$-0.5$'
+      - '$0.125$'
+    explanation: |
+      Now $\delta_2=(p-y)\,p(1-p)=(-0.5)(0.25)=-0.125$. Then $\delta_{1,2}=\delta_2\cdot w_{2,2}\cdot[z_{1,2}>0]=(-0.125)(-2)(1)=0.25$, and the gradient is $\delta_{1,2}x_1=0.25\cdot2=0.5$. The answer 2 is the cross-entropy result, which omits the sigmoid-derivative factor $p(1-p)=0.25$. $-0.5$ drops the negative outgoing weight's sign flip. $0.125$ stops at $|\delta_2|$.
+    source: CS229 notes §7.4.4; Bishop PRML §5.3.2
+
+  - id: q3
+    prompt: |
+      How many trainable parameters does a 784-256-128-10 MLP with biases have?
+    correct: "235,146"
+    wrong:
+      - "234,752"
+      - "235,920"
+      - "203,530"
+    explanation: |
+      Count $n_{in}n_{out}+n_{out}$ per layer: $200{,}960+32{,}896+1{,}290=235{,}146$. 234,752 forgets the biases. 235,920 gives each layer biases sized by its *input* width. 203,530 is a 784-256-10 network, without the 128-unit layer.
+    source: CS229 notes §7.5
+
+  - id: q4
+    prompt: |
+      Which statement about the universal approximation theorem is **false**?
+    correct: "A small, fixed-width hidden layer can approximate any continuous function on a compact set"
+    wrong:
+      - "It says nothing about whether gradient descent will actually find the approximating weights"
+      - "It holds for ReLU hidden units, not only for sigmoid-like squashing activations"
+      - "Some functions need exponentially more units in one hidden layer than in a deep net"
+    explanation: |
+      The theorem guarantees existence only *given enough hidden units*. The required width can grow exponentially, so "fixed and small" is false. Leshno et al. extended it to any non-polynomial activation, including ReLU. It is silent on optimisation and generalisation. Depth-separation results (tent-map compositions, Montúfar et al.) show the exponential gap.
+    source: Goodfellow DL §6.4.1
+
+  - id: q5
+    prompt: |
+      You train an MLP with two hidden layers of 100 units on the four XOR points, but use the **identity** as the activation. What is the best it can do?
+    correct: "No better than a linear classifier: at most 3 of the 4 points"
+    wrong:
+      - "It fits XOR exactly once the hidden layers are wide enough"
+      - "It fits XOR exactly, but would generalise poorly to new points"
+      - "Training diverges because the composed network is not identifiable"
+    explanation: |
+      With identity activations the whole network collapses to one affine map, $(W_3W_2W_1)x+\text{const}$, so it can only draw a line. The XOR proof shows no line gets all four points. A line can get three, for example $x_1+x_2>0.5$, which misclassifies only $(1,1)$. Width doesn't help a linear map. The redundant parameterisation makes the loss non-identifiable, but training still converges.
+    source: Goodfellow DL §6.1
+
+  - id: q6
+    prompt: |
+      In a 784-256-256-10 numpy MLP the backward loop contains
+
+      ```python
+      delta = (delta @ W) * (cache[l][1] > 0)   # cache[l] = (A_prev, Z_l)
+      ```
+
+      What happens?
+    correct: "Crashes at the output layer (silent if widths matched)"
+    wrong:
+      - "Nothing: Z_l and Z_{l-1} have the same sign pattern for ReLU nets"
+      - "It works, but the gradient check fails only for the biases"
+      - "It silently zeroes the gradient of the first layer only"
+    explanation: |
+      The mask must come from $Z^{(l-1)}$, the pre-activation of the layer you are propagating *into*. At $l=L$, `delta @ W` is (B, 256) but `cache[L][1]` is (B, 10), so broadcasting fails. Between the two 256-wide layers the shapes match, and the code would silently apply the wrong layer's ReLU pattern. The two layers' sign patterns are unrelated.
+    source: CS229 notes §7.4.4
+
+  - id: q7
+    prompt: |
+      At batch size 64, your analytic weight gradients are *exactly* 64× the centred finite differences, in every layer. What is the most likely bug?
+    correct: '$\delta^{(L)}$ was set to $P-Y$ while the loss is a batch mean'
+    wrong:
+      - "The ReLU mask was taken from the wrong layer's cache"
+      - 'The weight gradient was computed as $X^\top\delta$ instead of $\delta^\top X$'
+      - "The finite-difference step $h$ is too large for float64"
+    explanation: |
+      A clean factor equal to $B$ in every layer points at the shared starting signal. The mean loss contributes $1/B$ to $\delta^{(L)}$, and everything downstream inherits it. A wrong mask or a transpose would give unstructured errors or shape failures, not an exact constant ratio. A step that is too large causes $O(h^2)$ discrepancies, not $64\times$.
+    source: CS229 notes §7.5; Goodfellow DL §11.5
+
+  - id: q8
+    prompt: |
+      With batch-first activations and $W^{(l)}$ stored as (out, in), which expression is $\delta^{(l-1)}=\partial L/\partial Z^{(l-1)}$?
+    correct: '$(\delta^{(l)}W^{(l)})\odot\phi''(Z^{(l-1)})$'
+    wrong:
+      - '$(\delta^{(l)}W^{(l)\top})\odot\phi''(Z^{(l-1)})$'
+      - '$(\delta^{(l)}W^{(l)})\odot\phi''(Z^{(l)})$'
+      - '$(\delta^{(l)}W^{(l)})\,\phi''(Z^{(l-1)})$, a matrix product'
+    explanation: |
+      $\delta^{(l)}$ is $(B\times n_l)$ and $W^{(l)}$ is $(n_l\times n_{l-1})$, so $\delta W$ is $B\times n_{l-1}$. Then the elementwise VJP through $\phi$ uses that same layer's pre-activations, $Z^{(l-1)}$. Using $W^\top$ is the column-vector formula pasted into the row layout. $\phi'(Z^{(l)})$ uses the wrong layer. A matrix product would treat the diagonal Jacobian as dense.
+    source: CS229 notes §7.4.4; Goodfellow DL §6.5.4
+
+  - id: q9
+    prompt: |
+      A one-hidden-layer tanh MLP has every weight and bias initialised to the same constant $c=0.1$ and is trained with minibatch SGD. What happens to the hidden units?
+    correct: "They stay identical, so the layer acts like one unit"
+    wrong:
+      - "Minibatch noise makes them drift apart after a few steps"
+      - "They never change, because every gradient is exactly zero"
+      - "The bias terms break the symmetry once training starts"
+    explanation: |
+      Identical incoming weights give identical $z$ and $h$ for every input. Identical outgoing weights then give identical $\delta$, so every update is identical too. Minibatch noise is shared by all units because they see the same examples, and the biases start equal as well. Gradients aren't zero here since $c\neq0$; the units simply move in lockstep. Breaking this tie is why initialisation must be random.
+    source: Bishop PRML §5.1.1; Goodfellow DL §6.1
+
+  - id: q10
+    prompt: |
+      Compose the tent map $t(x)=2\,\mathrm{ReLU}(x)-4\,\mathrm{ReLU}(x-\tfrac12)$ with itself 10 times on $[0,1]$. How many linear pieces result, and how many units would a one-hidden-layer ReLU net need to match it?
+    correct: "1024 pieces; at least 1023 units (vs 20 in the deep net)"
+    wrong:
+      - "20 pieces; at least 19 units (vs 20 in the deep net)"
+      - "1024 pieces; at least 20 units, the same as the deep net"
+      - "100 pieces; at least 99 units (vs 20 in the deep net)"
+    explanation: |
+      Each tent maps $[0,1]$ onto itself twice, so every composition doubles the number of pieces: $2^{10}=1024$. A one-hidden-layer ReLU net on a scalar has at most one kink per unit, so $m$ units give at most $m+1$ pieces, and you need $m\ge1023$. The deep version uses 2 units per layer, 20 in total. "20 pieces" counts units instead of pieces.
+    source: Goodfellow DL §6.4.1
+
+  - id: q11
+    prompt: |
+      A 10-4-1 MLP with tanh hidden units has generic weights. Counting only permutations and sign flips of hidden units, how many distinct weight vectors compute exactly the same function?
+    correct: "384"
+    wrong:
+      - "24"
+      - "16"
+      - "48"
+    explanation: |
+      There are $M!=24$ ways to permute the hidden units with their weights, and $2^M=16$ sign patterns, since tanh is odd and flipping a unit's in-weights, bias and out-weight cancels. Together that's $24\times16=384$. 24 and 16 each count only one of the symmetries. 48 allows only a single global sign flip ($24\times2$) instead of one flip per unit.
+    source: Bishop PRML §5.1.1
+
+  - id: q12
+    prompt: |
+      A sigmoid output unit has logit $z=-6$ and target $y=1$. What is $\partial L/\partial z$ under squared error $\frac12(p-y)^2$ vs under binary cross-entropy?
+    correct: "About $-0.0025$ (squared error) vs $-0.998$ (cross-entropy)"
+    wrong:
+      - "About $-0.998$ (squared error) vs $-0.0025$ (cross-entropy)"
+      - "About $-0.998$ under both losses, since they share the sigmoid"
+      - "About $-0.25$ (squared error) vs $-0.998$ (cross-entropy)"
+    explanation: |
+      $p=\sigma(-6)=0.0025$. Squared error gives $(p-y)\,p(1-p)\approx(-0.9975)(0.0025)=-0.0025$. Cross-entropy gives $p-y=-0.9975$, about 400× larger. That is exactly the confidently-wrong case where learning should be fastest. $-0.25$ wrongly uses the *maximum* of $\sigma'$, which occurs only at $z=0$.
+    source: Goodfellow DL §6.2.2.2; CS229 notes §7.4.3
+
+  - id: q13
+    prompt: |
+      A 256-256-256-256 MLP (input, two hidden layers, output all 256 wide) computes its weight gradients as `dW = A_prev.T @ delta` while storing W as (out, in). What do you observe?
+    correct: "No error, but each update uses the transposed gradient"
+    wrong:
+      - "A shape error on the first backward pass"
+      - "Correct training, since the transpose of the gradient has the same norm"
+      - "Correct training, because the gradient check is symmetric in W"
+    explanation: |
+      Every layer is square, so `A_prev.T @ delta` (256×256) fits $W$'s shape and the update runs. But it equals $\bar W^\top$. That is not a descent direction in general: $\langle\bar W,\bar W^\top\rangle$ can be negative. A gradient check would expose it immediately, and so would unequal layer widths, which turn it into a crash. Equal norms don't make two directions equal.
+    source: CS229 notes §7.5; Goodfellow DL §11.5
+
+cards:
+  - id: f1
+    front: The four backward equations for a batch-first MLP with $W^{(l)}$ stored as (out, in).
+    back: |
+      $$\begin{aligned} \bar W^{(l)} &= \delta^{(l)\top}A^{(l-1)}\\ \bar b^{(l)} &= \textstyle\sum_{\text{rows}}\delta^{(l)}\\ \bar A^{(l-1)} &= \delta^{(l)}W^{(l)}\\ \delta^{(l-1)} &= \bar A^{(l-1)}\odot\phi'(Z^{(l-1)}) \end{aligned}$$
+
+      Start from $\delta^{(L)}=(P-Y)/B$ for mean softmax-CE.
+    source: CS229 notes §7.4.4, §7.5
+
+  - id: f2
+    front: Shapes in a 784-256-10 MLP at batch 64 — $Z_1$, $\delta_2$, $\bar W_1$, $\bar W_2$, $\bar b_1$, $\bar A_1$.
+    back: |
+      $Z_1$: 64×256 · $\delta_2$: 64×10 · $\bar W_1$: 256×784 · $\bar W_2$: 10×256 · $\bar b_1$: 256 · $\bar A_1$: 64×256.
+
+      Every gradient has its variable's shape.
+    source: CS229 notes §7.5
+
+  - id: f3
+    front: Prove that no linear classifier solves XOR, and give a 2-unit ReLU solution.
+    back: |
+      **Proof.** You'd need $b<t$, $w_1+b>t$, $w_2+b>t$ and $w_1+w_2+b<t$. Adding the middle two gives $w_1+w_2+2b>2t$; adding the outer two gives $<2t$. Contradiction.
+
+      **Solution.** $f=w^\top\max(0,W^\top x+c)$ with $W=\begin{pmatrix}1&1\\1&1\end{pmatrix}$, $c=(0,-1)$, $w=(1,-2)$ outputs $0,1,1,0$.
+    source: Goodfellow DL §6.1
+
+  - id: f4
+    front: Universal approximation theorem — statement and three things it does not promise.
+    back: |
+      **Statement.** One hidden layer with a non-polynomial activation (squashing functions, or ReLU per Leshno et al.) plus a linear output can approximate any continuous function on a compact set to any accuracy, given enough units.
+
+      **Not promised:** a reasonable width (it can be exponential), learnability by gradient descent, or generalisation.
+    source: Goodfellow DL §6.4.1
+
+  - id: f5
+    front: How many equivalent weight vectors does a layer of $M$ tanh hidden units have, and what's the ReLU analogue?
+    back: |
+      $M!\,2^M$: $M!$ permutations times $2^M$ sign flips (tanh is odd). ReLU has no sign symmetry. Instead it has a continuous positive rescaling: multiply a unit's in-weights by $\alpha>0$ and its out-weight by $1/\alpha$.
+    source: Bishop PRML §5.1.1
+
+  - id: f6
+    front: Effect of switching the loss reduction from mean to sum at batch size $B$.
+    back: |
+      Every gradient grows $B\times$. Under SGD that is a $B\times$ larger learning rate, which couples the learning rate to batch size. Adam is nearly unaffected, because it divides by the gradient's RMS. Prefer the mean, with the $1/B$ inside $\delta^{(L)}$.
+    source: CS229 notes §7.5; Kingma & Ba 2015 §2.1
+
+  - id: f7
+    type: open
+    front: Whiteboard task — implement forward and backward for a 2-layer ReLU MLP with softmax cross-entropy in numpy. Talk through it.
+    back: |
+      1. **Shapes first:** $X$ is $(B,d)$, $W_1$ is $(h,d)$, $W_2$ is $(K,h)$, with biases $(h)$ and $(K)$.
+      2. **Forward:** `Z1 = X @ W1.T + b1`, `A1 = max(Z1, 0)`, `Z2 = A1 @ W2.T + b2`. Cache $X$, $Z_1$ and $A_1$.
+      3. **Loss:** stable log-softmax (subtract the row max), `loss = -logp[range(B), y].mean()`.
+      4. **Output error:** `d2 = softmax(Z2); d2[range(B), y] -= 1; d2 /= B`, which is $(P-Y)/B$.
+      5. **Layer 2:** `dW2 = d2.T @ A1` $(K,h)$, `db2 = d2.sum(0)`.
+      6. **Into layer 1:** `dA1 = d2 @ W2` $(B,h)$, then `d1 = dA1 * (Z1 > 0)`.
+      7. **Layer 1:** `dW1 = d1.T @ X` $(h,d)$, `db1 = d1.sum(0)`.
+      8. **Verify:** a float64 centred-difference check on a 5-4-3 net, then compare with autograd.
+
+      Mention the $1/B$, the log-sum-exp trick, and why unequal widths catch transpose bugs.
+    source: CS229 notes §7.4.4, §7.5; Goodfellow DL §6.5.7
+
+  - id: f8
+    type: open
+    front: Your from-scratch MLP learns much worse than the same architecture in PyTorch. How do you debug it?
+    back: |
+      1. **Same starting point:** copy identical weights, data and hyperparameters into both implementations.
+      2. **Compare forward outputs and losses.** If they differ, look at activation choice, bias broadcasting, softmax stability, or the reduction (mean vs sum).
+      3. **Compare gradients layer by layer** against autograd. The first layer that disagrees localises the bug: transpose, mask index, or a missing $1/B$ (a clean factor-$B$ ratio).
+      4. **Gradient-check in float64** on a tiny net with unequal widths, so transposes crash instead of passing silently.
+      5. **Then check the update and init.** Is the sign right (`-=`)? Is the learning rate scaled correctly? Is the init scale sensible (He for ReLU)? Are the hidden units distinct (no symmetric init)?
+      6. **Overfit a few examples.** If the gradients agree but this fails, suspect the loss or the data feed.
+    source: Goodfellow DL §11.5; Karpathy 2019 §2
+
+  - id: f9
+    type: open
+    front: If one hidden layer is a universal approximator, why do we use deep networks?
+    back: |
+      - **Existence vs efficiency.** The theorem guarantees a wide enough shallow net exists, but the width can be exponential.
+      - **A concrete separation.** A one-hidden-layer ReLU net on a scalar input gives at most $m+1$ pieces with $m$ units. Composing the 2-unit tent map $k$ times gives $2^k$ pieces from $2k$ units, so the shallow net needs at least $2^k-1$. Montúfar et al. generalise this: linear regions grow exponentially with depth.
+      - **Statistical argument** (Goodfellow et al.): depth encodes a prior that the target is a composition of simpler functions, and empirically deeper nets generalise better on many tasks.
+      - **Caveats:** universality says nothing about optimisation or generalisation, and depth brings its own optimisation issues (vanishing gradients, hence normalisation and residuals).
+    source: Goodfellow DL §6.4.1
+
+  - id: f10
+    type: open
+    front: Explain weight-space symmetry in MLPs and two consequences of it.
+    back: |
+      **The symmetry.** Permuting the hidden units of a layer (with their weights) gives $M!$ equivalent networks. For odd activations like tanh, flipping a unit's input weights, bias and output weight gives $2^M$ more. ReLU has a positive rescaling symmetry instead.
+
+      **Consequence 1: the loss is non-convex.** Permuted minima are distinct points with equal loss. Convexity would force their midpoint to be a minimum too, but the midpoint averages different units and is generically worse.
+
+      **Consequence 2: initialisation must break symmetry.** Units that start identical get identical gradients and stay identical forever.
+
+      **Extras:** minima come in families, so parameter-space distances and averages are misleading unless you align units first. Bishop notes the counting matters for Bayesian model comparison.
+    source: Bishop PRML §5.1.1; Goodfellow DL §6.1
+
+reading:
+  - title: "CS229 Lecture Notes, ch. 7 Deep Learning (§7.4.3–7.5: backward functions, backprop for MLPs, vectorisation)"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: Derives each module's backward function (matmul, activation, losses), then assembles Algorithm 3 and its vectorised form.
+  - title: "Goodfellow, Bengio & Courville, Deep Learning §6.1, §6.4.1, §6.5.4"
+    url: https://www.deeplearningbook.org/contents/mlp.html
+    kind: book
+    note: The XOR solution traced step by step, universal approximation and depth (Montúfar's folding picture), and the MLP backward algorithm.
+  - title: "Bishop, Pattern Recognition and Machine Learning §5.1–5.3"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: Weight-space symmetries (§5.1.1) and a fully worked backprop example (§5.3.2) in column-vector notation.
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction §13.2–13.3"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: XOR, the importance of depth, and reverse-mode differentiation specialised to MLPs.
+  - title: "d2l.ai §5.1 Multilayer Perceptrons"
+    url: https://d2l.ai/chapter_multilayer-perceptrons/mlp.html
+    kind: course
+    note: A gentle companion. Why stacked affine layers collapse (§5.1.1.3), universal approximators, and the common activations with code.

@@ -1,0 +1,559 @@
+id: gen.latent-variables-elbo
+area: genmodels
+title: Latent-Variable Models, Variational Inference & the ELBO
+summary: Why log p(x) is intractable once there are hidden variables, and how the evidence lower bound fixes it. Derived two ways, worked through on a model where every number can be checked, and connected to EM, mean-field VI and amortized inference.
+order: 30
+level: core
+tags: [elbo, variational-inference, latent-variables, em, kl-divergence, jensen]
+prereqs: [fund.kl-divergence, fund.mle]
+
+explainer:
+  - title: "The problem: likelihoods with hidden causes"
+    body: |
+      We want to fit a model of data $x$ (images, say) by maximum likelihood. A **latent-variable model** assumes each $x$ was made by first drawing a hidden cause $z$ and then drawing $x$ given $z$:
+
+      $$z\sim p(z),\qquad x\mid z\sim p_\theta(x\mid z).$$
+
+      - $p(z)$ is the **prior** over latents, usually $\mathcal N(0,I)$.
+      - $p_\theta(x\mid z)$ is the **likelihood** or **decoder**, e.g. a Gaussian whose mean $\mu_\theta(z)$ is a neural network with parameters $\theta$.
+
+      Simple pieces give a rich model of $x$. If $z$ takes $K$ values and $p_\theta(x\mid z)$ is Gaussian, $x$ follows a mixture of $K$ Gaussians. A continuous $z$ gives an infinite mixture.
+
+      Together they define the **joint** $p_\theta(x,z)=p(z)\,p_\theta(x\mid z)$. Maximum likelihood needs the **evidence** (marginal likelihood) of each datapoint, the joint integrated over $z$:
+
+      $$p_\theta(x)=\int p_\theta(x\mid z)\,p(z)\,dz.$$
+
+      **Why this is hard.** With a neural-network mean $\mu_\theta(z)$ the integral has no closed form. The **posterior** $p_\theta(z\mid x)=p_\theta(x\mid z)p(z)/p_\theta(x)$ has the same integral as its normaliser, so it is intractable too.
+
+      **Why naive Monte Carlo fails.** Since $p_\theta(x)=\mathbb E_{p(z)}[p_\theta(x\mid z)]$, we could average $p_\theta(x\mid z_i)$ over prior samples $z_i$. That is unbiased, but almost every prior sample explains $x$ badly. A tiny example: $z\sim\mathcal N(0,1)$, $x\mid z\sim\mathcal N(z,0.1^2)$, and we observe $x=2.5$.
+      - The posterior sits near $z=2.48$ with sd $0.1$ (precisions add, $1+1/0.1^2$; the worked example derives this). Only 0.8% of prior draws land within two posterior sds of it, and those few dominate the average.
+      - The per-sample relative variance $\mathbb E[w^2]/\mathbb E[w]^2-1$ of $w=p(x\mid z)$ is 154. The mean of $N$ draws has relative variance $154/N$; setting $\sqrt{154/N}=0.1$ gives $N\approx15{,}000$ samples for 10% accuracy.
+      - With 10 independent copies of this dimension, $w$ is a product of independent factors, so $1+\text{rel. var}$ is raised to the 10th power. The count becomes about $10^{24}$.
+
+      **The fix we'll build.** Sample $z$ from a distribution $q(z)$ that concentrates where the posterior is, and correct with weights. This turns into a computable lower bound on $\log p_\theta(x)$: the ELBO.
+    source: Kingma & Welling 2019 §1.7–1.8; Murphy PML2 §10.1.1, §21.1
+
+  - title: "Three refreshers: Jensen, KL ≥ 0, importance sampling"
+    body: |
+      **Jensen's inequality.** A function $f$ is **concave** if every chord lies on or below its graph (in 1-D, $f''\le0$). $\log$ is concave since $(\log x)''=-1/x^2<0$. For concave $f$ and any random variable $X$:
+
+      $$\mathbb E[f(X)]\le f(\mathbb E[X]).$$
+
+      *Proof.* Let $m=\mathbb E[X]$. A concave function lies below its tangent at $m$: $f(x)\le f(m)+f'(m)(x-m)$ for every $x$. Take expectations; the last term has mean zero. For strictly concave $f$, equality needs all of $X$'s mass at the touching point, i.e. $X$ constant with probability 1. For convex $f$ the inequality flips; to remember the direction, draw the chord.
+
+      ![Jensen for log with a two-point $X$. The average of the logs (chord midpoint) sits below the log of the average (on the curve).](gen.latent-variables-elbo/jensen-chord)
+
+      **KL ≥ 0 (Gibbs' inequality).** $\mathrm{KL}(q\|p)=\mathbb E_q[\log q(z)-\log p(z)]$. Apply Jensen to $\log$:
+
+      $$\begin{aligned}-\mathrm{KL}(q\|p)&=\mathbb E_q\Big[\log\frac{p(z)}{q(z)}\Big]\\&\le\log\mathbb E_q\Big[\frac{p(z)}{q(z)}\Big]\\&=\log\int_{q>0}p(z)\,dz\ \le\ 0.\end{aligned}$$
+
+      Equality holds iff $p/q$ is constant where $q>0$ and $p$ has no mass elsewhere, i.e. $q=p$. KL is not symmetric. $\mathrm{KL}(q\|p)$ averages under $q$.
+
+      **Importance sampling.** Draw from a distribution $q$ we can sample (the **proposal**) instead of $p$. For any $q$ with $q(z)>0$ wherever $p(z)f(z)\ne0$:
+
+      $$\mathbb E_p[f(z)]=\mathbb E_q\Big[f(z)\,\frac{p(z)}{q(z)}\Big].$$
+
+      Sample from $q$ and reweight by $p/q$. The estimate is unbiased for any such $q$. For $f\ge0$ its variance is small when $q$ is roughly proportional to $pf$, and zero when $q\propto pf$ exactly, because then every term $fp/q$ is the same constant.
+
+      For us, $p_\theta(x)=\mathbb E_q[p_\theta(x,z)/q(z)]$, and the zero-variance proposal $q\propto p_\theta(x,z)$ is exactly the posterior $p_\theta(z\mid x)$. **A good proposal is an approximate posterior.**
+    source: CS229 notes §11.2; MacKay ITILA §2.6–2.7; Murphy PML2 §11.5.1
+
+  - title: "Derivation 1: the ELBO via Jensen"
+    body: |
+      Pick any distribution $q(z)$ over latents with $q(z)>0$ wherever $p_\theta(x,z)>0$. It may depend on $x$, and then we write $q(z\mid x)$. Four steps:
+
+      $$\begin{aligned}\log p_\theta(x)&=\log\int p_\theta(x,z)\,dz\\&=\log\int q(z)\,\frac{p_\theta(x,z)}{q(z)}\,dz\\&=\log\mathbb E_{q}\Big[\frac{p_\theta(x,z)}{q(z)}\Big]\\&\ge\mathbb E_{q}\Big[\log\frac{p_\theta(x,z)}{q(z)}\Big].\end{aligned}$$
+
+      1. Marginalise the joint $p_\theta(x,z)=p_\theta(x\mid z)p(z)$ over $z$.
+      2. Multiply and divide by $q(z)$, which changes nothing.
+      3. Read the integral as an expectation under $q$. This is importance sampling: the **weight** $w(z)=p_\theta(x,z)/q(z)$ has $\mathbb E_q[w]=p_\theta(x)$.
+      4. Apply Jensen to the concave $\log$, moving it inside the expectation.
+
+      The right-hand side is the **evidence lower bound (ELBO)**:
+
+      $$\mathcal L(q,\theta;x)=\mathbb E_{q}\big[\log p_\theta(x,z)-\log q(z)\big].$$
+
+      It is computable. It needs samples from $q$ and pointwise values of $p_\theta(x\mid z)$, $p(z)$ and $q(z)$, never the integral.
+
+      **When is it tight?** Jensen is an equality iff $w(z)$ is constant in $z$, i.e. $q(z)\propto p_\theta(x,z)$. Normalising gives $q(z)=p_\theta(x,z)/p_\theta(x)=p_\theta(z\mid x)$. The bound is exact exactly when $q$ is the true posterior.
+
+      **How to read it.** The ELBO is the *average log weight*, while $\log p_\theta(x)$ is the *log of the average weight*. The more $w$ varies under $q$, the bigger the gap, so a $q$ close to the posterior gives a tight bound. A single draw $z\sim q$ gives $\log w(z)$, an unbiased estimate of the ELBO. By contrast, the log of an unbiased estimate of $p_\theta(x)$ is biased low, which is the same inequality again. What this derivation does not show is *how big* the gap is; the next card computes it exactly.
+
+      **Variational inference (VI)** turns posterior inference into optimisation: choose a family $\mathcal Q$ of tractable distributions and pick the $q\in\mathcal Q$ that maximises the ELBO. "Variational" refers to optimising over a function (the distribution $q$), as in the calculus of variations.
+
+    source: CS229 notes §11.3; Luo 2022, "Evidence Lower Bound" (p.2–3); Kingma & Welling 2019 §2.2
+
+  - title: "Derivation 2: the exact identity log p = ELBO + KL"
+    body: |
+      Start from the product rule. For any $z$ with $p_\theta(z\mid x)>0$:
+
+      $$p_\theta(x)=\frac{p_\theta(x,z)}{p_\theta(z\mid x)}.$$
+
+      The left side does not depend on $z$, so it equals its own average under any normalised $q$:
+
+      $$\begin{aligned}\log p_\theta(x)&=\mathbb E_q[\log p_\theta(x)]\\&=\mathbb E_q\Big[\log\frac{p_\theta(x,z)}{p_\theta(z\mid x)}\Big]\\&=\mathbb E_q\Big[\log\frac{p_\theta(x,z)}{q(z)}+\log\frac{q(z)}{p_\theta(z\mid x)}\Big]\\&=\mathcal L(q,\theta;x)+\mathrm{KL}\big(q\,\|\,p_\theta(z\mid x)\big).\end{aligned}$$
+
+      Step by step: the expectation of a constant is the constant; the product rule; multiply and divide by $q(z)$ inside the log and split; the first expectation is the ELBO and the second is, by definition, the KL from $q$ to the true posterior.
+
+      **Consequences.**
+      - **The gap is exactly the posterior KL.** Since KL ≥ 0, $\mathcal L\le\log p_\theta(x)$. This recovers the Jensen bound and names what Jensen threw away.
+      - **Two jobs in one objective** (Kingma & Welling's "two for one"). For fixed $\theta$, $\log p_\theta(x)$ doesn't depend on $q$, so every nat gained in $\mathcal L$ over $q$ is a nat removed from $\mathrm{KL}(q\|p_\theta(z\mid x))$. That is approximate inference, done without ever evaluating the posterior. Over $\theta$, raising $\mathcal L$ pushes up a lower bound on the likelihood, which is approximate maximum likelihood.
+      - **The catch.** Over $\theta$, the ELBO also rewards models whose posterior is easy for $q$ to match, because a smaller gap raises $\mathcal L$ too. With a restrictive family for $q$, training biases the model toward posteriors of that shape.
+      - **Which KL.** It is the *reverse* KL, $\mathrm{KL}(q\|p)$, with the expectation under $q$. That is what makes it computable from samples of $q$, and it drives the behaviour on the "Choosing q" card.
+    source: Kingma & Welling 2019 §2.2–2.2.1; Bishop PRML §9.4 (eqs. 9.70–9.73); CS229 notes §11.3.1; Murphy PML2 §21.2.4
+
+  - title: "Worked example: everything computable"
+    body: |
+      Take a 1-D linear-Gaussian model with one observation:
+
+      $$z\sim\mathcal N(0,1),\quad x\mid z\sim\mathcal N(z,1),\quad x=1.$$
+
+      **Exact answers.** $x$ is $z$ plus independent unit noise, so $x\sim\mathcal N(0,2)$ and
+
+      $$\log p(x)=-\tfrac12\log(4\pi)-\tfrac{x^2}{4}=-1.516.$$
+
+      For the posterior, add the log-densities and complete the square in $z$: $-\tfrac{z^2}{2}-\tfrac{(x-z)^2}{2}=-(z-\tfrac x2)^2+\text{const}$. So $p(z\mid x)=\mathcal N(\tfrac x2,\tfrac12)=\mathcal N(0.5,0.5)$.
+
+      **ELBO of a Gaussian $q=\mathcal N(m,s^2)$.** Write $\mathcal L=\mathbb E_q[\log p(z)]+\mathbb E_q[\log p(x\mid z)]+H(q)$ and take one term at a time, using $\mathbb E_q[z^2]=m^2+s^2$, $\mathbb E_q[(x-z)^2]=(x-m)^2+s^2$ and $\mathbb E_q[(z-m)^2]=s^2$:
+
+      $$\begin{aligned}\mathbb E_q\log p(z)&=-\tfrac12\log2\pi-\tfrac12(m^2+s^2)\\\mathbb E_q\log p(x\mid z)&=-\tfrac12\log2\pi-\tfrac12\big((x-m)^2+s^2\big)\\H(q)=-\mathbb E_q\log q&=\tfrac12\log2\pi s^2+\tfrac12\end{aligned}$$
+
+      Adding, one $\log2\pi$ cancels against the entropy's, and the two $s^2/2$ terms combine into $s^2$:
+
+      $$\begin{aligned}\mathcal L&=-\tfrac12\log 2\pi+\tfrac12+\tfrac12\log s^2\\&\quad-\tfrac12\big(m^2+(x-m)^2\big)-s^2.\end{aligned}$$
+
+      ![$\log p(x)$ = ELBO + gap for four choices of $q$ (exact values). The gap shrinks to zero only at the true posterior.](gen.latent-variables-elbo/elbo-gap)
+
+      - $q=$ prior $\mathcal N(0,1)$: $\mathcal L=-1.919$, gap $0.403$.
+      - $\mathcal N(0.5,1)$, right mean, too wide: $-1.669$, gap $0.153$.
+      - $\mathcal N(1,0.5)$, right width, wrong mean: $-1.766$, gap $0.250$.
+      - $\mathcal N(0.5,0.5)$, the posterior: $-1.516$, gap $0$.
+
+      Each gap equals $\mathrm{KL}(q\|\mathcal N(0.5,0.5))$ computed directly from the two-Gaussian formula $\log\frac{s_2}{s_1}+\frac{s_1^2+(m_1-m_2)^2}{2s_2^2}-\frac12$ (derived in fund.kl-divergence). For the prior: $\tfrac12\log\tfrac12+\tfrac{1+0.25}{1}-\tfrac12=0.403$.
+
+      **Maximising the ELBO finds the posterior.** Set the derivatives to zero:
+
+      $$\begin{aligned}\partial_m\mathcal L&=-m+(x-m)=0\Rightarrow m=\tfrac x2,\\\partial_{s^2}\mathcal L&=\tfrac{1}{2s^2}-1=0\Rightarrow s^2=\tfrac12.\end{aligned}$$
+
+      We recovered the exact posterior by optimisation, never touching $p(x)$. That is variational inference in miniature. In a deep model the same optimisation runs by gradient ascent, and its optimum is only the best $q$ inside the chosen family.
+    source: Murphy PML2 §10.1.1–10.1.2; Bishop PRML §2.3.3; Kingma & Welling 2019 §2.2
+
+  - title: "Reading the ELBO: three equivalent forms"
+    body: |
+      Write $q$ for $q(z\mid x)$. Splitting $\log p_\theta(x,z)-\log q$ in different ways gives three forms, each with its own reading.
+
+      **1. Energy + entropy.** Keep the joint together:
+
+      $$\mathcal L=\mathbb E_q[\log p_\theta(x,z)]+H(q).$$
+
+      The first term pulls $q$ onto the $z$ that best explain $x$ jointly with the prior, a MAP-like pull. The entropy $H(q)=-\mathbb E_q[\log q]$ pushes $q$ to spread out. In physics language $-\log p_\theta(x,z)$ is an *energy* and $-\mathcal L$ is the *variational free energy*.
+
+      **2. Reconstruction − prior matching.** Use $p_\theta(x,z)=p_\theta(x\mid z)\,p(z)$:
+
+      $$\begin{aligned}\mathcal L&=\mathbb E_q[\log p_\theta(x\mid z)]+\mathbb E_q\Big[\log\frac{p(z)}{q}\Big]\\&=\mathbb E_q[\log p_\theta(x\mid z)]-\mathrm{KL}\big(q\,\|\,p(z)\big).\end{aligned}$$
+
+      - *Reconstruction*: draw a code $z$ from $q$ and score how well the decoder regenerates $x$ from it.
+      - *Prior matching*: a penalty, in nats, for how far this datapoint's code distribution moves away from the prior. gen.vae shows its average over the data is the information the code carries about $x$ plus a mismatch term.
+
+      A VAE trains this form, because for a Gaussian $q$ and prior the KL is closed-form and only the reconstruction needs sampling. In the worked example at the posterior: reconstruction $-1.294$, KL to prior $0.222$, total $-1.516$.
+
+      **3. Evidence − posterior gap.** $\mathcal L=\log p_\theta(x)-\mathrm{KL}(q\|p_\theta(z\mid x))$, from the identity. Useful for reasoning, not computable.
+
+      **Don't mix up the two KLs.** The *gap* is the KL to the posterior $p_\theta(z\mid x)$. The *training term* is the KL to the prior $p(z)$.
+
+      **Names and signs.** ELBO = variational lower bound, to be maximised. Variational free energy = $-$ELBO (Murphy, physics). A "VAE loss" in code is usually $-$ELBO averaged over a batch. Bishop writes $\mathcal L(q,\theta)$, Kingma & Welling $\mathcal L_{\theta,\phi}(x)$, CS229 $\mathrm{ELBO}(x;Q,\theta)$. For a dataset, the per-datapoint ELBOs add up, each with its own $q$.
+    source: Murphy PML2 §10.1.1.1–10.1.1.2; Goodfellow DL §20.10.3; Luo 2022, "Variational Autoencoders" (p.4); CS229 notes §11.3.1
+
+  - title: "EM and VI: coordinate ascent on the ELBO"
+    body: |
+      Treat the ELBO as a function of two arguments, $\mathcal L(q,\theta)$, and let $\ell(\theta)=\log p_\theta(x)$. Since $\ell(\theta)=\mathcal L(q,\theta)+\mathrm{KL}(q\|p_\theta(z\mid x))$, we can climb $\ell$ by maximising $\mathcal L$ in each argument in turn. This is the **EM algorithm**.
+
+      **E-step** (fix $\theta^{old}$, maximise over $q$). $\ell(\theta^{old})$ doesn't depend on $q$, so the best $q$ makes the KL zero: $q=p_{\theta^{old}}(z\mid x)$. The bound now touches $\ell$ at $\theta^{old}$.
+
+      **M-step** (fix $q$, maximise over $\theta$). $H(q)$ doesn't involve $\theta$, so
+
+      $$\theta^{new}=\arg\max_\theta\ \mathbb E_{q}[\log p_\theta(x,z)].$$
+
+      This *expected complete-data log-likelihood* is often easy because the log acts on the joint, e.g. weighted Gaussian fits in a mixture model.
+
+      **Why the likelihood never decreases:**
+
+      $$\begin{aligned}\ell(\theta^{new})&\ge\mathcal L(q,\theta^{new})\\&\ge\mathcal L(q,\theta^{old})=\ell(\theta^{old}).\end{aligned}$$
+
+      The first inequality is the bound, the second is the M-step, and the equality is the E-step's tightness. $\ell$ rises by at least as much as the bound does. EM converges to a stationary point, usually a local maximum, not necessarily the global one.
+
+      ![EM on the toy model below (exact curves). Each E-step builds a bound that touches $\ell$ at the current $\theta$; the M-step jumps to that bound's maximum.](gen.latent-variables-elbo/em-bound)
+
+      **Toy run.** $z\sim\mathcal N(\theta,1)$, $x\mid z\sim\mathcal N(z,1)$, one observation $x=2$. Then $\ell(\theta)=\log\mathcal N(2;\theta,2)$ peaks at $\theta=2$. The posterior is $\mathcal N(\frac{\theta^{old}+x}{2},\frac12)$ (precisions add to 2). In the M-step only $\log p_\theta(z)$ involves $\theta$, and maximising $\mathbb E_q[-\tfrac12(z-\theta)^2]$ gives $\theta^{new}=\mathbb E_q[z]=\frac{\theta^{old}+x}{2}$. From $\theta=-2$ the iterates are $0,1,1.5,\dots$, halving the distance each step. In the first step $\ell$ climbs from $-5.27$ to $-2.27$ while the bound rises only to $-3.27$. The gap at $\theta$ is the KL between two posteriors of variance $\frac12$ whose means differ by $(\theta-\theta^{old})/2$, i.e. $\big(\frac{\theta-\theta^{old}}{2}\big)^2/(2\cdot\tfrac12)=(\theta-\theta^{old})^2/4$.
+
+      **When the posterior is intractable**, restrict $q$ to a family $\mathcal Q$. The E-step becomes "maximise $\mathcal L$ over $q\in\mathcal Q$", the gap no longer closes, and only the bound is guaranteed to rise. This is **variational EM**. Doing both steps by joint gradient ascent on $\mathcal L(q_\phi,\theta)$ gives the VAE. The classic exact-EM example is the Gaussian mixture (fund.gmm-em).
+    source: Bishop PRML §9.4; CS229 notes §11.3; Murphy PML2 §10.1.3
+
+  - title: "Choosing q: families and the reverse-KL bias"
+    body: |
+      The bound is only as good as the family $\mathcal Q$ we search:
+      - **Mean-field (factorised):** $q(z)=\prod_j q_j(z_j)$. Cheap, but it cannot represent posterior correlations.
+      - **Diagonal Gaussian** $\mathcal N(m,\mathrm{diag}\,v)$: the mean-field Gaussian, and the VAE default.
+      - **Full-covariance Gaussians, flows:** richer and costlier (gen.vae, gen.flows).
+
+      **Why minimising KL(q‖p) makes q too narrow.** $\mathrm{KL}(q\|p)=\mathbb E_q[\log q-\log p]$ is evaluated only where $q$ puts mass. Mass where $p$ is tiny costs $-\log p\to\infty$, while leaving parts of $p$ uncovered costs nothing. So $q$ hides inside $p$. This is called *zero-forcing* or *mode-seeking*; with a multimodal posterior, $q$ tends to lock onto one mode.
+
+      **A computable case.** Target $p=\mathcal N(\mu,\Sigma)$ with precision $\Lambda=\Sigma^{-1}$; fit $q=\mathcal N(m,\mathrm{diag}\,v)$. Writing $z-\mu=(m-\mu)+\epsilon$ with $\epsilon$ the zero-mean deviation under $q$, the cross term has mean zero and $\mathbb E[\epsilon^\top\Lambda\epsilon]=\mathrm{tr}(\Lambda\,\mathrm{diag}\,v)$, so $\mathbb E_q[(z-\mu)^\top\Lambda(z-\mu)]=(m-\mu)^\top\Lambda(m-\mu)+\sum_j\Lambda_{jj}v_j$. Also use $H(q)=\sum_j\frac12\log(2\pi e v_j)$:
+
+      $$\begin{aligned}\mathrm{KL}(q\|p)&=\tfrac12(m-\mu)^\top\Lambda(m-\mu)\\&\quad+\tfrac12\textstyle\sum_j\big(\Lambda_{jj}v_j-\log v_j\big)+c.\end{aligned}$$
+
+      The minimum has $m=\mu$, and $\partial_{v_j}$ gives $\tfrac12(\Lambda_{jj}-1/v_j)=0$:
+
+      $$v_j=\frac{1}{\Lambda_{jj}}\ \le\ \Sigma_{jj}.$$
+
+      The inequality is Cauchy–Schwarz: $1=(e_j^\top\Sigma^{1/2}\Sigma^{-1/2}e_j)^2\le\Sigma_{jj}\Lambda_{jj}$. $1/\Lambda_{jj}$ is the variance of $z_j$ *given all the other coordinates* (Gaussian conditioning, Bishop eq. 2.75), not its marginal variance. For unit variances and correlation $\rho=0.9$: $v_j=1-\rho^2=0.19$, an sd of 0.44 against the true 1.
+
+      ![Exact fits to a correlated Gaussian. The reverse-KL mean-field fit (solid) sits inside; the forward-KL factorised fit (dashed) matches the marginals.](gen.latent-variables-elbo/meanfield)
+
+      The other direction, $\mathrm{KL}(p\|q)$, is minimised by matching each marginal's mean and variance ($v_j=\Sigma_{jj}$): mass-covering. VI uses $\mathrm{KL}(q\|p)$ because only expectations under $q$ are computable. The consequence: **VI posteriors are over-confident**, and mean-field drops correlations entirely.
+    source: Bishop PRML §10.1.2 (eqs. 10.10–10.15, Fig. 10.2); Murphy PML2 §10.1.2
+
+  - title: "Amortized inference and optimising the ELBO"
+    body: |
+      **Classical VI** gives each datapoint $x_i$ its own variational parameters $\psi_i$ (say a mean and a variance) and optimises them separately: $N$ problems, plus a fresh inner optimisation for every new $x$ at test time.
+
+      **Amortized VI** trains one network, the **encoder** or **inference network**, that maps $x$ to the parameters of its $q$. With $\psi=f_\phi(x)$ we write $q_\phi(z\mid x)$. Inference becomes a single forward pass, and the encoder generalises to unseen $x$. The objective sums the per-datapoint ELBOs and is estimated on minibatches:
+
+      $$\begin{aligned}\mathcal L(\theta,\phi)&=\sum_i\mathbb E_{q_\phi(z\mid x_i)}\Big[\log\frac{p_\theta(x_i,z)}{q_\phi(z\mid x_i)}\Big].\end{aligned}$$
+
+      **The price.** One encoder may not output the best $q$ in the family for every $x$; the resulting shortfall in the ELBO is the **amortization gap** (split out from the family's own *approximation gap*, and measured, in gen.vae).
+
+      **Gradients.** With respect to $\theta$, the sampling distribution doesn't move, so the gradient passes inside:
+
+      $$\nabla_\theta\mathcal L=\mathbb E_{q_\phi}\big[\nabla_\theta\log p_\theta(x,z)\big],$$
+
+      estimated with one sample $z\sim q_\phi$. With respect to $\phi$, the distribution being averaged over depends on $\phi$, so in general $\nabla_\phi\mathbb E_{q_\phi}[f]\ne\mathbb E_{q_\phi}[\nabla_\phi f]$. There are two fixes. The score-function (REINFORCE) estimator is unbiased but high-variance. The reparameterization trick writes $z=\mu_\phi(x)+\sigma_\phi(x)\,\epsilon$ with $\epsilon\sim\mathcal N(0,I)$. gen.vae derives both and combines amortized inference, reparameterized gradients and neural decoders into the VAE.
+    source: Murphy PML2 §10.1.4–10.1.6; Kingma & Welling 2019 §2.1, §2.3; Cremer et al. 2018 §1
+
+  - title: "Pitfalls and what interviewers probe"
+    body: |
+      **Common mistakes**
+      - Treating a higher ELBO as a higher likelihood. Over $\theta$, the ELBO can rise because the gap shrank while $\log p_\theta(x)$ fell. Compare models with an importance-sampled estimate of $\log p$ (gen.vae), not ELBOs alone.
+      - Support: if $q$ puts mass where the posterior is zero, $\mathrm{KL}(q\|p_\theta(z\mid x))=\infty$ and the ELBO is $-\infty$.
+
+      **Interview chain, with short answers**
+      - *Why not maximise $\log p(x)$ directly?* The integral over $z$ has no closed form, and naive Monte Carlo needs a number of samples exponential in $\dim z$.
+      - *Derive the ELBO two ways.* Jensen on $\log\mathbb E_q[w]$; or the product rule plus a split into ELBO + KL.
+      - *What is the gap, and when is the bound tight?* $\mathrm{KL}(q\|p_\theta(z\mid x))$; tight iff $q$ is the posterior.
+      - *Relation to EM?* Coordinate ascent on $\mathcal L(q,\theta)$. The exact E-step closes the gap, which makes $\ell$ monotone.
+      - *Why the reverse KL, and what does it cost?* It is the only one computable under $q$. It is mode-seeking and under-estimates variance.
+      - *Amortized vs classical VI?* One encoder vs per-datapoint parameters; the price is the amortization gap.
+      - *Why is $\nabla_\phi$ harder than $\nabla_\theta$?* The sampling distribution depends on $\phi$. Use reparameterization or REINFORCE.
+      - *Is the Monte Carlo ELBO estimate biased?* $\log w(z)$ is unbiased for the ELBO. The log of an averaged weight is biased low for $\log p(x)$, and becomes a tighter bound as more samples are averaged (the IWAE idea, gen.vae-variants).
+    source: Kingma & Welling 2019 §2.2–2.3, §2.6; Murphy PML2 §10.1, §21.2.4; Bishop PRML §10.1.2
+
+  - title: Key results
+    body: |
+      - Evidence: $p_\theta(x)=\int p_\theta(x\mid z)p(z)\,dz$, intractable for neural decoders; so is the posterior $p_\theta(z\mid x)$.
+      - ELBO:
+
+      $$\mathcal L=\mathbb E_q\big[\log p_\theta(x,z)-\log q(z\mid x)\big]$$
+
+      - Jensen route: $\log\mathbb E_q[w]\ge\mathbb E_q[\log w]$ with $w=p_\theta(x,z)/q$.
+      - Exact identity:
+
+      $$\log p_\theta(x)=\mathcal L+\mathrm{KL}\big(q\,\|\,p_\theta(z\mid x)\big)$$
+
+      - Tight iff $q=p_\theta(z\mid x)$. Over $q$: inference. Over $\theta$: approximate MLE.
+      - Forms: $\mathbb E_q[\log p_\theta(x,z)]+H(q)$ and
+
+      $$\mathcal L=\mathbb E_q[\log p_\theta(x\mid z)]-\mathrm{KL}\big(q\,\|\,p(z)\big)$$
+
+      - EM: E-step $q=p_{\theta^{old}}(z\mid x)$; M-step $\max_\theta\mathbb E_q[\log p_\theta(x,z)]$; $\ell(\theta^{new})\ge\mathcal L(q,\theta^{new})\ge\ell(\theta^{old})$.
+      - Mean-field Gaussian fit to $\mathcal N(\mu,\Lambda^{-1})$ by $\mathrm{KL}(q\|p)$: $m=\mu$, $v_j=1/\Lambda_{jj}\le\Sigma_{jj}$ (over-confident).
+      - Toy check: $z\sim\mathcal N(0,1)$, $x\mid z\sim\mathcal N(z,1)$, $x=1$: $\log p=-1.516$, posterior $\mathcal N(0.5,0.5)$, ELBO at the prior $-1.919$ (gap 0.403).
+    source: Kingma & Welling 2019 §2.2; Bishop PRML §9.4, §10.1.2; Cremer et al. 2018 Table 1
+
+quiz:
+  - id: q1
+    prompt: |
+      The Jensen derivation of the ELBO ends with
+
+      $$\log\mathbb E_q\Big[\frac{p_\theta(x,z)}{q(z)}\Big]\ \ge\ \mathbb E_q\Big[\log\frac{p_\theta(x,z)}{q(z)}\Big].$$
+
+      Which fact justifies this step?
+    correct: $\log$ is concave, so the average of $\log w$ is at most $\log$ of the average of $w$
+    wrong:
+      - $\log$ is convex, so the average of $\log w$ is at most $\log$ of the average of $w$
+      - Every weight $w(z)$ is at most $p_\theta(x)$, and $\log$ is an increasing function
+      - Cauchy–Schwarz bounds $\mathbb E_q[w]^2$ by $\mathbb E_q[w^2]$, which then bounds the log
+    explanation: |
+      Jensen for a concave $f$ gives $\mathbb E[f(X)]\le f(\mathbb E[X])$, and $\log$ is concave ($(\log x)''=-1/x^2<0$). For a *convex* function the inequality points the other way, so the "convex" option has the right inequality for the wrong reason. The per-sample claim is false: individual weights $w(z)=p_\theta(x,z)/q(z)$ can exceed $p_\theta(x)$. Only their *average* equals $p_\theta(x)$.
+    source: CS229 notes §11.2–11.3
+
+  - id: q2
+    prompt: |
+      ![The four $q$'s from the worked example ($z\sim\mathcal N(0,1)$, $x\mid z\sim\mathcal N(z,1)$, $x=1$).](gen.latent-variables-elbo/elbo-gap)
+
+      Now take $q=\mathcal N(0,0.25)$, which is not shown. What is the gap $\log p(x)-\mathcal L(q)$? You may use $\mathrm{KL}(\mathcal N(m_1,s_1^2)\|\mathcal N(m_2,s_2^2))=\log\frac{s_2}{s_1}+\frac{s_1^2+(m_1-m_2)^2}{2s_2^2}-\frac12$.
+    correct: "0.347 nats"
+    wrong:
+      - "0.318 nats"
+      - "0.653 nats"
+      - "0.403 nats"
+    explanation: |
+      The gap is $\mathrm{KL}(q\|p(z\mid x))$ with posterior $\mathcal N(0.5,0.5)$: $\log\frac{\sqrt{0.5}}{\sqrt{0.25}}+\frac{0.25+0.25}{2\cdot0.5}-\frac12=0.347+0.5-0.5=0.347$. Check: $\mathcal L=-0.919+0.5-0.693-0.5-0.25=-1.862$, and $-1.516-(-1.862)=0.347$. The tempting 0.318 is $\mathrm{KL}(q\|p(z))$, the KL to the *prior*: the training term, not the gap. 0.653 is the KL in the wrong order, $\mathrm{KL}(p(z\mid x)\|q)$. 0.403 is the prior's gap.
+    source: Kingma & Welling 2019 §2.2; Murphy PML2 §10.1.1
+
+  - id: q3
+    prompt: |
+      Which statement about the ELBO $\mathcal L(q,\theta)$ is **false**?
+    correct: Maximising $\mathcal L$ over $q$ minimises $\mathrm{KL}(p_\theta(z\mid x)\,\|\,q)$
+    wrong:
+      - For fixed $\theta$, raising $\mathcal L$ over $q$ by 0.1 nats lowers $\mathrm{KL}(q\|p_\theta(z\mid x))$ by exactly 0.1 nats
+      - $\mathcal L=\log p_\theta(x)$ holds exactly when $q$ equals the posterior almost everywhere
+      - An update to $\theta$ can raise $\mathcal L$ while lowering $\log p_\theta(x)$, if the gap shrinks by more
+    explanation: |
+      From $\log p_\theta(x)=\mathcal L+\mathrm{KL}(q\|p_\theta(z\mid x))$, the KL that the ELBO controls is the **reverse** KL, with $q$ first and the expectation under $q$. The forward KL would need expectations under the unknown posterior. The other three follow from the identity: with $\theta$ fixed the left side is constant, the gap is zero iff $q$ is the posterior, and over $\theta$ both $\log p_\theta(x)$ and the gap move.
+    source: Kingma & Welling 2019 §2.2–2.2.1; Murphy PML2 §10.1.1
+
+  - id: q4
+    prompt: |
+      The second derivation begins with $\log p_\theta(x)=\mathbb E_q\big[\log p_\theta(x,z)-\log p_\theta(z\mid x)\big]$. What makes this an exact equality?
+    correct: The bracket is the constant $\log p_\theta(x)$ for every $z$, so its $q$-average is that constant
+    wrong:
+      - Jensen's inequality for $\log$, which happens to be tight because $q$ is normalised
+      - Bayes' rule only holds on average over $z$, and taking $\mathbb E_q$ supplies that average
+      - It is a Monte Carlo approximation that becomes exact as the number of samples grows
+    explanation: |
+      The product rule gives $p_\theta(x,z)=p_\theta(z\mid x)\,p_\theta(x)$ pointwise, so $\log p_\theta(x,z)-\log p_\theta(z\mid x)=\log p_\theta(x)$ for every $z$ in the posterior's support. It is a constant in $z$, and $\mathbb E_q$ of a constant is that constant. No inequality and no sampling is involved; that is why this route yields an *identity* with the KL term visible, rather than a bound.
+    source: Bishop PRML §9.4 (eq. 9.73); Luo 2022, "Evidence Lower Bound" (p.3)
+
+  - id: q5
+    prompt: |
+      Run exact EM on $z\sim\mathcal N(\theta,1)$, $x\mid z\sim\mathcal N(z,1)$ with one observation $x=3$, starting from $\theta=-1$. What is $\theta$ after **two** EM iterations?
+    correct: "2"
+    wrong:
+      - "3"
+      - "1.5"
+      - "1"
+    explanation: |
+      E-step: the posterior is $\mathcal N\big(\frac{\theta^{old}+x}{2},\frac12\big)$. M-step: maximising $\mathbb E_q[\log\mathcal N(z;\theta,1)]$ sets $\theta=\mathbb E_q[z]$. So $\theta$ moves halfway to $x$ each iteration: $-1\to1\to2$. The tempting 3 is the MLE. EM does not jump there in one step because the M-step fits the *current* posterior, which still remembers $\theta^{old}$. Using the prior mean 0 instead of $\theta^{old}$ in the posterior would give 1.5, and 1 is where $\theta$ is after only one iteration.
+    source: Bishop PRML §9.4; CS229 notes §11.3
+
+  - id: q6
+    prompt: |
+      The true posterior over $(z_1,z_2)$ is Gaussian with unit variances and correlation $\rho=0.6$. You fit a mean-field Gaussian $q_1(z_1)q_2(z_2)$ by minimising $\mathrm{KL}(q\|p)$. What variance does each factor get?
+    correct: "0.64"
+    wrong:
+      - "1.00"
+      - "0.40"
+      - "1.56"
+    explanation: |
+      The optimum is $v_j=1/\Lambda_{jj}$. For $\Sigma=\begin{pmatrix}1&\rho\\\rho&1\end{pmatrix}$, $\Lambda_{jj}=1/(1-\rho^2)$, so $v_j=1-\rho^2=0.64$: the *conditional* variance of $z_j$ given $z_{\neg j}$. The tempting 1.00 (the marginal variance) is what the forward KL, $\mathrm{KL}(p\|q)$, would give. 1.56 is $\Lambda_{jj}$ itself, with precision and variance swapped, and 0.40 is $1-\rho$, which mixes up correlation and variance.
+    source: Bishop PRML §10.1.2 (eqs. 10.12–10.14)
+
+  - id: q7
+    prompt: |
+      For one test image, you start from the VAE encoder's $q_\phi(z\mid x)$ and run 200 gradient steps on the ELBO with respect to *that image's own* Gaussian mean and variance, keeping $\theta$ fixed. The ELBO rises by 3 nats. What have you measured?
+    correct: At least 3 nats of amortization gap for this image
+    wrong:
+      - A 3-nat rise in $\log p_\theta(x)$ for this image
+      - A 3-nat reduction of the approximation gap
+      - A 3-nat drop in the KL from $q$ to the prior
+    explanation: |
+      $\theta$ is fixed, so $\log p_\theta(x)$ is unchanged and the 3 nats came out of the gap $\mathrm{KL}(q\|p_\theta(z\mid x))$. The Gaussian family is unchanged too, so the best-in-family bound $\mathcal L[q^*]$ (the approximation gap) did not move. The encoder simply wasn't outputting the best Gaussian for this $x$: that shortfall is the amortization gap $\mathcal L[q^*]-\mathcal L[q_\phi]$. This refinement is what semi-amortized VI does. Nothing forces the KL to the prior down; it may even go up.
+    source: Cremer et al. 2018 §1 (Table 1); Murphy PML2 §10.1.6
+
+  - id: q8
+    prompt: |
+      Why can't you estimate $\nabla_\phi\,\mathbb E_{q_\phi(z\mid x)}[f(z)]$ by drawing $z\sim q_\phi$ and computing $\nabla_\phi f(z)$, where $f$ does not depend on $\phi$ directly?
+    correct: Once $z$ is drawn, $f(z)$ ignores $\phi$, so it misses how $\phi$ moves $z$
+    wrong:
+      - It is unbiased, but its variance is too high to train with in practice
+      - It is biased because the ELBO is only a lower bound on $\log p_\theta(x)$
+      - It ignores the entropy of $q_\phi$, which is the only $\phi$-dependent term
+    explanation: |
+      $\phi$ enters only through the distribution of $z$, so $\nabla_\phi\mathbb E_{q_\phi}[f]\ne\mathbb E_{q_\phi}[\nabla_\phi f]$; the naive estimate here is zero, which is wrong rather than noisy. "Unbiased but high variance" describes a *different* estimator, the score-function (REINFORCE) one. The reparameterization trick fixes the problem by writing $z=\mu_\phi+\sigma_\phi\epsilon$, so $\phi$ sits inside $f$'s argument. Whether the objective is a bound is irrelevant to the gradient.
+    source: Kingma & Welling 2019 §2.3 (eqs. 2.18–2.19); Kingma & Welling 2014 §2.2
+
+  - id: q9
+    prompt: |
+      Two latent-variable models, trained with the same encoder family, report test ELBOs of $-100$ (model A) and $-102$ (model B) nats per example. What can you conclude about their log-likelihoods?
+    correct: "Undetermined: B's is higher if its gap exceeds A's by over 2 nats"
+    wrong:
+      - A's is higher, because the ELBO is a lower bound on log-likelihood
+      - B's is higher, because a lower bound that is lower is a tighter one
+      - A's is higher by about 2 nats, since the gaps are similar
+    explanation: |
+      $\log p=\mathcal L+\text{gap}$, and the gap $\mathrm{KL}(q\|p_\theta(z\mid x))$ depends on the model as well as on $q$. If A's posterior is easier to approximate, A can win on ELBO while losing on likelihood. "Gaps are similar" is an unjustified assumption, not a conclusion. To compare likelihoods, use a tighter estimate, such as importance sampling with many samples.
+    source: Kingma & Welling 2019 §2.2, §2.6; Cremer et al. 2018 §1
+
+  - id: q10
+    prompt: |
+      For a **continuous** latent $z$, what happens to the ELBO $\mathbb E_q[\log p_\theta(x,z)]+H(q)$ if $q$ collapses to a point mass at the MAP value $z^*$?
+    correct: It tends to $-\infty$, because the differential entropy $H(q)\to-\infty$
+    wrong:
+      - It tends to $\log p_\theta(x,z^*)$, the familiar MAP objective
+      - It tends to $\log p_\theta(x)$, since the MAP is the posterior's peak
+      - It is unchanged, since only the expected log-joint depends on $q$
+    explanation: |
+      A Gaussian with variance $s^2$ has $H=\frac12\log(2\pi e s^2)$, which goes to $-\infty$ as $s\to0$, while $\mathbb E_q[\log p_\theta(x,z)]\to\log p_\theta(x,z^*)$ stays finite. The "MAP objective" answer is right only for **discrete** $z$, where a point mass has entropy 0. That gap between the two cases is why the entropy term is what keeps $q$ from collapsing.
+    source: Murphy PML2 §10.1.1.2; Goodfellow DL §20.10.3
+
+  - id: q11
+    prompt: |
+      Estimating $p(x)$ by averaging $p(x\mid z_i)$ over prior samples has relative variance 3 per sample in a one-dimensional model. The latent now has 5 independent copies of that dimension (with $x$ split the same way). Roughly how many samples give 10% relative error?
+    correct: About $1.0\times10^5$
+    wrong:
+      - About $2.4\times10^4$
+      - About $1.5\times10^3$
+      - About $3.0\times10^2$
+    explanation: |
+      The weight is a product of 5 independent factors, so $\mathbb E[w^2]/\mathbb E[w]^2$ multiplies: $1+\text{rel. var}=(1+3)^5=1024$. The relative error of an $N$-sample mean is $\sqrt{1023/N}$, so $N\approx1023/0.01\approx1.0\times10^5$. Forgetting the "+1" gives $3^5/0.01=2.4\times10^4$. Adding the variances across dimensions gives $1.5\times10^3$. This exponential blow-up with dimension is why prior sampling is hopeless, and why we want a proposal near the posterior.
+    source: Murphy PML2 §11.5.1; Kingma & Welling 2019 §1.8
+
+  - id: q12
+    prompt: |
+      Model: $z\sim\mathcal N(0,1)$, $x\mid z\sim\mathcal N(z,4)$, with $x=5$ observed. Maximising the ELBO over $q=\mathcal N(m,s^2)$ gives:
+    correct: $\mathcal N(1,\,0.8)$
+    wrong:
+      - $\mathcal N(4,\,0.8)$
+      - $\mathcal N(1,\,1)$
+      - $\mathcal N(5,\,4)$
+    explanation: |
+      The family contains the exact posterior, so the ELBO's maximiser is the posterior. Precisions add: $1+\frac14=1.25$, giving variance $0.8$. The mean is the precision-weighted data term, $(x/4)/1.25=1$. $\mathcal N(4,0.8)$ swaps the weights, as if the prior were the noisy one. $\mathcal N(1,1)$ keeps the prior's variance. $\mathcal N(5,4)$ is the likelihood viewed as a function of $z$, ignoring the prior.
+    source: Bishop PRML §2.3.3; Murphy PML2 §10.1.2
+
+  - id: q13
+    prompt: |
+      Variational EM restricts $q$ to a Gaussian family, so the E-step cannot reach the true posterior. Which statement is **false**?
+    correct: Every iteration still increases $\log p_\theta(x)$, though by less than exact EM would
+    wrong:
+      - Every iteration with exact E- and M-step optimisation still increases (or keeps) the ELBO
+      - After the E-step, the bound generally no longer touches $\log p_\theta(x)$ at the current $\theta$
+      - Exact EM also has no guarantee of reaching the global maximum of $\log p_\theta(x)$
+    explanation: |
+      The monotonicity proof needs $\mathcal L(q,\theta^{old})=\ell(\theta^{old})$, the E-step's tightness. With a restricted family the gap stays open. Since $\ell=\mathcal L+\text{gap}$, if the M-step shrinks the gap by more than it raises the bound, $\ell$ falls even though the bound rose. The bound itself still rises, since each step maximises $\mathcal L$ in one argument. Exact EM is guaranteed only to reach a stationary point, typically a local maximum.
+    source: Murphy PML2 §10.1.3; Bishop PRML §9.4
+
+cards:
+  - id: f1
+    front: State the exact identity linking $\log p_\theta(x)$, the ELBO and a KL. Name each term.
+    back: |
+      $$\log p_\theta(x)=\mathcal L(q)+\mathrm{KL}\big(q(z\mid x)\,\|\,p_\theta(z\mid x)\big)$$
+
+      $\log p_\theta(x)$ is the evidence; $\mathcal L=\mathbb E_q[\log p_\theta(x,z)-\log q]$ is the ELBO; the KL from $q$ to the *true posterior* is the gap. It holds for every $q$, which makes $\mathcal L\le\log p_\theta(x)$ with equality iff $q=p_\theta(z\mid x)$.
+    source: Kingma & Welling 2019 §2.2 (eqs. 2.8–2.12)
+
+  - id: f2
+    front: Write the ELBO in its "energy + entropy" and "reconstruction − prior matching" forms.
+    back: |
+      $$\mathcal L=\mathbb E_q[\log p_\theta(x,z)]+H(q)$$
+
+      $$\mathcal L=\mathbb E_q[\log p_\theta(x\mid z)]-\mathrm{KL}\big(q\,\|\,p(z)\big)$$
+
+      The second uses $p_\theta(x,z)=p_\theta(x\mid z)p(z)$. Its KL is to the **prior**, unlike the gap, which is KL to the posterior.
+    source: Murphy PML2 §10.1.1.2 (eqs. 10.11–10.15)
+
+  - id: f3
+    front: Jensen's inequality for $\log$, with the equality condition.
+    back: |
+      $$\mathbb E[\log X]\le\log\mathbb E[X]$$
+
+      This holds because $\log$ is concave; for convex $f$ the direction flips. Since $\log$ is strictly concave, equality holds iff $X$ is constant with probability 1. In the ELBO, $X=p_\theta(x,z)/q(z)$ is constant in $z$ iff $q$ is the posterior.
+    source: CS229 notes §11.2, §11.3
+
+  - id: f4
+    front: Write the EM monotonicity chain, saying what justifies each step.
+    back: |
+      $$\ell(\theta^{new})\ge\mathcal L(q,\theta^{new})\ge\mathcal L(q,\theta^{old})=\ell(\theta^{old})$$
+
+      The steps are: the ELBO bounds $\ell$; the M-step maximises over $\theta$; the E-step set $q=p_{\theta^{old}}(z\mid x)$, so the gap was zero. With a restricted $q$ the last equality fails, and only the bound is monotone.
+    source: Bishop PRML §9.4; CS229 notes §11.3
+
+  - id: f5
+    front: A mean-field Gaussian $q$ is fitted to $\mathcal N(\mu,\Sigma)$ by minimising $\mathrm{KL}(q\|p)$. What are its means and variances, and how do they compare with $\mathrm{KL}(p\|q)$?
+    back: |
+      Reverse KL: $m=\mu$ and $v_j=1/\Lambda_{jj}$ with $\Lambda=\Sigma^{-1}$. This is the conditional variance, which is $\le\Sigma_{jj}$ (over-confident). Forward KL: $v_j=\Sigma_{jj}$, the marginal variance (mass-covering). For $\rho=0.9$ and unit variances: 0.19 vs 1.
+    source: Bishop PRML §10.1.2
+
+  - id: f7
+    front: Gradient of the ELBO with respect to the decoder $\theta$ vs the encoder $\phi$. Which is easy, and why?
+    back: |
+      $\theta$ is easy: $\nabla_\theta\mathcal L=\mathbb E_{q_\phi}[\nabla_\theta\log p_\theta(x,z)]$, estimated with a sample from $q_\phi$. $\phi$ is hard because the distribution being averaged over depends on $\phi$, so the gradient cannot be pushed inside. It needs the reparameterization trick or the score-function estimator.
+    source: Kingma & Welling 2019 §2.3 (eqs. 2.14–2.19)
+
+  - id: f13
+    front: Why is $\log\frac1K\sum_{k=1}^K w_k$, with $w_k=p_\theta(x,z_k)/q(z_k)$ and $z_k\sim q$, biased low for $\log p_\theta(x)$? What is its expectation at $K=1$?
+    back: |
+      Each $w_k$ has mean $p_\theta(x)$, so the average is unbiased for $p_\theta(x)$. But $\log$ is concave, so by Jensen $\mathbb E[\log\bar w]\le\log\mathbb E[\bar w]=\log p_\theta(x)$. At $K=1$ the expectation is $\mathbb E_q[\log w]$, which is exactly the ELBO. Averaging more weights reduces their spread, so the Jensen gap shrinks as $K$ grows (the IWAE bound, gen.vae-variants).
+    source: Kingma & Welling 2019 §2.6; Burda et al. 2016 Thm 1
+
+  - id: f9
+    type: open
+    front: Derive the ELBO two ways at a whiteboard, and say what each derivation shows that the other doesn't.
+    back: |
+      **Jensen route.**
+
+      $$\begin{aligned}\log p(x)&=\log\textstyle\int q\,\frac{p(x,z)}{q}\,dz\\&=\log\mathbb E_q[w]\ge\mathbb E_q[\log w]\end{aligned}$$
+
+      with $w=p(x,z)/q(z)$. It shows the importance-sampling origin, and that the bound is tight iff $w$ is constant, i.e. $q\propto p(x,z)$, which is the posterior. It also motivates tighter multi-sample bounds.
+
+      **Identity route.** $\log p(x)=\log p(x,z)-\log p(z\mid x)$ for every $z$. Take $\mathbb E_q$, then add and subtract $\log q$:
+
+      $$\log p(x)=\underbrace{\mathbb E_q\big[\log\tfrac{p(x,z)}{q}\big]}_{\mathcal L}+\mathrm{KL}(q\|p(z\mid x)).$$
+
+      It gives the **size** of the gap. It shows that maximising over $q$ is exactly minimising the reverse KL to the posterior (inference), while over $\theta$ it is approximate MLE. It also shows the bias: the ELBO prefers models whose posteriors fit the family.
+
+      Finish with the reconstruction − KL-to-prior form, and point out that the two KLs are different.
+    source: Kingma & Welling 2019 §2.2; Luo 2022, "Evidence Lower Bound" (p.2–4)
+
+  - id: f10
+    type: open
+    front: Explain to an interviewer why we can't just Monte-Carlo $p(x)$ in a latent-variable model, and how that leads to the ELBO.
+    back: |
+      1. $p_\theta(x)=\int p_\theta(x\mid z)p(z)dz$ has no closed form with a neural decoder, and the posterior needs it as a normaliser.
+      2. Naive MC averages $p_\theta(x\mid z_i)$ over $z_i\sim p(z)$. It is unbiased, but nearly all prior draws explain $x$ badly. The relative variance is $\mathbb E[w^2]/\mathbb E[w]^2-1$, and for independent latent dimensions $1+$ that multiplies, so the sample count grows exponentially with $\dim z$. In a 1-D toy with $\sigma=0.1$ and $x=2.5$, about 15,000 samples are needed for 10% error; with 10 such dimensions, about $10^{24}$.
+      3. Importance sampling fixes this: $p_\theta(x)=\mathbb E_q[p_\theta(x,z)/q]$, and the zero-variance $q$ is the posterior.
+      4. We can't get the posterior, so we learn an approximation $q$. We can't take the log of an expectation cheaply or unbiasedly either, so we move the log inside with Jensen. That gives a bound whose gap is $\mathrm{KL}(q\|p(z\mid x))$.
+      5. Optimising this bound jointly over $q$ (inference) and $\theta$ (learning) is variational inference/EM, and with an encoder it is the VAE.
+    source: Kingma & Welling 2019 §1.8, §2.1–2.2; Murphy PML2 §11.5.1
+
+  - id: f11
+    type: open
+    front: Present EM as coordinate ascent on the ELBO, prove monotonicity, and say what changes when the posterior is intractable.
+    back: |
+      - Write $\ell(\theta)=\mathcal L(q,\theta)+\mathrm{KL}(q\|p_\theta(z\mid x))$.
+      - **E-step:** with $\theta$ fixed, maximise over $q$. $\ell$ is constant in $q$, so the optimum zeroes the KL: $q=p_{\theta^{old}}(z\mid x)$.
+      - **M-step:** with $q$ fixed, maximise over $\theta$. The entropy is constant, so this maximises $\mathbb E_q[\log p_\theta(x,z)]$ (closed form for exponential-family joints, e.g. GMM weighted means and covariances).
+      - **Monotone:** $\ell(\theta^{new})\ge\mathcal L(q,\theta^{new})\ge\mathcal L(q,\theta^{old})=\ell(\theta^{old})$. EM converges to a stationary point, possibly a local optimum. Toy example: $z\sim\mathcal N(\theta,1)$, $x\mid z\sim\mathcal N(z,1)$ gives $\theta\leftarrow(\theta+x)/2$, halving the error each step.
+      - **Intractable posterior:** restrict $q\in\mathcal Q$ (variational EM). The E-step no longer closes the gap, so only $\mathcal L$ is monotone and $\ell$ may dip. Replacing exact steps by joint stochastic gradient steps on $(\phi,\theta)$, with an amortized encoder, gives the VAE.
+    source: Bishop PRML §9.4; CS229 notes §11.3; Murphy PML2 §10.1.3, §10.1.5
+
+  - id: f12
+    type: open
+    front: Why does variational inference tend to under-estimate posterior uncertainty? Back it with a calculation.
+    back: |
+      - VI minimises $\mathrm{KL}(q\|p)=\mathbb E_q[\log q-\log p]$. Mass in regions where $p\approx0$ costs $-\log p\to\infty$, while uncovered regions of $p$ cost nothing. So $q$ is zero-forcing and mode-seeking.
+      - **Calculation:** fit $q=\mathcal N(m,\mathrm{diag}\,v)$ to $p=\mathcal N(\mu,\Lambda^{-1})$. Using $\mathbb E_q[(z-\mu)^\top\Lambda(z-\mu)]=(m-\mu)^\top\Lambda(m-\mu)+\sum_j\Lambda_{jj}v_j$, the KL is $\frac12\sum_j(\Lambda_{jj}v_j-\log v_j)$ plus a mean term and a constant. Minimising gives $m=\mu$ and $v_j=1/\Lambda_{jj}$, the conditional variance, which is $\le\Sigma_{jj}$ by Cauchy–Schwarz. With $\rho=0.9$ this is 0.19 vs 1.
+      - The forward KL would moment-match ($v_j=\Sigma_{jj}$), but it needs expectations under $p$, which is exactly what we can't compute.
+      - Remedies: richer families (full-rank, flows), or importance-weighted bounds.
+    source: Bishop PRML §10.1.2; Murphy PML2 §10.1.2
+
+reading:
+  - title: "Kingma & Welling (2019), An Introduction to Variational Autoencoders, §1.7–2.3"
+    url: https://arxiv.org/abs/1906.02691
+    kind: paper
+    note: The cleanest modern treatment of the intractability, the KL-gap derivation of the ELBO and the "two for one" view.
+  - title: "Bishop, Pattern Recognition and Machine Learning, §9.4 and §10.1"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: §9.4 has the classic EM-as-bound-maximisation figures; §10.1.2 has the mean-field-on-a-correlated-Gaussian result and its picture.
+  - title: "Murphy, Probabilistic Machine Learning: Advanced Topics, §10.1"
+    url: https://probml.github.io/pml-book/book2.html
+    kind: book
+    note: Free-energy and ELBO views side by side, variational EM, stochastic and amortized VI, and the amortization gap.
+  - title: "Stanford CS229 lecture notes, ch. 11 (EM algorithms)"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: A gentle Jensen-first derivation with the tightness argument spelled out, then the general EM algorithm.
+  - title: "Luo (2022), Understanding Diffusion Models: A Unified Perspective, pp. 2–5"
+    url: https://arxiv.org/abs/2208.11970
+    kind: paper
+    note: Both ELBO derivations with every step labelled; the same ELBO later becomes the diffusion objective.

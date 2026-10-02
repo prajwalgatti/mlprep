@@ -1,0 +1,483 @@
+id: fund.gradient-descent
+area: fundamentals
+title: "Gradient Descent: Convergence & Conditioning"
+summary: Why −∇f is the steepest direction, how curvature limits the step (η < 2/λ_max), the descent lemma and GD's rates, why ill-conditioning makes it slow, and how preconditioning fixes it.
+order: 106
+level: core
+tags: [optimization, gradient-descent, convergence, conditioning]
+prereqs: [fund.convexity]
+
+explainer:
+  - title: "The problem: descend using only the slope"
+    body: |
+      We want to minimize a differentiable function $f:\mathbb{R}^d\to\mathbb{R}$, for example a training loss as a function of the parameters $x$. There is no closed-form minimizer, but we can evaluate $f$ and its gradient $\nabla f$ at any point. So we iterate: $x_{k+1}=x_k+v_k$. Which step $v$?
+
+      **First-order Taylor model.** Near $x$,
+
+      $$f(x+v)\approx f(x)+\nabla f(x)^\top v.$$
+
+      The change is the directional derivative $\nabla f^\top v$. Fix the step length $\|v\|=r$. By Cauchy–Schwarz, $\nabla f^\top v\ge-\|\nabla f\|\,r$, with equality only when $v$ points along $-\nabla f$. So the negative gradient is the **steepest-descent direction** (in the Euclidean norm). Any direction with $\nabla f^\top v<0$ also decreases $f$ for small enough steps; these are called descent directions.
+
+      **Gradient descent (GD):**
+
+      $$x_{k+1}=x_k-\eta\,\nabla f(x_k)$$
+
+      The step size $\eta>0$ is the **learning rate**. Why not take a huge step? The linear model is only accurate near $x$. Far away the function curves, and a long step can overshoot and *increase* $f$. The rest of this lesson is about exactly that: how curvature limits $\eta$, and how that limit sets the speed.
+
+      **Notation.** $g=\nabla f(x)$ is the gradient and $H=\nabla^2 f(x)$ the Hessian (the matrix of second derivatives, symmetric for smooth $f$). Its eigenvalues are the curvatures along its eigenvectors. Sources name the learning rate differently: $\epsilon$ (Goodfellow et al.), $t$ (Boyd), $\eta$ or $\alpha$ elsewhere.
+
+      "Steepest" depends on how you measure step length. Measured in another norm, the steepest direction changes; that idea returns as preconditioning.
+    source: Boyd CVX §9.3, §9.4; Murphy PML1 §8.2.1; Goodfellow DL §4.3
+
+  - title: "What curvature does to a step"
+    body: |
+      Use the **second-order** Taylor model at $x$, and step along $-g$:
+
+      $$f(x-\eta g)\approx f(x)-\eta\,g^\top g+\tfrac{\eta^2}{2}\,g^\top Hg$$
+
+      Read the three terms as: where we are; the decrease the slope promises (linear in $\eta$); and a curvature correction (quadratic in $\eta$). When the last term exceeds the second, the step goes *uphill*.
+
+      **Best step along $g$.** If $g^\top Hg>0$, the model is a parabola in $\eta$. Setting its derivative $-g^\top g+\eta\,g^\top Hg$ to zero gives
+
+      $$\eta^*=\frac{g^\top g}{g^\top Hg}.$$
+
+      The ratio $g^\top Hg/g^\top g$ (a Rayleigh quotient) is a weighted average of $H$'s eigenvalues, weighted by the squared components of $g$ in the eigenbasis. So it lies between $\lambda_{min}$ and $\lambda_{max}$, and $1/\lambda_{max}\le\eta^*\le1/\lambda_{min}$. In the worst case, $g$ lies along the top eigenvector and $\eta^*=1/\lambda_{max}$.
+
+      **Example.** $H=\mathrm{diag}(1,10)$, $g=(1,1)$: $g^\top g=2$ and $g^\top Hg=11$, so $\eta^*=2/11\approx0.18$. A step longer than $2\eta^*=4/11$ makes the model predict an *increase*.
+
+      **Why this matters for networks.** Goodfellow et al. report that during training the gradient norm often barely shrinks while $g^\top Hg$ grows by more than an order of magnitude. Then the learning rate must shrink to compensate for the curvature, and progress slows even though the gradient is still large. This is **ill-conditioning**.
+
+      **Edge case.** If $g^\top Hg\le0$ (zero or negative curvature along $g$), the quadratic model predicts unlimited decrease. The model is wrong far from $x$, so $\eta$ must then be chosen heuristically.
+    source: Goodfellow DL §4.3.1 (eqs. 4.9–4.10), §8.2.1
+
+  - title: "Exact analysis on a quadratic"
+    body: |
+      Take $f(x)=\tfrac12x^\top Ax$ with $A$ symmetric positive definite, eigenvalues $\lambda_i$ and orthonormal eigenvectors $u_i$. Then $\nabla f=Ax$ and GD is linear:
+
+      $$x_{k+1}=(I-\eta A)\,x_k.$$
+
+      Let $c_i=u_i^\top x$ be the coordinate along $u_i$. Since $Au_i=\lambda_iu_i$, the coordinates decouple, and each one is scaled by the same factor every step:
+
+      $$c_{i,k}=(1-\eta\lambda_i)^k\,c_{i,0}.$$
+
+      **Stability.** All coordinates shrink iff $|1-\eta\lambda_i|<1$ for every $i$, that is iff
+
+      $$0<\eta<\frac{2}{\lambda_{max}}.$$
+
+      **Best fixed step.** The slowest coordinate sets the rate $\rho(\eta)=\max_i|1-\eta\lambda_i|$, which is the larger of $|1-\eta\lambda_{min}|$ and $|1-\eta\lambda_{max}|$. The first falls and the second rises with $\eta$; they cross where $1-\eta\lambda_{min}=\eta\lambda_{max}-1$:
+
+      $$\eta^*=\frac{2}{\lambda_{max}+\lambda_{min}},\quad\rho^*=\frac{\kappa-1}{\kappa+1}$$
+
+      Here $\kappa=\lambda_{max}/\lambda_{min}$ is the **condition number**.
+
+      ![$|1-\eta\lambda|$ for $\lambda=1$ and $\lambda=10$. The rate is set by the worse of the two; the best step balances them at the crossing.](fund.gradient-descent/eigen-contraction)
+
+      **Worked example.** $f=\tfrac12(x^2+100y^2)$, so $\kappa=100$.
+      - GD diverges for $\eta>0.02$. At exactly $0.02$, $y$ flips sign forever without shrinking.
+      - $\eta^*=2/101\approx0.0198$ gives $\rho^*=99/101\approx0.980$ per step. Cutting the distance to the optimum 100-fold takes $\ln100/\ln(101/99)\approx230$ steps.
+      - With $\eta=1/\lambda_{max}=0.01$, $y$ is solved in one step but $x$ shrinks only by $0.99$ per step: about 458 steps.
+
+      The distance contracts by $\rho$ per step, and the function gap by $\rho^2$. Near any smooth minimum, $f$ is approximately quadratic with $A=H(x^*)$, so this analysis governs the final phase of convergence.
+
+      ![Best-fixed-step GD on a quadratic with $\kappa=2$ and with $\kappa=20$. The stiff direction overshoots and flips sign while the flat direction crawls.](fund.gradient-descent/zigzag)
+    source: Murphy PML1 §8.2.2–8.2.3; Goodfellow DL §4.3.1; Cohen et al. 2021 §2
+
+  - title: "Smoothness and the descent lemma"
+    body: |
+      For a non-quadratic $f$, we need an assumption that limits curvature. **Refresher:** $f$ is $L$-**smooth** if its gradient is $L$-Lipschitz, $\|\nabla f(x)-\nabla f(y)\|\le L\|x-y\|$. For twice-differentiable $f$ this means every Hessian eigenvalue has magnitude at most $L$.
+
+      **Quadratic upper bound.** Along the segment from $x$ to $y$, the gradient changes by at most $L$ times the distance travelled. Integrating that change gives
+
+      $$f(y)\le f(x)+\nabla f(x)^\top(y-x)+\tfrac L2\|y-x\|^2.$$
+
+      **Descent lemma.** Put $y=x^+=x-\eta\nabla f(x)$:
+
+      $$\begin{aligned} f(x^+)&\le f(x)-\eta\|\nabla f\|^2+\tfrac{L\eta^2}{2}\|\nabla f\|^2\\ &=f(x)-\eta\big(1-\tfrac{L\eta}{2}\big)\|\nabla f\|^2\end{aligned}$$
+
+      - Decrease is **guaranteed for $0<\eta<2/L$**, the same threshold as on a quadratic with $L=\lambda_{max}$.
+      - The guaranteed decrease is largest at $\eta=1/L$: $f(x^+)\le f(x)-\|\nabla f\|^2/(2L)$.
+      - No convexity was used. The lemma holds for non-convex $f$ as long as it is smooth.
+
+      **Line search, when $L$ is unknown.** *Backtracking* (the Armijo rule) starts from $t=1$ and multiplies $t$ by $\beta\in(0,1)$ until
+
+      $$f(x-t\nabla f)\le f(x)-c\,t\,\|\nabla f\|^2$$
+
+      with a constant $c\in(0,\tfrac12)$. By the descent lemma, any $t\le1/L$ passes, because then $1-Lt/2\ge\tfrac12>c$. So the search stops with $t\ge\beta/L$, and GD keeps the same rates up to constants. *Exact* line search instead minimizes $f$ along the ray.
+
+      Deep learning rarely uses either. Each trial step costs a forward pass, and with minibatches the loss values themselves are noisy. Fixed learning-rate schedules take their place (fund.sgd-momentum).
+    source: Bottou et al. 2018 §4.1 (eq. 4.3, Lemma 4.2); Boyd CVX §9.3.1; Murphy PML1 §8.2.2
+
+  - title: "Convergence rates: what GD guarantees"
+    body: |
+      All three results use $\eta=1/L$. Note that each one bounds a *different* quantity.
+
+      **Non-convex, $L$-smooth, bounded below by $f_{inf}$.** Sum the descent lemma over $K$ steps. The left side telescopes:
+
+      $$\frac1{2L}\sum_{k<K}\|\nabla f(x_k)\|^2\le f(x_0)-f_{inf}.$$
+
+      So $\min_k\|\nabla f(x_k)\|^2\le2L(f(x_0)-f_{inf})/K$. GD reaches an approximately **stationary point** at rate $O(1/K)$ in squared gradient norm. That point may be a saddle.
+
+      **$\mu$-strongly convex.** Refresher: $f(y)\ge f(x)+\nabla f^\top(y-x)+\frac\mu2\|y-x\|^2$ for all $x,y$. Minimize both sides over $y$. The right side is smallest at $y=x-\nabla f/\mu$, giving $f^*\ge f(x)-\|\nabla f\|^2/(2\mu)$, so
+
+      $$\|\nabla f(x)\|^2\ge2\mu\,(f(x)-f^*).$$
+
+      In words: far from optimal, the gradient must be large. Substitute into the descent lemma:
+
+      $$f(x^+)-f^*\le\Big(1-\frac{\mu}{L}\Big)(f(x)-f^*)$$
+
+      This is **linear convergence**: the error falls below $\varepsilon$ after about $\kappa\ln(1/\varepsilon)$ steps, with $\kappa=L/\mu$.
+
+      **Convex but not strongly convex.** The rate is **sublinear**, $f(x_k)-f^*\le L\|x_0-x^*\|^2/(2k)$. Sketch: combine the descent lemma with convexity, $f(x)\le f^*+\nabla f^\top(x-x^*)$, and complete the square:
+
+      $$f(x^+)-f^*\le\tfrac L2\big(\|x-x^*\|^2-\|x^+-x^*\|^2\big)$$
+
+      Summing over steps telescopes the right side. Since $f(x_k)$ never increases, $k\,(f(x_k)-f^*)\le\frac L2\|x_0-x^*\|^2$.
+
+      Nesterov's accelerated method improves $O(1/k)$ to $O(1/k^2)$, the best possible for first-order methods on this class.
+    source: Bottou et al. 2018 §4.3 (Thm 4.8 with M = 0), §7.2; Boyd CVX §9.1.2, §9.3.1
+
+  - title: "Preconditioning: change the geometry"
+    body: |
+      GD's speed depends on $\kappa$, and $\kappa$ depends on the coordinates. Take $f=\tfrac12(x^2+100y^2)$ ($\kappa=100$) and substitute $y=u/10$. Then $f=\tfrac12(x^2+u^2)$, which has $\kappa=1$, and GD with $\eta=1$ lands on the optimum in one step. Same problem, different parameterization, so GD is **not invariant to linear reparameterization**. (Newton's method is; see fund.newton.)
+
+      **Preconditioned GD:**
+
+      $$x\leftarrow x-\eta\,P^{-1}\nabla f(x),\quad P\succ0$$
+
+      Two equivalent readings:
+      - It is steepest descent when step length is measured in the norm $\|v\|_P=\sqrt{v^\top Pv}$.
+      - It is plain GD in new coordinates $\bar x=P^{1/2}x$. To see this, let $\bar f(\bar x)=f(P^{-1/2}\bar x)$. Its gradient is $P^{-1/2}\nabla f$. A GD step in $\bar x$ is $-\eta P^{-1/2}\nabla f$, which maps back to $-\eta P^{-1}\nabla f$ in $x$. The Hessian in the new coordinates is $P^{-1/2}HP^{-1/2}$.
+
+      **Choosing $P$.** If $P\approx H$, the transformed Hessian is close to $I$ and $\kappa\approx1$. $P=H$ exactly is Newton's method, which is too expensive for large models. Practical versions:
+      - **Feature scaling and whitening** for linear models (fund.whitening). The least-squares Hessian is $X^\top X$, so rescaling a feature rescales that feature's row and column of $H$.
+      - **Diagonal $P$ from gradient statistics**: AdaGrad, RMSProp and Adam (fund.adaptive-lr, fund.adam).
+      - **Structured approximations** such as K-FAC and Shampoo (fund.second-order).
+
+      A diagonal $P$ can only fix ill-conditioning that is aligned with the coordinate axes. A valley that runs diagonally needs off-diagonal curvature information.
+    source: Boyd CVX §9.4.1, §9.4.4
+
+  - title: "Non-convex landscapes and deep nets"
+    body: |
+      **Critical points** ($\nabla f=0$) are classified by the Hessian's eigenvalues: all positive gives a minimum, all negative a maximum, mixed signs a **saddle**. For many classes of random high-dimensional functions, saddles vastly outnumber minima. A coin-flip heuristic explains why: a minimum needs all $d$ eigenvalues positive. Critical points with high loss tend to be saddles, and Dauphin et al. found many high-loss saddles in real networks.
+
+      **GD near a saddle.** Take $f=\tfrac12x^2-\tfrac12y^2$. GD multiplies $x$ by $(1-\eta)$ and $y$ by $(1+\eta)$ each step. So it escapes along $y$ exponentially, but slowly if it starts close. With $\eta=0.1$ and $y_0=10^{-8}$, reaching $|y|=1$ takes $\ln10^8/\ln1.1\approx193$ steps: a **plateau** in the loss curve. Started exactly at $y_0=0$, GD converges to the saddle; gradient noise breaks this. Newton's method, by contrast, is *attracted* to saddles, because it solves for $\nabla f=0$.
+
+      **Other obstacles.**
+      - Wide flat regions, where gradient and Hessian both vanish.
+      - **Cliffs**: products of many large weights create steep walls, and one step can catapult the parameters far away. The remedy is gradient clipping (sys.tuning-diagnostics, fund.rnn).
+
+      **Curvature changes during training.** The quadratic analysis assumed a fixed Hessian. In real networks the **sharpness** $\lambda_1$ (the top Hessian eigenvalue) moves. Under full-batch GD it tends to *rise* (progressive sharpening) until it reaches about $2/\eta$. It then hovers there while the loss keeps falling, non-monotonically over short spans (the **edge of stability**; Cohen et al. 2021). So the quadratic picture correctly predicts the threshold, but not what happens at it. Gilmer et al. (2021) linked divergence to runs that entered regions with $\lambda_1>2/\eta$ and failed to leave. sys.tuning-diagnostics covers the momentum and Adam versions and how warmup helps.
+    source: Goodfellow DL §8.2.3, §8.2.4; Cohen et al. 2021 §3.1; Gilmer et al. 2021 §1
+
+  - title: "Pitfalls and common wrong answers"
+    body: |
+      - **Three different step sizes.** $2/L$ is the stability limit (and the limit of guaranteed descent). $1/L$ maximizes the guaranteed decrease in the descent lemma. $2/(\lambda_{max}+\lambda_{min})$ gives the best rate on a quadratic. Know which question is being asked.
+      - **Rates measure different things**: the function gap, the distance $\|x-x^*\|$, or the gradient norm. On a quadratic the gap contracts by the square of the distance factor.
+      - **"GD converges linearly on convex smooth functions."** Only with strong convexity (or the gradient-domination inequality $\|\nabla f\|^2\ge2\mu(f-f^*)$). A convex function that is very flat at its minimum, such as $x^4$, converges sublinearly.
+      - **A small gradient does not mean a minimum.** It could be a saddle or a plateau. The converse also fails in practice: Goodfellow et al. show a convolutional network whose gradient norm *grew* throughout a successful training run. Networks often don't approach any critical point.
+      - **Divergence can be delayed.** If the stiff direction starts with a tiny component, the loss first falls (the flat directions dominate) and only later explodes once $|1-\eta\lambda_{max}|^k$ has amplified that component. Rising loss after a good start can still mean $\eta>2/\lambda_{max}$.
+      - **Condition-number rates aren't literal for networks.** Their Hessians have near-zero and negative eigenvalues, so $\kappa$ is not even defined. Use the analysis for its mechanisms (stiff directions cap $\eta$, flat directions set the speed), not its numbers.
+    source: Boyd CVX §9.3; Goodfellow DL §8.2.1 (Fig. 8.1); Murphy PML1 §8.2.3
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Why the negative gradient?"* It minimizes the first-order Taylor change $\nabla f^\top v$ over steps of fixed length (Cauchy–Schwarz). It is steepest only in the Euclidean norm.
+      - *"Largest stable learning rate on a quadratic?"* Decouple into eigendirections: $c_i\leftarrow(1-\eta\lambda_i)c_i$, so $\eta<2/\lambda_{max}$. The best fixed step is $2/(\lambda_{max}+\lambda_{min})$, with rate $(\kappa-1)/(\kappa+1)$.
+      - *"Why is GD slow when $\kappa$ is large?"* The stiffest direction caps $\eta$ at about $2/\lambda_{max}$. The flattest direction then shrinks by only $1-\eta\lambda_{min}\approx1-2/\kappa$ per step, so the step count grows linearly in $\kappa$.
+      - *"Prove that GD converges."* Quadratic upper bound, then the descent lemma. Add strong convexity for a linear rate. Telescope for the non-convex stationary-point rate.
+      - *"How would you speed it up?"* Momentum ($\sqrt\kappa$ instead of $\kappa$; fund.sgd-momentum), preconditioning or normalization, or second-order methods.
+      - *"Does GD get stuck at saddle points?"* Generically no: it escapes along negative curvature exponentially, but can plateau when it starts near one. Newton's method is the one attracted to saddles.
+      - *"Why no line search in deep learning?"* Each trial costs a forward pass, and minibatch losses are noisy.
+      - *"How does this connect to training instability?"* The sharpness rises toward $2/\eta$ during training. Exceeding it in the quadratic model means divergence along the top eigenvector; see sys.tuning-diagnostics.
+    source: Boyd CVX §9.3–9.4; Goodfellow DL §4.3.1, §8.2.3; Cohen et al. 2021 §2–3
+
+  - title: "Key results"
+    body: |
+      - Update $x\leftarrow x-\eta\nabla f$. Along $g$: $f(x-\eta g)\approx f-\eta g^\top g+\frac{\eta^2}2g^\top Hg$, so the best step is $\eta^*=g^\top g/g^\top Hg\in[1/\lambda_{max},1/\lambda_{min}]$.
+      - Quadratic: each eigencoordinate scales by $1-\eta\lambda_i$. Stable iff $\eta<2/\lambda_{max}$.
+
+      $$\eta^*=\frac{2}{\lambda_{max}+\lambda_{min}},\quad\rho^*=\frac{\kappa-1}{\kappa+1}$$
+
+      - Descent lemma ($L$-smooth):
+
+      $$f(x^+)\le f(x)-\eta\big(1-\tfrac{L\eta}{2}\big)\|\nabla f\|^2$$
+
+      - Rates at $\eta=1/L$: non-convex $\min_k\|\nabla f\|^2=O(1/K)$; convex $f-f^*\le L\|x_0-x^*\|^2/(2k)$; strongly convex $(1-\mu/L)^k$, about $\kappa\ln(1/\varepsilon)$ steps. Nesterov: $O(1/k^2)$.
+      - Strong convexity gives $\|\nabla f\|^2\ge2\mu(f-f^*)$.
+      - Preconditioning $x\leftarrow x-\eta P^{-1}\nabla f$ is GD in coordinates $P^{1/2}x$; $P\approx H$ makes $\kappa\approx1$.
+      - Saddles dominate in high dimensions. GD escapes them, but slowly from nearby starts. In training, sharpness rises to about $2/\eta$ (edge of stability).
+    source: Goodfellow DL §4.3.1; Boyd CVX §9.3–9.4; Bottou et al. 2018 §4; Cohen et al. 2021
+
+quiz:
+  - id: q1
+    prompt: |
+      GD on $f=\tfrac12(x^2+100y^2)$ with a fixed step. Which step size minimizes the worst-case per-step contraction of $\|x_k-x^*\|$, and what is that contraction?
+    correct: '$\eta=2/101$, contraction $99/101\approx0.980$'
+    wrong:
+      - '$\eta=1/100$, contraction $99/100=0.990$'
+      - '$\eta=2/100$, contraction $98/100=0.980$'
+      - '$\eta=1/101$, contraction $100/101\approx0.990$'
+    explanation: |
+      The rate is $\max(|1-\eta\cdot1|,|1-\eta\cdot100|)$, minimized where the two are equal: $\eta=2/101$, giving $99/101$. The tempting $\eta=0.02$ sits exactly on the stability limit: the $y$-coordinate is multiplied by $-1$ every step and never shrinks, so the contraction there is 1. $\eta=1/100$ converges, but the $x$-coordinate then shrinks only by 0.99.
+    source: Murphy PML1 §8.2.3; Goodfellow DL §4.3.1
+
+  - id: q2
+    prompt: |
+      At a point with Hessian $H=\mathrm{diag}(1,10)$ and gradient $g=(2,1)$, what step along $-g$ minimizes the second-order Taylor model?
+    correct: '$5/14\approx0.36$'
+    wrong:
+      - '$1/10=0.10$'
+      - '$5/41\approx0.12$'
+      - '$14/5=2.8$'
+    explanation: |
+      $\eta^*=g^\top g/g^\top Hg=(4+1)/(4\cdot1+1\cdot10)=5/14$. $1/\lambda_{max}=0.1$ is the worst case, which applies only when $g$ lies along the top eigenvector. Here most of $g$ is in the low-curvature direction, so the best step is longer. $5/41$ comes from swapping which component meets which curvature.
+    source: Goodfellow DL §4.3.1 (eq. 4.10)
+
+  - id: q3
+    prompt: |
+      ![Log loss vs step for GD on $f=\tfrac12(x^2+10y^2)$ from $(1,10^{-3})$, at four step sizes.](fund.gradient-descent/lr-regimes)
+
+      Here $\lambda_{max}=10$, so $2/\lambda_{max}=0.2$. Which panel uses a step size **above** 0.2?
+    correct: C
+    wrong:
+      - A
+      - B
+      - D
+    explanation: |
+      In C the loss first falls, because the $x$-direction dominates and shrinks, and then rises steadily: the tiny $y$-component is multiplied by $|1-10\eta|>1$ every step and eventually takes over. A ($\eta=0.195$) has a slow tail because $|1-1.95|=0.95$ is close to 1, but it still converges. B is a small step ($0.02$) and D is $\eta=1/\lambda_{max}=0.1$. An initial decrease does not rule out $\eta>2/\lambda_{max}$.
+    source: Goodfellow DL §4.3.1; Cohen et al. 2021 §2
+
+  - id: q4
+    prompt: |
+      A function is $L$-smooth and $\mu$-strongly convex with $\kappa=L/\mu=100$. Using the bound $f(x_k)-f^*\le(1-\mu/L)^k(f(x_0)-f^*)$ with $\eta=1/L$, about how many steps guarantee a $10^6$-fold reduction of the gap?
+    correct: About 1,400
+    wrong:
+      - About 140
+      - About 14
+      - About 14,000
+    explanation: |
+      $k=\ln10^6/(-\ln0.99)\approx1375$, which matches the rule of thumb $\kappa\ln(1/\varepsilon)=100\times13.8\approx1380$. About 140 is what you'd get with $\sqrt\kappa$ in place of $\kappa$; that is momentum's rate, not GD's.
+    source: Boyd CVX §9.3.1 (eq. 9.18–9.19)
+
+  - id: q5
+    prompt: |
+      Which statement about gradient descent with $\eta=1/L$ is **false**?
+    correct: On convex $L$-smooth functions, the gap $f(x_k)-f^*$ shrinks linearly
+    wrong:
+      - On non-convex $L$-smooth functions, $\min_k\|\nabla f(x_k)\|^2$ is $O(1/K)$
+      - On $\mu$-strongly convex functions, the gap shrinks by $(1-\mu/L)$ per step
+      - Nesterov acceleration improves the convex rate from $O(1/k)$ to $O(1/k^2)$
+    explanation: |
+      Convexity plus smoothness gives only the sublinear rate $L\|x_0-x^*\|^2/(2k)$. A linear rate needs strong convexity, or at least the gradient-domination inequality $\|\nabla f\|^2\ge2\mu(f-f^*)$. The other three statements are the standard results.
+    source: Bottou et al. 2018 §4.3, §7.2; Boyd CVX §9.3.1
+
+  - id: q6
+    prompt: |
+      The descent lemma $f(x^+)\le f(x)-\eta(1-\tfrac{L\eta}2)\|\nabla f\|^2$ follows from substituting $x^+=x-\eta\nabla f$ into which inequality?
+    correct: The quadratic upper bound implied by an $L$-Lipschitz gradient
+    wrong:
+      - The tangent-line lower bound implied by convexity of $f$
+      - The quadratic lower bound implied by strong convexity of $f$
+      - The Cauchy–Schwarz bound on the first-order Taylor term
+    explanation: |
+      Smoothness gives $f(y)\le f(x)+\nabla f^\top(y-x)+\frac L2\|y-x\|^2$, an *upper* bound, which is what you need to prove that $f$ decreases. Convexity and strong convexity give *lower* bounds. They enter the rate proofs later, but they can't show decrease, and the lemma holds without them.
+    source: Bottou et al. 2018 §4.1 (eq. 4.3)
+
+  - id: q7
+    prompt: |
+      In the linear-rate proof for strongly convex $f$, the step $\|\nabla f(x)\|^2\ge2\mu(f(x)-f^*)$ is obtained how?
+    correct: Minimize both sides of the strong-convexity lower bound over $y$
+    wrong:
+      - Substitute $x^+=x-\nabla f/L$ into the quadratic upper bound
+      - Apply Jensen's inequality to $f$ along the segment to $x^*$
+      - Set $y=x^*$ in the strong-convexity bound and drop the quadratic
+    explanation: |
+      $f(y)\ge f(x)+\nabla f^\top(y-x)+\frac\mu2\|y-x\|^2$ holds for all $y$. Minimizing the left side gives $f^*$, and minimizing the right side gives $f(x)-\|\nabla f\|^2/(2\mu)$. Setting $y=x^*$ and dropping the quadratic only gives $f^*\ge f(x)+\nabla f^\top(x^*-x)$, which still involves the unknown $x^*$. The first distractor is the descent lemma, the other half of the proof.
+    source: Boyd CVX §9.1.2; Bottou et al. 2018 §4.2 (eq. 4.12)
+
+  - id: q8
+    prompt: |
+      For $f=\tfrac12(x^2+100y^2)$, you reparameterize $y=u/10$ and run GD on $(x,u)$. What changes?
+    correct: The condition number drops to 1; GD with $\eta=1$ converges in one step
+    wrong:
+      - Nothing, because GD's iterates are invariant to linear reparameterization
+      - The condition number rises to $10^4$, so GD needs far more steps
+      - The minimizer moves, so GD converges to a different point in $(x,y)$
+    explanation: |
+      In $(x,u)$, $f=\tfrac12(x^2+u^2)$ has Hessian $I$, so one step with $\eta=1$ lands on the optimum. Mapping back, this is preconditioned GD on the original problem with $P=\mathrm{diag}(1,100)$. Newton's method is the one that is invariant to linear reparameterization; GD is not.
+    source: Boyd CVX §9.4.1, §9.4.4
+
+  - id: q9
+    prompt: |
+      GD with $\eta=0.1$ on $f=\tfrac12x^2-\tfrac12y^2$, started at $(1,10^{-8})$. About how many steps until $|y|$ reaches 1?
+    correct: About 190
+    wrong:
+      - About 80
+      - It never does; GD converges to the saddle
+      - About 1,800
+    explanation: |
+      $y$ is multiplied by $1+\eta=1.1$ each step, so $k=\ln10^8/\ln1.1\approx193$. GD converges to the saddle only if $y_0$ is *exactly* 0, a measure-zero set. A small nonzero component grows exponentially, but the plateau lasts a long time when it starts tiny.
+    source: Goodfellow DL §8.2.3
+
+  - id: q10
+    prompt: |
+      Cohen et al. (2021) trained networks with full-batch GD at a fixed step size $\eta$. What did the sharpness (top Hessian eigenvalue) typically do?
+    correct: It rose until about $2/\eta$, then hovered there as loss kept falling
+    wrong:
+      - It fell steadily, so larger step sizes became safe later on
+      - It rose past $2/\eta$, and training then diverged within a few steps
+      - It stayed near its initial value throughout the whole training run
+    explanation: |
+      Progressive sharpening drives the sharpness up to about $2/\eta$. Instead of diverging, as the local quadratic model predicts, GD then operates at the edge of stability: the loss keeps decreasing over long spans, non-monotonically over short ones. Divergence is what the quadratic model predicts, and it happens only when the dynamics can't push back toward flatter regions.
+    source: Cohen et al. 2021 §3.1
+
+  - id: q11
+    prompt: |
+      Backtracking line search on an $L$-smooth $f$ with $L=10$: start at $t=1$, halve until $f(x-t\nabla f)\le f(x)-c\,t\|\nabla f\|^2$ with $c<\tfrac12$. What is the smallest step the search can ever return?
+    correct: '$0.0625$'
+    wrong:
+      - '$0.1$'
+      - '$0.05$'
+      - '$0.03125$'
+    explanation: |
+      Every $t\le1/L=0.1$ satisfies the condition, by the descent lemma. The trial sequence is $1, 0.5, 0.25, 0.125, 0.0625$, so the search stops at $0.0625$ at the latest. $0.1$ isn't on the halving grid. $0.05=\beta/L$ is the general lower bound, not a value the search actually visits here. $0.03125$ would require $0.0625$ to fail, which it can't.
+    source: Boyd CVX §9.3.1 (backtracking analysis)
+
+  - id: q12
+    prompt: |
+      GD with **exact** line search on an ill-conditioned quadratic. Which statement is **false**?
+    correct: The exact step size removes the zig-zag across the valley
+    wrong:
+      - Each new gradient is orthogonal to the previous search direction
+      - Its convergence rate still worsens as $\kappa$ grows
+      - With $\kappa=1$ it reaches the minimum in a single step
+    explanation: |
+      At the exact minimizer along the ray, $\frac{d}{d\eta}f(x-\eta g)=-\nabla f(x^+)^\top g=0$, so consecutive directions are perpendicular. That is exactly what produces the zig-zag. The rate is $((\kappa-1)/(\kappa+1))^2$ per step in function value, which still degrades with $\kappa$. Fixing the zig-zag needs momentum, conjugate directions or preconditioning.
+    source: Murphy PML1 §8.2.3 (eq. 8.29); Boyd CVX §9.3.2
+
+cards:
+  - id: f1
+    front: Write the GD update and derive why $-\nabla f$ is the steepest-descent direction.
+    back: |
+      $$x_{k+1}=x_k-\eta\nabla f(x_k)$$
+
+      First-order Taylor: $f(x+v)\approx f(x)+\nabla f^\top v$. Over $\|v\|=r$, Cauchy–Schwarz gives $\nabla f^\top v\ge-r\|\nabla f\|$, with equality iff $v\propto-\nabla f$. It is steepest only in the Euclidean norm. In the norm $\|v\|_P$ the steepest step is $-P^{-1}\nabla f$.
+    source: Boyd CVX §9.4.1
+
+  - id: f2
+    front: State the descent lemma and the step-size range it covers.
+    back: |
+      For $L$-smooth $f$ and $x^+=x-\eta\nabla f(x)$:
+
+      $$f(x^+)\le f(x)-\eta\big(1-\tfrac{L\eta}{2}\big)\|\nabla f\|^2$$
+
+      Decrease is guaranteed for $0<\eta<2/L$. The best guaranteed decrease, $\|\nabla f\|^2/(2L)$, comes at $\eta=1/L$. No convexity is needed.
+    source: Bottou et al. 2018 §4.1
+
+  - id: f3
+    front: GD on $f=\tfrac12x^\top Ax$. Give the per-eigendirection dynamics, the stability condition, the best fixed step and its rate.
+    back: |
+      $c_{i,k}=(1-\eta\lambda_i)^kc_{i,0}$. Stable iff $\eta<2/\lambda_{max}$.
+
+      $$\eta^*=\frac{2}{\lambda_{max}+\lambda_{min}},\quad\rho^*=\frac{\kappa-1}{\kappa+1}$$
+
+      That rate is per step in distance; the function gap contracts by $\rho^2$.
+    source: Murphy PML1 §8.2.2–8.2.3
+
+  - id: f4
+    front: GD convergence rates (η = 1/L) in the non-convex, convex and strongly convex cases. What quantity does each bound?
+    back: |
+      - Non-convex, $L$-smooth: $\min_{k<K}\|\nabla f(x_k)\|^2\le2L(f(x_0)-f_{inf})/K$ (squared gradient norm).
+      - Convex: $f(x_k)-f^*\le L\|x_0-x^*\|^2/(2k)$ (gap; sublinear).
+      - $\mu$-strongly convex: $f(x_k)-f^*\le(1-\mu/L)^k(f(x_0)-f^*)$ (gap; linear, about $\kappa\ln(1/\varepsilon)$ steps).
+      - Nesterov acceleration on convex problems: $O(1/k^2)$.
+    source: Bottou et al. 2018 §4, §7.2; Boyd CVX §9.3.1
+
+  - id: f5
+    front: What does preconditioned GD $x\leftarrow x-\eta P^{-1}\nabla f$ correspond to, and what is the ideal $P$?
+    back: |
+      Steepest descent in the norm $\|v\|_P=\sqrt{v^\top Pv}$, which is the same as plain GD in coordinates $\bar x=P^{1/2}x$, where the Hessian becomes $P^{-1/2}HP^{-1/2}$. The ideal is $P\approx H$, which makes $\kappa\approx1$ (Newton). Diagonal versions such as Adam fix only axis-aligned ill-conditioning.
+    source: Boyd CVX §9.4.1, §9.4.4
+
+  - id: f6
+    front: What are progressive sharpening and the edge of stability?
+    back: |
+      Under full-batch GD with fixed $\eta$, the sharpness $\lambda_1$ (top Hessian eigenvalue) tends to rise during training (progressive sharpening) until it reaches about $2/\eta$. It then hovers there while the loss keeps decreasing non-monotonically (edge of stability). The quadratic model predicts divergence above $2/\eta$, but the real dynamics push back toward flatter regions.
+    source: Cohen et al. 2021 §3
+
+  - id: f7
+    type: open
+    front: Derive the $O(1/k)$ rate of GD on a convex, $L$-smooth function.
+    back: |
+      Use $\eta=1/L$ and write $g=\nabla f(x)$.
+      1. Descent lemma: $f(x^+)\le f(x)-\frac1{2L}\|g\|^2$.
+      2. Convexity: $f(x)\le f^*+g^\top(x-x^*)$.
+      3. Combine: $f(x^+)\le f^*+g^\top(x-x^*)-\frac1{2L}\|g\|^2$.
+      4. Complete the square. Since $x^+-x^*=x-x^*-g/L$:
+
+      $$f(x^+)-f^*\le\tfrac L2\big(\|x-x^*\|^2-\|x^+-x^*\|^2\big)$$
+
+      5. Sum over $k$ steps. The right side telescopes to at most $\frac L2\|x_0-x^*\|^2$.
+      6. $f(x_k)$ is non-increasing, so $k(f(x_k)-f^*)\le$ the sum, giving $f(x_k)-f^*\le L\|x_0-x^*\|^2/(2k)$.
+
+      Mention that Nesterov's method reaches $O(1/k^2)$, which is optimal for first-order methods.
+    source: Bottou et al. 2018 §7.2; Boyd CVX §9.3.1
+
+  - id: f8
+    type: open
+    front: Explain to an interviewer why ill-conditioning makes gradient descent slow, and what you would do about it.
+    back: |
+      - **Model**: near a minimum, $f\approx\frac12(x-x^*)^\top H(x-x^*)$. GD scales each eigencoordinate by $1-\eta\lambda_i$.
+      - **The cap**: stability needs $\eta<2/\lambda_{max}$, so the stiffest direction limits the step.
+      - **The cost**: the flattest direction then shrinks by only $1-\eta\lambda_{min}\approx1-2/\kappa$ per step. The best fixed step gives $(\kappa-1)/(\kappa+1)$, so the number of steps grows like $\kappa$. Geometrically, GD zig-zags across the valley.
+      - **Fixes**: momentum (rate $(\sqrt\kappa-1)/(\sqrt\kappa+1)$); preconditioning $P^{-1}\nabla f$ with $P\approx H$, i.e. feature scaling, whitening, normalization layers or adaptive methods; Newton or quasi-Newton when affordable.
+      - **Caveat**: networks have near-zero and negative curvature directions, so $\kappa$ explains mechanisms, not exact step counts.
+    source: Goodfellow DL §4.3.1, §8.2.1; Boyd CVX §9.4.4; Bottou et al. 2018 §7.1
+
+  - id: f9
+    type: open
+    front: Prove linear convergence of GD for an $L$-smooth, $\mu$-strongly convex function.
+    back: |
+      1. Descent lemma at $\eta=1/L$: $f(x^+)\le f(x)-\frac1{2L}\|\nabla f\|^2$.
+      2. Strong convexity: $f(y)\ge f(x)+\nabla f^\top(y-x)+\frac\mu2\|y-x\|^2$. Minimize both sides over $y$; the right side is smallest at $y=x-\nabla f/\mu$:
+
+      $$f^*\ge f(x)-\frac{\|\nabla f\|^2}{2\mu}$$
+
+      So $\|\nabla f\|^2\ge2\mu(f(x)-f^*)$.
+      3. Substitute into step 1 and subtract $f^*$: $f(x^+)-f^*\le(1-\mu/L)(f(x)-f^*)$.
+      4. Iterate: $(1-1/\kappa)^k$, so about $\kappa\ln(1/\varepsilon)$ steps.
+
+      Remark: step 2 is the only place strong convexity is used, so any function satisfying that gradient-domination inequality (even a non-convex one) gets the same rate.
+    source: Boyd CVX §9.1.2, §9.3.1; Bottou et al. 2018 §4.2 (eq. 4.12)
+
+  - id: f10
+    type: open
+    front: Is gradient descent attracted to saddle points? Compare with Newton's method.
+    back: |
+      - At a saddle, the Hessian has eigenvalues of both signs. Along a direction with curvature $-b<0$, GD multiplies the component by $1+\eta b>1$, so it escapes exponentially. It converges to the saddle only from the measure-zero stable manifold, and gradient noise removes even that.
+      - It can still be **slow**: starting within $\delta$ of the saddle, escape takes about $\ln(1/\delta)/\ln(1+\eta b)$ steps (e.g. 193 steps for $\delta=10^{-8}$, $\eta b=0.1$). This shows up as a plateau.
+      - **Newton** solves $\nabla f=0$ via $-H^{-1}\nabla f$. Along negative-curvature directions this step points *toward* the saddle, so it is attracted. Fixes: saddle-free Newton ($|H|$), damping or trust regions.
+      - In high dimensions saddles outnumber minima (coin-flip argument), which is one reason plain second-order methods struggle on networks.
+    source: Goodfellow DL §8.2.3, §4.3.1
+
+reading:
+  - title: "Boyd & Vandenberghe, Convex Optimization, §9.2–9.4"
+    url: https://web.stanford.edu/~boyd/cvxbook/
+    kind: book
+    note: Descent methods, line search, the strongly convex GD analysis, and steepest descent in other norms (preconditioning).
+  - title: "Goodfellow, Bengio & Courville, Deep Learning, §4.3 and §8.2"
+    url: https://www.deeplearningbook.org/contents/numerical.html
+    kind: book
+    note: The second-order Taylor view of a GD step, condition number, and the challenges specific to networks (saddles, cliffs).
+  - title: "Bottou, Curtis & Nocedal 2018, Optimization Methods for Large-Scale Machine Learning, §4 and §7"
+    url: https://arxiv.org/abs/1606.04838
+    kind: paper
+    note: Clean proofs from the Lipschitz-gradient bound; §7 covers momentum and acceleration rates.
+  - title: "Cohen et al. 2021, Gradient Descent on Neural Networks Typically Occurs at the Edge of Stability"
+    url: https://arxiv.org/abs/2103.00065
+    kind: paper
+    note: Progressive sharpening and the 2/η threshold in real training.
+  - title: "Dive into Deep Learning, §12.3 Gradient Descent"
+    url: https://d2l.ai/chapter_optimization/gd.html
+    kind: course
+    note: Runnable 1-D and 2-D examples, including Newton's method for contrast.

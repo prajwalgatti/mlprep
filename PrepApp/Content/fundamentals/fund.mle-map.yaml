@@ -1,0 +1,491 @@
+id: fund.mle-map
+area: fundamentals
+title: MAP Estimation, Priors & Bayesian Prediction
+summary: Fixing MLE's small-sample overconfidence with a prior. Conjugate Beta, Dirichlet and Gaussian updates, MAP vs posterior mean, L2 and L1 as Gaussian and Laplace priors, posterior predictive vs plug-in, and why MAP depends on the parameterization.
+order: 80
+level: core
+tags: [probability, estimation, regularization, bayesian, priors]
+prereqs: [fund.mle, fund.bayes-theorem]
+
+explainer:
+  - title: "The problem: MLE trusts small samples too much"
+    body: |
+      A coin lands heads 3 times in 3 flips. The MLE is $\hat p=3/3=1$, so a model using it predicts that tails is impossible. A spam filter that never saw a word in ham emails assigns it probability 0 there. The MLE uses nothing but the sample, and small samples are often extreme.
+
+      The fix is to say what we believed before the data. Treat $\theta$ as a random variable with a **prior** $p(\theta)$ and apply Bayes' theorem (fund.bayes-theorem):
+
+      $$p(\theta\mid D)=\frac{p(D\mid\theta)\,p(\theta)}{p(D)}$$
+
+      **MAP estimation** returns the posterior mode. Take logs and drop the evidence $p(D)$, which does not depend on $\theta$:
+
+      $$\begin{aligned}\hat\theta_{\text{MAP}}&=\arg\max_\theta\,\log p(\theta\mid D)\\&=\arg\max_\theta\Big[\sum_i\log p(x_i\mid\theta)+\log p(\theta)\Big]\end{aligned}$$
+
+      This is the MLE objective plus a term $\log p(\theta)$. Equivalently, minimizing NLL $-\log p(\theta)$ is **regularized maximum likelihood** with penalty $-\log p(\theta)$. A flat prior over a domain that contains the MLE adds a constant, so MAP equals the MLE.
+
+      **Which summary of the posterior?** Different losses pick different summaries:
+      - The **posterior mean** minimizes expected squared error. It is the Bayes estimator under squared loss (derivative of $\mathbb E[(\theta-a)^2\mid D]$ in $a$ is zero at $a=\mathbb E[\theta\mid D]$).
+      - The **posterior median** minimizes expected absolute error.
+      - The **mode (MAP)** is the most probable value for a discrete $\theta$, or the highest-density point for a continuous one.
+
+      Full Bayesian inference keeps the whole posterior and averages predictions over it (the posterior-predictive card). MAP is the cheapest step away from the MLE: still one point, but shaped by a prior.
+    source: Murphy PML1 §4.5, §4.6, §5.1.5; Goodfellow DL §5.6.1
+
+  - title: "Conjugacy: the Beta–Bernoulli model"
+    body: |
+      With a coin, the likelihood of $h$ heads in $n$ flips is $\theta^h(1-\theta)^{n-h}$. If the prior has the same functional form, multiplying keeps that form. Such a prior is called **conjugate**.
+
+      The **Beta prior** with $\alpha,\beta>0$ is
+
+      $$\mathrm{Beta}(\theta\mid\alpha,\beta)\propto\theta^{\alpha-1}(1-\theta)^{\beta-1}.$$
+
+      Its mean is $\frac{\alpha}{\alpha+\beta}$; for $\alpha,\beta>1$ its mode is $\frac{\alpha-1}{\alpha+\beta-2}$.
+
+      **Posterior by multiplying kernels.** Ignore constants:
+
+      $$\begin{aligned}p(\theta\mid D)&\propto\theta^h(1-\theta)^{n-h}\,\theta^{\alpha-1}(1-\theta)^{\beta-1}\\&=\theta^{\alpha+h-1}(1-\theta)^{\beta+n-h-1}\end{aligned}$$
+
+      So $p(\theta\mid D)=\mathrm{Beta}(\alpha+h,\,\beta+n-h)$. No integral was needed: the normalizer is whatever makes it a Beta density.
+
+      **Pseudo-counts.** The data add $h$ to $\alpha$ and $n-h$ to $\beta$, so the prior acts like $\alpha$ imaginary heads and $\beta$ imaginary tails. $\alpha+\beta$ is the prior's *equivalent sample size*: Beta(2,2) is worth 4 flips, Beta(20,20) is worth 40. Updating one flip at a time gives the same posterior as updating on the whole batch, so yesterday's posterior is today's prior.
+
+      **The posterior mean shrinks the MLE towards the prior mean.** With $m=\frac{\alpha}{\alpha+\beta}$:
+
+      $$\begin{aligned}\frac{\alpha+h}{\alpha+\beta+n}&=\lambda\,m+(1-\lambda)\frac hn\\ \lambda&=\frac{\alpha+\beta}{\alpha+\beta+n}\end{aligned}$$
+
+      As $n$ grows, $\lambda\to0$ and the data win.
+
+      **Terminology.** $\alpha$ and $\beta$ are *hyperparameters*: parameters of a prior. Deep learning borrows the word for the learning rate, weight decay and so on, which are not parameters of any prior. The Tuning Playbook calls them *metaparameters* for this reason.
+    source: Murphy PML1 §4.6.1–4.6.2; Bishop PRML §2.1.1; Tuning Playbook FAQ ("Why do you call the learning rate and other optimization parameters hyperparameters?")
+
+  - title: "Mode, mean or MLE: three estimates from one posterior"
+    body: |
+      **The mode, derived.** For $\mathrm{Beta}(a,b)$ the log-density is $(a-1)\log\theta+(b-1)\log(1-\theta)+\text{const}$. Setting the derivative to zero:
+
+      $$\frac{a-1}{\theta}=\frac{b-1}{1-\theta}\;\Rightarrow\;\theta=\frac{a-1}{a+b-2}$$
+
+      This is valid for $a,b>1$. Substitute the posterior $a=\alpha+h$, $b=\beta+n-h$:
+      - MAP: $\dfrac{h+\alpha-1}{n+\alpha+\beta-2}$
+      - posterior mean: $\dfrac{h+\alpha}{n+\alpha+\beta}$
+      - MLE: $\dfrac hn$
+
+      **Worked: 3 heads in 3, prior Beta(2,2).** The posterior is Beta(5,2). MAP $=4/5$, mean $=5/7\approx0.71$, MLE $=1$. Beta(1,1) is uniform, and then MAP equals the MLE.
+
+      ![Posterior Beta(5,2) is a compromise between the prior and the likelihood. It is skewed left, so its mean (5/7) sits left of its mode (4/5); the MLE sits at the boundary.](fund.mle-map/beta-posterior)
+
+      **MAP can keep the zero-count problem.** With 0 heads in $n$ and a uniform prior, the posterior Beta$(1,n+1)$ peaks at 0, so MAP $=0$. Its mean, $1/(n+2)$, does not.
+
+      **Dirichlet–categorical.** For $K$ outcomes with counts $N_k$, the conjugate prior is $\mathrm{Dir}(\theta\mid\alpha)\propto\prod_k\theta_k^{\alpha_k-1}$, and the posterior is $\mathrm{Dir}(\alpha_k+N_k)$. Then:
+
+      $$\begin{aligned}\text{mean}_k&=\frac{N_k+\alpha_k}{N+\sum_j\alpha_j}\\ \text{mode}_k&=\frac{N_k+\alpha_k-1}{N+\sum_j\alpha_j-K}\end{aligned}$$
+
+      With $\alpha_k=1$ (uniform), the mean is **add-one (Laplace) smoothing**, $(N_k+1)/(N+K)$, which is what naive Bayes uses. To get the same numbers from a MAP estimate you need $\alpha_k=2$. Add-$\alpha$ smoothing in general is the posterior mean with a symmetric $\mathrm{Dir}(\alpha)$ prior.
+    source: Murphy PML1 §4.5.1, §4.6.2, §4.6.3; Bishop PRML §2.2.1
+
+  - title: "The Gaussian mean, and what happens as N grows"
+    body: |
+      **Setup.** $x_i\sim\mathcal N(\mu,\sigma^2)$ with $\sigma^2$ known, and prior $\mu\sim\mathcal N(\mu_0,\tau^2)$. The log-posterior is quadratic in $\mu$:
+
+      $$-\frac{1}{2\sigma^2}\sum_i(x_i-\mu)^2-\frac{1}{2\tau^2}(\mu-\mu_0)^2+\text{const}$$
+
+      **Complete the square.** The $\mu^2$ coefficient is $-\frac12\big(\frac N{\sigma^2}+\frac1{\tau^2}\big)$, and the $\mu$ coefficient is $\frac{N\bar x}{\sigma^2}+\frac{\mu_0}{\tau^2}$. So the posterior is Gaussian with
+
+      $$\begin{aligned}\frac1{\tau_N^2}&=\frac1{\tau^2}+\frac N{\sigma^2}\\ \mu_N&=\frac{\sigma^2\mu_0+N\tau^2\bar x}{\sigma^2+N\tau^2}\end{aligned}$$
+
+      **Read it.** Precisions add: the prior counts once, each observation adds $1/\sigma^2$. The posterior mean is a precision-weighted average of the prior mean and $\bar x$. The posterior variance $\tau_N^2=\frac{\sigma^2\tau^2}{\sigma^2+N\tau^2}$ tends to $\sigma^2/N$, so it shrinks like $1/N$. For a Gaussian posterior, MAP, mean and median coincide.
+
+      **Worked.** Prior $\mathcal N(0,1)$, $\sigma^2=1$, $N=4$, $\bar x=2$: $\mu_N=\frac{0+4\cdot2}{1+4}=1.6$ and $\tau_N^2=0.2$. The MLE would be 2.
+
+      **Large-$N$ behaviour in general.** The log-likelihood is a sum of $N$ terms while $\log p(\theta)$ stays fixed. As long as the prior is positive and continuous near the truth, the likelihood dominates: **MAP → MLE**, and the posterior concentrates at rate $1/\sqrt N$. Under regularity conditions the posterior becomes approximately Gaussian around the MLE with covariance $(N F)^{-1}$, the same as the MLE's sampling distribution. This is the Bernstein–von Mises theorem. So priors matter most when data are scarce, or when the number of parameters is large compared with $N$, which is the deep-learning regime.
+    source: Murphy PML1 §4.6.4, §4.6.8; Bishop PRML §2.3.6, §2.1.1
+
+  - title: "A Gaussian prior is an L2 penalty"
+    body: |
+      **Linear regression** with $y_i=w^\top x_i+\varepsilon_i$, $\varepsilon_i\sim\mathcal N(0,\sigma^2)$, and prior $w\sim\mathcal N(0,\tau^2I)$. The negative log-posterior is
+
+      $$\frac{1}{2\sigma^2}\sum_i(y_i-w^\top x_i)^2+\frac{1}{2\tau^2}\|w\|_2^2+\text{const}.$$
+
+      Multiplying by $2\sigma^2$ does not move the minimizer, and gives **ridge regression**:
+
+      $$\sum_i(y_i-w^\top x_i)^2+\lambda\|w\|_2^2,\qquad\lambda=\frac{\sigma^2}{\tau^2}$$
+
+      A tighter prior (smaller $\tau$) or noisier data (larger $\sigma$) means a larger $\lambda$. Bishop writes $\lambda=\alpha/\beta$ with prior precision $\alpha=1/\tau^2$ and noise precision $\beta=1/\sigma^2$, which is the same quantity. In this linear-Gaussian model the posterior is Gaussian, so the ridge solution is also the posterior mean.
+
+      **Weight decay and dataset size.** Networks are trained on the *mean* loss. Start from the MAP objective with a generic per-example NLL and divide by $N$:
+
+      $$\frac1N\sum_i\mathrm{NLL}_i+\frac{1}{2N\tau^2}\|w\|_2^2$$
+
+      Written as $\frac1N\sum_i\mathrm{NLL}_i+\frac{\lambda}{2}\|w\|^2$, this gives $\lambda=\frac{1}{N\tau^2}$. Fixing the prior and doubling the data should **halve** $\lambda$. A weight-decay value tuned on one dataset size therefore does not transfer to another. The data term grows with $N$ and the prior's relative weight shrinks, exactly as in the large-$N$ argument.
+
+      Two caveats. The MAP reading holds for an L2 term added to the loss and optimized with SGD. Adam with decoupled weight decay (AdamW) is not equivalent to it (fund.adam). And penalties are usually applied to weights only, not to biases or normalization gains.
+    source: Murphy PML1 §4.5.3; Goodfellow DL §5.6, §5.6.1; Bishop PRML §3.3.1
+
+  - title: "A Laplace prior is an L1 penalty, and sparsity lives in the kink"
+    body: |
+      The **Laplace prior** $p(w_j)=\frac1{2b}e^{-|w_j|/b}$ gives $-\log p(w)=\frac1b\|w\|_1+\text{const}$. Repeating the ridge steps, multiply by $2\sigma^2$:
+
+      $$\sum_i(y_i-w^\top x_i)^2+\lambda\|w\|_1,\qquad\lambda=\frac{2\sigma^2}{b}$$
+
+      That is the **lasso**. Again, a tighter prior (smaller $b$) means a larger $\lambda$.
+
+      ![Gaussian and Laplace priors with equal variance. The Laplace prior is peaked at 0. Its negative log is a V with a kink at 0, while the Gaussian's is a smooth parabola with zero slope at 0.](fund.mle-map/l1-l2-priors)
+
+      **Why MAP under a Laplace prior gives exact zeros.** Hold the other weights fixed and look at one coordinate $w_j$. At $w_j=0$ the penalty $\lambda|w_j|$ has no derivative; its *subgradient* is the whole interval $[-\lambda,\lambda]$. Zero is optimal whenever the data term's slope there is small enough to be cancelled:
+
+      $$\Big|\frac{\partial\,\mathrm{RSS}}{\partial w_j}\Big|_{w_j=0}\le\lambda$$
+
+      Then $w_j$ stays exactly 0. A Gaussian penalty has slope 0 at the origin, so any nonzero data slope pushes $w_j$ off zero: ridge shrinks weights but almost never zeroes them. The geometric picture of the L1 ball's corners and the soft-thresholding solution are in fund.regularization.
+
+      **The posterior mean is not sparse.** The Laplace posterior is a continuous density with no point mass at 0, and its mean averages over values of both signs. It lands exactly on 0 only by coincidence. Sparsity is a property of the *mode* of this posterior, not of Bayesian inference with a Laplace prior. Some texts call any penalized MLE "MAP" even when the penalty is not the log of a normalizable prior; strictly, MAP needs a genuine prior.
+    source: Murphy PML1 §4.5.3, §11.4.1–11.4.2; Murphy PML2 §15.2.5–15.2.6; Goodfellow DL §7.1.2
+
+  - title: "Predicting: the posterior predictive vs plug-in"
+    body: |
+      To predict a new $x$ we want $p(x\mid D)$, not $p(x\mid\hat\theta)$. By the sum and product rules:
+
+      $$p(x\mid D)=\int p(x\mid\theta)\,p(\theta\mid D)\,d\theta$$
+
+      This averages the predictions of every $\theta$, weighted by its posterior probability (*Bayesian model averaging*). The **plug-in** approximation replaces the posterior by a spike at one estimate, giving $p(x\mid\hat\theta)$. It ignores uncertainty about $\theta$, so it is overconfident with little data.
+
+      **Beta–Bernoulli.** $p(\text{heads}\mid D)=\int\theta\,p(\theta\mid D)\,d\theta=\mathbb E[\theta\mid D]=\frac{h+\alpha}{n+\alpha+\beta}$. With a uniform prior this is **Laplace's rule of succession**, $(h+1)/(n+2)$. After 3 heads in 3 it gives $4/5$, while plugging in the MLE (or the uniform-prior MAP) gives 1. For the Dirichlet the predictive is likewise the posterior mean, which is add-one smoothing.
+
+      **Gaussian mean.** A new $x=\mu+\varepsilon$ with $\mu\sim\mathcal N(\mu_N,\tau_N^2)$ independent of the noise, so variances add:
+
+      $$p(x\mid D)=\mathcal N(\mu_N,\;\sigma^2+\tau_N^2)$$
+
+      The predictive variance is noise plus parameter uncertainty. In the worked example it is $1+0.2=1.2$, whereas plug-in claims 1. Bayesian linear regression has the same structure, $\sigma^2+x^\top\Sigma_Nx$, with the second term growing away from the data (fund.ridge-lasso).
+
+      **Beyond conjugate models** the integral is intractable, and the standard approximations are:
+      - Laplace approximation: a Gaussian at the MAP with the inverse Hessian as covariance.
+      - MCMC: average $p(x\mid\theta_s)$ over posterior samples $\theta_s$.
+      - Variational inference: fit a simple $q(\theta)$ by minimizing $\mathrm{KL}(q\,\|\,p(\theta\mid D))$.
+      - Deep ensembles: average a few independently trained networks. This is a practical approximation, not exact model averaging.
+    source: Murphy PML1 §4.6.2, §4.6.7, §4.6.8; Goodfellow DL §5.6; Bishop PRML §3.3.2
+
+  - title: "MAP depends on the parameterization"
+    body: |
+      **Densities pick up a Jacobian.** If $\phi=g(\theta)$ is a smooth bijection, the density of $\phi$ is $p_\phi(\phi)=p_\theta(g^{-1}(\phi))\,\big|\tfrac{d\theta}{d\phi}\big|$. The extra factor can move the peak, so in general $\hat\phi_{\text{MAP}}\ne g(\hat\theta_{\text{MAP}})$.
+
+      **Worked: the coin posterior over log-odds.** Take the Beta(5,2) posterior and $\phi=\mathrm{logit}\,p$, so $p=\sigma(\phi)$ and $dp/d\phi=\sigma(\phi)(1-\sigma(\phi))$:
+
+      $$p_\phi(\phi)\propto\sigma^4(1-\sigma)\cdot\sigma(1-\sigma)=\sigma^5(1-\sigma)^2$$
+
+      Its log-derivative in $\phi$ is $5(1-\sigma)-2\sigma$, which is zero at $\sigma(\phi)=5/7$. So the MAP over log-odds corresponds to $p=5/7\approx0.71$, while the MAP over $p$ is $0.8$. In general, Beta$(a,b)$ has mode $\frac{a-1}{a+b-2}$ in $p$ but $\frac{a}{a+b}$ in log-odds. The same beliefs give two different "most probable" values.
+
+      ![The same Beta(5,2) beliefs drawn over $p$ and over $\phi=\mathrm{logit}\,p$. The two dashed lines are the same two values of $p$ in both panels; the mode switches from 0.80 on the left to the value corresponding to 0.71 on the right.](fund.mle-map/map-reparam)
+
+      **What is invariant.** The MLE is, because the likelihood is a function of $\theta$ rather than a density over it (fund.mle). The full posterior is too: the probability of any event is the same in either parameterization, and so are posterior expectations of a fixed quantity. Only the mode is an artefact of the coordinates.
+
+      **The mode can be atypical.** In high dimensions the highest-density point can carry almost no probability mass nearby. A standard Gaussian in 100 dimensions has its density peak at the origin, yet its samples lie near radius $\sqrt{100}=10$. Skewed posteriors over variance parameters often peak at 0, far from where most of the mass is.
+    source: Murphy PML2 §7.4.1.2–7.4.1.3; Bishop PRML §1.2.1 (Ex. 1.4)
+
+  - title: "What interviewers probe"
+    body: |
+      - *MLE vs MAP in one line?* MAP adds $\log p(\theta)$ to the log-likelihood, so it is regularized MLE. With a flat prior they coincide, and they also converge as $N\to\infty$.
+      - *Why can you drop $p(D)$?* It does not depend on $\theta$. You need it only for model comparison (the marginal likelihood).
+      - *Which prior gives L2? L1? What is $\lambda$?* Gaussian $\mathcal N(0,\tau^2)$ gives $\lambda=\sigma^2/\tau^2$; Laplace with scale $b$ gives $\lambda=2\sigma^2/b$, for the summed squared-error objective.
+      - *Weight decay with a mean loss, dataset doubles?* $\lambda=1/(N\tau^2)$, so halve it to keep the same prior.
+      - *Beta(2,2) prior, 3/3 heads: MAP, mean, MLE?* $4/5$, $5/7$, $1$.
+      - *Why is L1-MAP sparse but the Laplace posterior mean not?* The mode sits at the kink, where the subgradient interval absorbs small data slopes. The mean averages a continuous density.
+      - *Is MAP invariant to reparameterization?* No: the Jacobian moves the mode. MLE and the full posterior are invariant.
+      - *Plug-in vs posterior predictive?* Plug-in ignores parameter uncertainty. The predictive integrates it out, giving the rule of succession and noise-plus-parameter variance.
+      - *When does the prior matter?* Small $N$ or many parameters. With lots of data the likelihood dominates (Bernstein–von Mises).
+      - *Is MAP "being Bayesian"?* Only partly. It uses a prior but returns a point, with no uncertainty, and its mode can be unrepresentative.
+    source: Murphy PML1 §4.5–4.6; Murphy PML2 §7.4.1; Goodfellow DL §5.6
+
+  - title: "Key results"
+    body: |
+      - MAP:
+
+      $$\hat\theta_{\text{MAP}}=\arg\max_\theta\Big[\sum_i\log p(x_i\mid\theta)+\log p(\theta)\Big]$$
+
+      Posterior mean minimizes squared loss, median absolute loss.
+      - Beta–Bernoulli: posterior $\mathrm{Beta}(\alpha+h,\beta+n-h)$; MAP $\frac{h+\alpha-1}{n+\alpha+\beta-2}$; mean $\frac{h+\alpha}{n+\alpha+\beta}$ (= posterior predictive). Uniform prior gives the rule of succession $\frac{h+1}{n+2}$.
+      - Dirichlet: posterior $\mathrm{Dir}(\alpha_k+N_k)$; uniform-prior mean $=(N_k+1)/(N+K)$, add-one smoothing.
+      - Gaussian mean, known $\sigma^2$:
+
+      $$\begin{aligned}\frac1{\tau_N^2}&=\frac1{\tau^2}+\frac N{\sigma^2}\\ \mu_N&=\frac{\sigma^2\mu_0+N\tau^2\bar x}{\sigma^2+N\tau^2}\end{aligned}$$
+
+      Predictive variance $\sigma^2+\tau_N^2$.
+      - Priors as penalties: Gaussian → L2 with $\lambda=\sigma^2/\tau^2$; Laplace → L1 with $\lambda=2\sigma^2/b$. With a mean loss, $\lambda\propto1/N$.
+      - MAP is not reparameterization-invariant; MLE and the full posterior are. MAP → MLE as $N\to\infty$.
+    source: Murphy PML1 §4.5–4.6; Bishop PRML §2.1–2.3
+
+quiz:
+  - id: q3
+    rev: 2
+    prompt: |
+      A coin lands heads in 0 out of 4 flips. With a $\mathrm{Beta}(2,2)$ prior on $p=P(\text{heads})$, what is the MAP estimate of $p$?
+    correct: '$1/6$'
+    wrong:
+      - '$0$'
+      - '$1/4$'
+      - '$1/2$'
+    explanation: |
+      The posterior is $\mathrm{Beta}(2+0,\,2+4)=\mathrm{Beta}(2,6)$, with mode $\frac{2-1}{2+6-2}=\frac16$. The MLE is 0, the zero-count answer the prior is meant to fix. $1/4=2/8$ is the posterior mean, not the mode. $1/2$ is the prior mode, which ignores the data.
+    source: Murphy PML1 §4.5.1, §4.6.2
+
+  - id: q5
+    prompt: |
+      Which statement is **false**?
+    correct: The MAP estimate is invariant under any smooth reparameterization of $\theta$
+    wrong:
+      - The MLE is invariant under reparameterization, so the MLE of $g(\theta)$ is $g(\hat\theta)$
+      - With a flat prior over the parameter domain, MAP equals MLE
+      - For a fixed prior with positive density at the true value, MAP approaches MLE as $N \to \infty$
+    explanation: |
+      Densities transform with a Jacobian factor, $p_\phi(\phi)=p_\theta(\theta)\,|d\theta/d\phi|$, so the posterior's mode moves under a nonlinear change of variables. For Beta(5,2), the mode is 0.8 over $p$ but corresponds to $5/7$ over log-odds. The likelihood is a function of $\theta$, not a density over it, so the MLE simply maps through $g$.
+    source: Murphy PML2 §7.4.1.3; Bishop PRML §1.2.1
+
+  - id: q7
+    prompt: |
+      Linear regression with noise $\mathcal{N}(0,\sigma^2)$ and prior $w\sim\mathcal{N}(0,\tau^2 I)$. Written as $\sum_i (y_i-w^\top x_i)^2 + \lambda\|w\|^2$, the MAP objective has $\lambda =$
+    correct: '$\sigma^2/\tau^2$'
+    wrong:
+      - '$\tau^2/\sigma^2$'
+      - '$1/\tau^2$'
+      - '$\sigma^2\tau^2$'
+    explanation: |
+      The negative log posterior is $\frac{1}{2\sigma^2}\sum_i(y_i-w^\top x_i)^2 + \frac{1}{2\tau^2}\|w\|^2$. Multiplying by $2\sigma^2$ gives $\lambda = \sigma^2/\tau^2$. More noise or a tighter prior means stronger regularization. $1/\tau^2$ would be right only if the data term were also divided by $\sigma^2$, i.e. written as $\frac1{\sigma^2}\sum_i(\cdot)^2$.
+    source: Murphy PML1 §4.5.3; Bishop PRML §3.3.1
+
+  - id: q9
+    prompt: |
+      Observations are $\mathcal N(\mu,\sigma^2)$ with $\sigma^2=2$ known. The prior is $\mu\sim\mathcal N(1,\,0.5)$ (variance 0.5). Six observations have mean $\bar x=3$. What is the posterior mean of $\mu$?
+    correct: '$2.2$'
+    wrong:
+      - '$3.0$'
+      - '$2.0$'
+      - '$1.8$'
+    explanation: |
+      $\mu_N=\frac{\sigma^2\mu_0+N\tau^2\bar x}{\sigma^2+N\tau^2}=\frac{2\cdot1+6\cdot0.5\cdot3}{2+3}=\frac{11}{5}=2.2$. In precision terms, the prior has precision 2 and the data have precision $6/2=3$, so the weights are $2/5$ and $3/5$. 3.0 is the MLE. 2.0 averages the prior mean and $\bar x$ equally. 1.8 swaps the weights.
+    source: Murphy PML1 §4.6.4
+
+  - id: q10
+    prompt: |
+      A 3-class categorical variable has observed counts $(5,0,1)$. What is its posterior mean under a uniform $\mathrm{Dir}(1,1,1)$ prior (add-one smoothing)?
+    correct: '$(6/9,\ 1/9,\ 2/9)$'
+    wrong:
+      - '$(5/6,\ 0,\ 1/6)$'
+      - '$(5/7,\ 1/7,\ 1/7)$'
+      - '$(7/12,\ 2/12,\ 3/12)$'
+    explanation: |
+      The posterior is $\mathrm{Dir}(6,1,2)$, with mean $(N_k+1)/(N+K)=(6,1,2)/9$. $(5/6,0,1/6)$ is the MLE, which keeps the zero. $(5/7,1/7,1/7)$ smooths only the empty class. $(7/12,2/12,3/12)$ is add-two smoothing, the posterior mean under $\mathrm{Dir}(2,2,2)$.
+    source: Murphy PML1 §4.6.3; CS229 notes §4.2.1
+
+  - id: q11
+    prompt: |
+      A prior is fixed, with density that is positive and continuous at the true parameter $\theta^*$. How does the MAP estimate compare with the MLE as the sample size $N\to\infty$?
+    correct: They converge, as the log-likelihood grows like $N$ but the log-prior doesn't
+    wrong:
+      - MAP stays offset from the MLE by a constant amount set by the prior
+      - MAP converges to the prior's mode rather than to the MLE itself
+      - They converge only when the prior is conjugate to the likelihood
+    explanation: |
+      The MAP objective is $\sum_{i=1}^N\log p(x_i\mid\theta)+\log p(\theta)$. The first term scales with $N$, the second does not, so its influence on the argmax vanishes. Conjugacy only makes the posterior easy to compute; it plays no role in the limit. A prior with zero density at $\theta^*$ would be the exception, since no data can overcome it.
+    source: Murphy PML1 §4.6.2; Bishop PRML §2.1.1
+
+  - id: q12
+    prompt: |
+      Which statement is **false**?
+    correct: MAP and the posterior mean coincide for any symmetric posterior
+    wrong:
+      - MAP and the posterior mean coincide for any Gaussian posterior
+      - For a $\mathrm{Beta}(a,a)$ posterior with $a>1$, both equal $1/2$
+      - The posterior mean minimizes the expected squared error
+    explanation: |
+      Symmetry fixes the mean at the centre but not the mode. A symmetric *bimodal* posterior has its mean in the dip between two peaks, where the density is low, and its modes elsewhere. Symmetric *unimodal* posteriors, including the Gaussian and Beta$(a,a)$ with $a>1$, do have mode equal to mean. The squared-loss property is the derivative condition $\frac{d}{da}\mathbb E[(\theta-a)^2]=0$.
+    source: Murphy PML1 §5.1.5; Murphy PML2 §7.4.1.2
+
+  - id: q13
+    prompt: |
+      You train with mean cross-entropy plus $\frac{\lambda}{2}\|w\|^2$, viewed as MAP with prior $\mathcal N(0,\tau^2I)$. The training set doubles in size. To keep the **same prior**, $\lambda$ should:
+    correct: Halve
+    wrong:
+      - Double
+      - Stay the same
+      - Shrink by a factor of $\sqrt2$
+    explanation: |
+      The MAP objective is $\sum_i\mathrm{NLL}_i+\frac{1}{2\tau^2}\|w\|^2$. Dividing by $N$ to get the mean loss gives $\lambda=1/(N\tau^2)$, so doubling $N$ halves $\lambda$. Keeping $\lambda$ fixed would silently tighten the prior's relative weight. This is why weight-decay values do not transfer across dataset sizes; AdamW's decoupled decay scales differently again.
+    source: Murphy PML1 §4.5.3; Goodfellow DL §5.6.1
+
+  - id: q14
+    prompt: |
+      ![Posterior over a coin's bias after 4 heads in 5 flips with a Beta(2,2) prior. Dotted lines A–D mark candidate values.](fund.mle-map/beta-posterior-q)
+
+      Which dotted line marks the **posterior mean**?
+    correct: Line D
+    wrong:
+      - Line A
+      - Line C
+      - Line B
+    explanation: |
+      The posterior is $\mathrm{Beta}(6,3)$. Its mean is $6/9\approx0.67$ (D). Its mode is $5/7\approx0.71$ (A, at the peak), the MLE is $4/5$ (C), and the prior mean is $1/2$ (B). The posterior is skewed left, with a longer tail towards 0, so the mean lies left of the mode.
+    source: Murphy PML1 §4.6.2
+
+  - id: q15
+    prompt: |
+      With a Laplace prior on regression weights, the MAP estimate is often exactly sparse, yet the posterior mean almost never is. Why?
+    correct: The mode can sit at the kink at 0; the mean averages both signs
+    wrong:
+      - The Laplace prior has a point mass at 0, which only the mode sees
+      - MAP depends only on the prior, while the mean also uses the data
+      - The mean is sparse too, since mode and mean agree for symmetric priors
+    explanation: |
+      At $w_j=0$ the log-prior's subgradient is an interval, so the mode stays at exactly 0 whenever the data slope there is small. The posterior is a continuous density with no point mass, and its mean is a weighted average over positive and negative values, which lands on exactly 0 only by coincidence. The Laplace density is continuous; it has a peak at 0, not an atom.
+    source: Murphy PML1 §11.4.1–11.4.2; Murphy PML2 §15.2.5–15.2.6
+
+  - id: q16
+    prompt: |
+      Under a uniform $\mathrm{Beta}(1,1)$ prior, a coin shows heads on both of 2 flips. What is the posterior predictive probability that the next flip is heads?
+    correct: '$3/4$'
+    wrong:
+      - '$1$'
+      - '$1/2$'
+      - '$2/3$'
+    explanation: |
+      The posterior is $\mathrm{Beta}(3,1)$, and $p(\text{heads}\mid D)=\mathbb E[\theta\mid D]=3/4$, Laplace's rule of succession $(h+1)/(n+2)$. Plugging in the MLE, or the MAP under this flat prior, gives 1, which says tails is impossible. 1/2 is the prior mean. 2/3 is $h/(n+1)$, a slip in the formula.
+    source: Murphy PML1 §4.6.2
+
+  - id: q17
+    prompt: |
+      A posterior over a coin's bias is $\mathrm{Beta}(4,2)$, whose mode in $p$ is $3/4$. If you instead take the mode of the same beliefs expressed over $\phi=\mathrm{logit}\,p$, which value of $p$ does it correspond to?
+    correct: '$2/3$'
+    wrong:
+      - '$3/4$'
+      - '$4/5$'
+      - '$1/2$'
+    explanation: |
+      The density over $\phi$ picks up $dp/d\phi=p(1-p)$, so it is proportional to $p^{4}(1-p)^{2}$ with $p=\sigma(\phi)$. Its log-derivative in $\phi$, $4(1-p)-2p$, vanishes at $p=4/6=2/3$. 3/4 assumes the mode transforms like a function value, which it does only for the MLE. 4/5 and 1/2 come from algebra slips.
+    source: Murphy PML2 §7.4.1.3; Bishop PRML §1.2.1
+
+cards:
+  - id: f1
+    front: Write the MLE and MAP objectives in log form for i.i.d. data. Why can the evidence be dropped?
+    back: |
+      $$\hat\theta_{\text{MLE}} = \arg\max_\theta \sum_i \log p(x_i\mid\theta)$$
+
+      $$\hat\theta_{\text{MAP}} = \arg\max_\theta \sum_i \log p(x_i\mid\theta) + \log p(\theta)$$
+
+      $p(D)$ does not depend on $\theta$, so it does not move the argmax.
+    source: Murphy PML1 §4.5; Goodfellow DL §5.6.1
+
+  - id: f2
+    front: Which priors correspond to L2 and L1 regularization, and how does $\lambda$ relate to them (linear regression with noise variance $\sigma^2$)?
+    back: |
+      - L2: Gaussian $\mathcal{N}(0,\tau^2)$, with $\lambda = \sigma^2/\tau^2$.
+      - L1: Laplace with scale $b$, with $\lambda = 2\sigma^2/b$.
+
+      Both are for the objective $\sum_i (y_i-w^\top x_i)^2 + \lambda\,\text{penalty}$. A tighter prior means a bigger $\lambda$. With a mean loss, divide by $N$: $\lambda\propto1/N$.
+    source: Murphy PML1 §4.5.3
+
+  - id: f3
+    front: MAP estimate and posterior mean for a Bernoulli parameter with a $\mathrm{Beta}(\alpha,\beta)$ prior, after $h$ heads in $n$ flips?
+    back: |
+      $$\text{MAP} = \frac{h+\alpha-1}{n+\alpha+\beta-2}, \qquad \text{mean} = \frac{h+\alpha}{n+\alpha+\beta}$$
+
+      $\mathrm{Beta}(1,1)$ (uniform) makes MAP equal the MLE $h/n$. The posterior mean with that prior, $\frac{h+1}{n+2}$, is Laplace smoothing and the posterior predictive.
+    source: Murphy PML1 §4.6.2
+
+  - id: f4
+    front: Is MAP invariant to reparameterization? Is MLE? Why?
+    back: |
+      **MAP: no.** A density over $\theta$ transforms with the Jacobian $|d\theta/d\phi|$, so its mode shifts under nonlinear $g$. Beta(5,2) has mode 0.8 in $p$, but its log-odds mode corresponds to $5/7$.
+
+      **MLE: yes.** The likelihood is a function of $\theta$, not a density over $\theta$, so $\hat\phi = g(\hat\theta)$.
+    source: Murphy PML2 §7.4.1.3
+
+  - id: f5
+    type: open
+    front: Explain MLE vs MAP vs full Bayesian inference to an interviewer, with an example.
+    back: |
+      **MLE** picks $\theta$ to maximize $p(D\mid\theta)$. It is simple and asymptotically efficient, but it overfits on small data: 3/3 heads gives $p=1$.
+
+      **MAP** adds a prior and maximizes $p(D\mid\theta)p(\theta)$, so it is regularized MLE. With a Beta(2,2) prior, 3/3 heads gives $4/5$. In deep learning, weight decay is MAP with a Gaussian prior. MAP is still a point estimate, and it depends on the parameterization.
+
+      **Full Bayes** keeps the whole posterior and predicts with $\int p(y\mid x,\theta)\,p(\theta\mid D)\,d\theta$. For the coin with a uniform prior that gives $4/5$ (the rule of succession). For Gaussians it adds parameter uncertainty to the predictive variance. It is usually intractable, so people approximate it with Laplace, MCMC, VI or deep ensembles.
+
+      MAP and MLE coincide with a flat prior and as $N\to\infty$.
+    source: Murphy PML1 §4.5–4.6; Goodfellow DL §5.6
+
+  - id: f6
+    type: open
+    front: Why does an L1 penalty produce sparse solutions? Give both the probabilistic and the geometric view.
+    back: |
+      **Probabilistic**: L1 is MAP under a Laplace prior, whose density has a sharp peak (a kink) at zero. The penalty's subgradient at 0 is $[-\lambda,\lambda]$, so any weight whose data-gradient magnitude is below $\lambda$ sits exactly at zero. The Laplace posterior *mean* is not sparse; only the mode is.
+
+      **Geometric**: minimize the loss subject to $\|w\|_1 \le t$. The L1 ball is a cross-polytope with corners on the axes, and loss contours usually first touch it at a corner, where some coordinates are zero. The L2 ball is round, so it shrinks weights but rarely zeroes them.
+    source: Murphy PML1 §11.4.2; Murphy PML2 §15.2.6
+
+  - id: f7
+    front: Posterior over a Gaussian mean (known $\sigma^2$, prior $\mathcal N(\mu_0,\tau^2)$, $N$ points with mean $\bar x$), and the posterior predictive.
+    back: |
+      $$\begin{aligned}\frac1{\tau_N^2}&=\frac1{\tau^2}+\frac N{\sigma^2}\\ \mu_N&=\frac{\sigma^2\mu_0+N\tau^2\bar x}{\sigma^2+N\tau^2}\end{aligned}$$
+
+      Precisions add; the mean is precision-weighted; $\tau_N^2\approx\sigma^2/N$ for large $N$. Predictive: $\mathcal N(\mu_N,\ \sigma^2+\tau_N^2)$.
+    source: Murphy PML1 §4.6.4
+
+  - id: f8
+    front: What is the posterior predictive, and how does it differ from plug-in prediction? Give the Beta–Bernoulli case.
+    back: |
+      $p(x\mid D)=\int p(x\mid\theta)\,p(\theta\mid D)\,d\theta$ averages over parameter uncertainty. Plug-in uses $p(x\mid\hat\theta)$, a spike at one estimate, which is overconfident with little data.
+
+      Beta–Bernoulli: $p(\text{heads}\mid D)=\frac{h+\alpha}{n+\alpha+\beta}$, the posterior mean. With a uniform prior this is the rule of succession $\frac{h+1}{n+2}$: 3/3 heads gives 4/5, not 1.
+    source: Murphy PML1 §4.6.2, §4.6.7
+
+  - id: f9
+    type: open
+    front: "Derive the posterior for a coin with a Beta prior, then its MAP and mean. Work the example: 3 heads in 3 flips, Beta(2,2)."
+    back: |
+      1. Likelihood $\theta^h(1-\theta)^{n-h}$; prior $\propto\theta^{\alpha-1}(1-\theta)^{\beta-1}$.
+      2. Multiply: $\theta^{\alpha+h-1}(1-\theta)^{\beta+n-h-1}$, so the posterior is $\mathrm{Beta}(\alpha+h,\beta+n-h)$ (conjugacy; the normalizer follows from the Beta form).
+      3. Mode: set $\frac{a-1}{\theta}=\frac{b-1}{1-\theta}$ to get $\frac{a-1}{a+b-2}=\frac{h+\alpha-1}{n+\alpha+\beta-2}$.
+      4. Mean: $\frac{a}{a+b}=\frac{h+\alpha}{n+\alpha+\beta}=\lambda m+(1-\lambda)\frac hn$ with $\lambda=\frac{\alpha+\beta}{\alpha+\beta+n}$, i.e. shrinkage towards the prior mean.
+      5. Example: posterior Beta(5,2). MAP $4/5$, mean $5/7$, MLE 1. The prior acts like 2 extra heads and 2 extra tails.
+    source: Murphy PML1 §4.6.2; Bishop PRML §2.1.1
+
+  - id: f10
+    type: open
+    front: Explain weight decay as a Gaussian prior, and why a tuned weight-decay value does not transfer to a dataset of a different size.
+    back: |
+      MAP with prior $w\sim\mathcal N(0,\tau^2I)$ minimizes $\sum_i\mathrm{NLL}_i+\frac{1}{2\tau^2}\|w\|^2$. Training uses the mean loss, so divide by $N$:
+
+      $$\frac1N\sum_i\mathrm{NLL}_i+\frac{1}{2N\tau^2}\|w\|^2$$
+
+      Matching this to $\frac{\lambda}{2}\|w\|^2$ gives $\lambda=1/(N\tau^2)$. For linear regression with summed squared error, $\lambda=\sigma^2/\tau^2$.
+
+      So with the same prior, doubling $N$ should halve $\lambda$. A $\lambda$ tuned at one size encodes a different prior at another. The general principle is that the prior's relative weight falls as data grow (MAP → MLE).
+
+      Caveats: the equivalence is for L2 added to the loss (SGD). AdamW's decoupled decay is not the same objective. In practice $\lambda$ is re-tuned rather than derived from a believed $\tau$.
+    source: Murphy PML1 §4.5.3; Goodfellow DL §5.6.1
+
+  - id: f11
+    front: Dirichlet–categorical posterior, its mean and mode, and how add-one smoothing arises.
+    back: |
+      Prior $\mathrm{Dir}(\alpha)\propto\prod_k\theta_k^{\alpha_k-1}$; posterior $\mathrm{Dir}(\alpha_k+N_k)$.
+
+      $$\begin{aligned}\text{mean}_k&=\frac{N_k+\alpha_k}{N+\sum_j\alpha_j}\\ \text{mode}_k&=\frac{N_k+\alpha_k-1}{N+\sum_j\alpha_j-K}\end{aligned}$$
+
+      Uniform $\alpha_k=1$: the mean is $(N_k+1)/(N+K)$, add-one smoothing, while the MAP equals the MLE. MAP needs $\alpha_k=2$ to reproduce add-one.
+    source: Murphy PML1 §4.6.3
+
+reading:
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, §4.5–4.6"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: MAP as regularization, then the conjugate Beta, Dirichlet and Gaussian models, posterior predictive vs plug-in, and approximate inference.
+  - title: "Bishop, Pattern Recognition and Machine Learning, §2.1–2.3 and §3.3"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: The Beta and Dirichlet derivations, Bayesian inference for the Gaussian, and Bayesian linear regression's predictive variance.
+  - title: "Goodfellow, Bengio & Courville, Deep Learning, §5.6"
+    url: https://www.deeplearningbook.org/contents/ml.html
+    kind: book
+    note: The Bayesian view in deep-learning terms, with Bayesian linear regression and MAP as weight decay.
+  - title: "CS229 Lecture Notes, §9.4 Bayesian statistics and regularization"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: A short derivation of full Bayesian prediction vs the MAP approximation.
+  - title: "Murphy, Probabilistic Machine Learning: Advanced Topics, §7.4.1"
+    url: https://probml.github.io/pml-book/book2.html
+    kind: book
+    note: Why the MAP estimate is untypical of the posterior and not invariant to reparameterization.

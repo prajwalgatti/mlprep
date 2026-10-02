@@ -1,0 +1,462 @@
+id: sys.tuning-pipeline
+area: applied
+title: "Tuning Playbook: Optimizer Settings and Pipeline Hygiene"
+summary: Tuning Adam (and why ε is coupled to the learning rate), regularizers as nuisance hyperparameters, BatchNorm and multi-host pitfalls, evaluation setup and checkpoint selection.
+order: 360
+level: intermediate
+tags: [tuning, adam, batch-norm, evaluation, distributed-training, tuning-playbook]
+prereqs: [sys.tuning-search, fund.adam, fund.batchnorm]
+
+explainer:
+  - title: "Choosing an optimizer: the inclusion hierarchy"
+    body: |
+      **The playbook's advice.** Start with the most popular optimizer for the problem type. Good choices are SGD with momentum (it prefers Nesterov) and Adam/NAdam. Be ready to tune *all* of its hyperparameters. Here are the update rules in the playbook's conventions ($g_t=\nabla\ell(\theta_t)$, learning rate $\eta_t$ or $\alpha_t$).
+
+      **Momentum:**
+
+      $$\begin{aligned}v_{t+1}&=\gamma v_t+g_t\\ \theta_{t+1}&=\theta_t-\eta_t v_{t+1}\end{aligned}$$
+
+      **Nesterov:** the same $v$, but the step is $\theta_{t+1}=\theta_t-\eta_t(\gamma v_{t+1}+g_t)$.
+
+      **Adam:**
+
+      $$\begin{aligned}m_{t+1}&=\beta_1m_t+(1-\beta_1)g_t\\ v_{t+1}&=\beta_2v_t+(1-\beta_2)g_t^2\\ \theta_{t+1}&=\theta_t-\alpha_t\,b_{t+1}\frac{m_{t+1}}{\sqrt{v_{t+1}}+\epsilon}\end{aligned}$$
+
+      Here $b_{t+1}=\sqrt{1-\beta_2^{t+1}}/(1-\beta_1^{t+1})$ is the bias correction. **NAdam** replaces $m_{t+1}$ in the numerator with $\beta_1m_{t+1}+(1-\beta_1)g_t$, a Nesterov-style look-ahead.
+
+      **Inclusion relationships** (Choi et al. 2019). Optimizer $N$ *includes* $M$ if some setting of $N$'s hyperparameters reproduces, or approximates arbitrarily well, any run of $M$:
+      - SGD ⊆ Momentum ⊆ RMSProp (with momentum);
+      - SGD ⊆ Momentum ⊆ Adam (as $\epsilon\to\infty$ with the LR scaled up accordingly; derived on the next card);
+      - SGD ⊆ Nesterov ⊆ NAdam.
+
+      Setting the momentum coefficient to 0 shows SGD is included in each chain. Momentum and Nesterov do not include each other.
+
+      **What follows.** With enough tuning, a more general optimizer can never lose to one it includes. Choi et al. found exactly this in practice: carefully tuned, Adam and NAdam never underperformed momentum or SGD. Published rankings that say otherwise usually reflect the tuning protocol, typically fixed $\epsilon$ and betas or narrow search spaces. The catch is cost: Adam has four hyperparameters that can all matter, so it needs more trials. Hence the playbook's suggestion to fix the extra knobs early and add them back as the budget grows.
+    source: Tuning Playbook §"Choosing the optimizer", FAQ "What are the update rules for all the popular optimization algorithms?"; Choi et al. 2019 §3, App. A
+
+  - title: "Tuning Adam, and why ε is not an independent knob"
+    body: |
+      ![Steady-state Adam step against gradient size. Below ε the step becomes proportional to the gradient: Adam turns into momentum with LR $\alpha/\epsilon$ on the EMA $m$, i.e. $\alpha(1-\beta_1)/\epsilon$ on the heavy-ball buffer.](sys.tuning-pipeline/adam-epsilon)
+
+      **The playbook's budget rule:**
+      - fewer than 10 trials: tune only the (base) learning rate;
+      - 10–25 trials: also tune $\beta_1$;
+      - 25+ trials: also tune $\epsilon$;
+      - substantially more than 25: also tune $\beta_2$.
+
+      Search $\alpha$, $\epsilon$, $1-\beta_1$ and $1-\beta_2$ on log scales.
+
+      **Deriving the ε coupling.** Use the playbook's form from the previous card: the per-coordinate step is $\alpha\,b_t\,m/(\sqrt{v}+\epsilon)$, with bias factor $b_t=\sqrt{1-\beta_2^t}/(1-\beta_1^t)$. If $\epsilon\gg\sqrt{v}$ (ε much larger than the gradient RMS):
+
+      $$\Delta\theta\approx-\frac{\alpha\,b_t}{\epsilon}\,m.$$
+
+      Write the heavy-ball buffer as $u_{t+1}=\beta_1u_t+g_t$; then $m=(1-\beta_1)u$, so
+
+      $$\Delta\theta\approx-\frac{\alpha(1-\beta_1)\,b_t}{\epsilon}\,u.$$
+
+      That is heavy-ball momentum with a *time-varying* LR $\alpha(1-\beta_1)b_t/\epsilon$, which tends to $\alpha(1-\beta_1)/\epsilon$ as $b_t\to1$, with no per-coordinate adaptivity. Two conventions appear in the literature: LR $\alpha/\epsilon$ relative to the EMA $m$, or $\alpha(1-\beta_1)/\epsilon$ relative to $u$; they describe the same step. Choi et al. make the inclusion exact by letting $\alpha_t$ grow with $\epsilon$ (and cancel the bias factor). At *fixed* $\alpha$, the step just goes to 0 as $\epsilon\to\infty$. In the opposite limit, $\epsilon\ll\sqrt{v}$, the step is about $\alpha$ times a sign-like ratio, independent of gradient scale.
+
+      **Consequences.**
+      - Changing $\epsilon$ at fixed $\alpha$ changes the *effective step size* whenever gradients are comparable to $\epsilon$. Tuning ε "blindly" therefore confounds it with the LR. Choi et al. searched $(\epsilon,\ \alpha/\epsilon)$ jointly for this reason; larger ε needs a larger α.
+      - The opposite failure: when the gradient RMS shrinks to about ε (as happens in large models), the step halves ($r/(r+\epsilon)=0.5$ at $r=\epsilon$) and keeps shrinking, so layers silently stop learning. Wortsman et al. saw gradient RMS near the default $10^{-8}$ in a 4.8B model. Lowering ε to $10^{-15}$ improved the loss. Counter-intuitively, raising it to $10^{-6}$ (which shrinks steps) caused divergence; the paper doesn't give a mechanism.
+    source: Tuning Playbook FAQ "How should Adam's hyperparameters be tuned?"; Choi et al. 2019 §4, App. A; Wortsman et al. 2023 §3.4
+
+  - title: "Regularizers as nuisance hyperparameters"
+    body: |
+      **Roles.** Whether to *include* a regularizer is a scientific (or fixed) decision, because it adds code or compute. Its *strength* is a nuisance hyperparameter, tuned for every comparison. When curves show problematic overfitting, the playbook's first move is to add cheap regularizers (dropout, label smoothing, weight decay) before drawing conclusions.
+
+      **Label smoothing** (Szegedy et al. 2016). Replace the one-hot target $y$ over $K$ classes with
+
+      $$q_k=(1-\varepsilon)\,y_k+\varepsilon/K.$$
+
+      The cross-entropy $H(q,p)=-\sum_kq_k\log p_k$ is minimised over distributions $p$ at $p=q$ (Gibbs' inequality). With $p=\mathrm{softmax}(z)$, $p=q$ needs the logit gap between the correct class $c$ and any other class $j$ to be
+
+      $$\begin{aligned}z_c-z_j&=\log\frac{q_c}{q_j}\\&=\log\frac{1-\varepsilon+\varepsilon/K}{\varepsilon/K}.\end{aligned}$$
+
+      For $K=10$, $\varepsilon=0.1$: $q_c=0.91$, $q_j=0.01$, so the gap is $\log91\approx4.51$. With hard labels the optimal gap is infinite, so logits grow without bound and predictions become overconfident. Smoothing caps the target confidence. Müller et al. found it improves calibration, but it makes the model a worse teacher for distillation, because it erases information about class similarities from the logits.
+
+      **Interactions to remember.**
+      - Regularization strength interacts with **batch size**. Small-batch noise already regularizes: for ResNet-50 on ImageNet, Shallue et al. found label smoothing helped only at large batches. On MNIST and Fashion-MNIST it helped at all batch sizes, presumably because those small datasets overfit at any batch size.
+      - Weight decay interacts with **model size** and the **LR**, so don't fix it across model sizes.
+      - Dropout and augmentation add gradient variance, so they may need **more steps**.
+      - If the training set can't be fit at all, regularization is unlikely to help much.
+    source: Tuning Playbook §"Identifying scientific, nuisance, and fixed hyperparameters", §"Examining the training curves"; Müller et al. 2019 §1.1, §2; Shallue et al. 2019 §4.6
+
+  - title: "BatchNorm implementation details"
+    body: |
+      ![Ghost batch norm on two devices. Each 64-example ghost batch computes its own μ, σ²; each device keeps its own running average (EMA), and the EMAs are averaged only at checkpoint time.](sys.tuning-pipeline/ghost-bn)
+
+      The playbook notes that LayerNorm can often replace BatchNorm today. When it can't, BN has traps around batch size and devices.
+
+      **Statistics are per device.** BN normalises with the batch mean and variance, but on multiple devices each device sees only its shard. Unless they are explicitly synchronised, each device uses statistics from its own per-device batch.
+
+      **Ghost batch norm.** Anecdotal ImageNet reports suggest computing the statistics over only about **64 examples** works better than using the whole large batch (Hoffer et al. 2017). Ghost BN splits each batch into "virtual" batches and normalises each separately. Decoupling the *statistics batch* from the *gradient batch* matters most when comparing batch sizes. Otherwise, changing the batch size also changes BN's noise and hence the loss function itself. Goyal et al. make the same point: they keep the per-worker BN batch at $n=32$ as workers are added, so "the underlying loss function is unchanged".
+
+      **An implementation trap.** Some ghost-BN implementations mishandle the case where the per-device batch is *larger* than the virtual batch. To get the intended number of examples per statistic, you must subsample or split the per-device batch.
+
+      **Running averages.** At test time BN uses exponential moving averages (EMAs) of the training statistics. An EMA is a linear combination of per-step statistics, so averaging the per-device EMAs gives exactly the EMA of the averaged statistics. They therefore need synchronising only *before saving a checkpoint*. Some common implementations never synchronise them and save only device 0's EMA, so the deployed model normalises with one shard's statistics.
+    source: Tuning Playbook §"Batch normalization implementation details", §"How batch norm interacts with the batch size"; Hoffer et al. 2017 §4; Goyal et al. 2017 §2.3
+
+  - title: "Multi-host pitfalls"
+    body: |
+      The playbook warns that multi-host training makes it easy to introduce bugs in logging, evaluation, RNGs, checkpointing and data sharding. Its checklist, with the reason for each item:
+
+      **1. Log and checkpoint from one host only.** Otherwise every host writes the same files: duplicated logs, conflicting checkpoint writes, and occasionally corrupted files.
+
+      **2. Synchronise BatchNorm statistics before evaluating or checkpointing.** Each host has its own running statistics (previous card). Evaluating or saving one host's statistics gives a model that differs from the one actually trained.
+
+      **3. Use the same RNG seed for initialisation on every host, and different seeds for data.**
+      - *Initialisation must match.* In data parallelism every replica must start from identical weights. Each host applies the same all-reduced gradient, so replicas that start different *stay* different and stop representing one model.
+      - *Data randomness must differ.* If every host reads the full dataset and shuffles and augments with the same seed, the hosts process the same examples. (With per-host file shards, a shared seed only correlates the augmentation.) The global batch is then full of duplicates, and the effective batch size is a fraction of the nominal one.
+
+      Label which seeds are which explicitly in the code.
+
+      **4. Shard data files across hosts.** Each host reads its own subset, which improves input performance and avoids every host reading everything.
+
+      **5. Normalise the loss by the global batch** (Goyal et al. §3). All-reduce *sums* gradients. If each worker averages over its local $n$ examples, the sum over $k$ workers is $k$ times the global-mean gradient, unless you divide by $k$ (or normalise each local loss by $kn$). For SGD, getting this wrong silently multiplies the LR by the number of workers; under Adam the scale mostly cancels and shows up only through ε, clipping thresholds and L2-style decay.
+
+      **Also:** the playbook suggests deferring the move to multi-host training until the project is mature enough to justify the bug risk, unless the speedup is needed for early tuning.
+    source: Tuning Playbook §"Considerations for multi-host pipelines", §"Choosing the batch size to minimize resource consumption"; Goyal et al. 2017 §3
+
+  - title: "Setting up periodic evaluation"
+    body: |
+      **Three settings:** *online* (live traffic; the gold standard, rarely available in development), *offline* (representative held-out sets; can be expensive), and *periodic* (during training; a cheap proxy that supports monitoring, checkpoint selection and training curves).
+
+      **Rules for periodic evaluation:**
+      - **Use regular step intervals, not time intervals.** Time-based evaluation spaces points unevenly when jobs are preempted or slowed, which makes curves hard to read and hides periodic patterns that signal leakage.
+      - **Use an evaluation batch at least as large as the training batch.** Evaluation stores no activations for backprop, so each example needs less memory.
+      - **Weight padded examples correctly.** If the evaluation set isn't divisible by the batch size, the last batch is padded. An unweighted mean over a batch of $b$ that includes $p$ padding examples counts their predictions too. Give padding weight 0 and divide by the sum of weights.
+      - **Save enough for offline analysis**, ideally predictions on a fixed set of individual examples.
+
+      **Choosing the periodic evaluation sample.**
+      - Check that metrics on the sample match those on the full offline set (no skew).
+      - The sample must be big enough for model differences to rise above noise. Treating examples as i.i.d. draws, the binomial standard error of an accuracy $p$ on $n$ examples is $\sqrt{p(1-p)/n}$: for $p=0.77$, $n=10{,}000$, about **0.42%**. Two models on *independent* samples differ with SE $\sqrt2\times0.42\approx0.59\%$, far too coarse to rank models 0.1% apart. On the *same* examples (paired) the noise is smaller, since it comes only from examples where they disagree. This is sampling noise only; seed variance comes on top.
+      - Overfitting the validation set through repeated use is possible in principle, but rarely a practical concern.
+      - For **imbalanced classes**, log the *count* of rare-class examples predicted correctly. A "+0.05 sensitivity" on a class with 20 positives is just one more example.
+    source: Tuning Playbook §"Evaluating model performance", §"Setting up periodic evaluations", §"Choosing a sample for periodic evaluation"; Miller 2024 (binomial and paired standard errors)
+
+  - title: "Checkpoints, tracking and the input pipeline"
+    body: |
+      ![Synthetic validation curve evaluated every 1k steps. The best checkpoint (step 39k) is not the last, and the run keeps the 3 best.](sys.tuning-pipeline/checkpoint-selection)
+
+      **Retrospective optimal checkpoint selection.** Checkpointing makes jobs resilient to preemption, and also enables selection. Keep the $N$ best checkpoints seen so far (by validation metric) and pick the best when training ends. The best is often *not* the last, especially once validation fluctuates around a plateau. With a fixed step budget and saved best-$N$ checkpoints, prospective early stopping (patience rules) is usually unnecessary. Retrospective selection is also what makes "longer training never hurts" true, given frequent enough checkpoints.
+
+      **Experiment tracking.** The playbook found a simple spreadsheet works, with columns for:
+      - study name, and a link to its config;
+      - a short description or notes;
+      - number of trials;
+      - validation performance of the study's best checkpoint;
+      - exact reproduction commands, including any uncommitted changes.
+
+      Use whatever system people will actually maintain. In the playbook's words, untracked experiments "might as well not exist".
+
+      **Input-bound pipelines.** Causes and fixes are task-specific, so start with a profiler (e.g. Perfetto for JAX, the TensorFlow profiler).
+      - Common causes: data not colocated with the trainer (network I/O latency); expensive online preprocessing (do it once offline); and unintended host–device synchronisation barriers, such as syncing metrics every step, which stall prefetching.
+      - Common fixes: prefetch examples; drop unused features or metadata as early as possible; run more parallel workers to generate examples (e.g. a tf.data service).
+
+      A slow input pipeline also distorts the batch-size throughput sweep, so fix it before choosing the batch size.
+    source: Tuning Playbook §"Saving checkpoints and retrospectively selecting the best checkpoint", §"Setting up experiment tracking", §"Optimizing the input pipeline"
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Adam or SGD?"* Adam includes momentum (as $\epsilon\to\infty$ with the LR scaled up with ε), so with enough tuning it should not lose (Choi et al.). Rankings in papers often reflect tuning protocols. Start with what's popular for the problem.
+      - *"Which Adam hyperparameters would you tune with 15 trials?"* The LR and $\beta_1$; add $\epsilon$ at 25+ trials and $\beta_2$ with many more.
+      - *"Why not tune ε on its own?"* When ε is comparable to the gradient RMS it sets the step size: for $\epsilon\gg\sqrt{\hat v}$, Adam becomes momentum with LR $\alpha(1-\beta_1)/\epsilon$. Search $(\epsilon,\alpha/\epsilon)$ jointly. And when gradients are tiny, an ε that is too large shrinks updates.
+      - *"Why does label smoothing regularize?"* The optimal logit gap becomes finite, $\log\frac{1-\varepsilon+\varepsilon/K}{\varepsilon/K}$ (4.51 for $K=10$, $\varepsilon=0.1$), instead of infinite. It is better for calibration and worse for distillation.
+      - *"Your multi-GPU model evaluates worse than during training. Why?"* Unsynced BN running statistics (device 0's EMA saved), padded evaluation examples weighted in, or a different BN batch at train and test.
+      - *"What RNG seeds do you share across hosts?"* The initialisation seed, so replicas match. Not the data seeds, which would duplicate examples.
+      - *"How do you pick the final checkpoint?"* Keep the best $N$ by validation metric during a fixed-length run and choose the best afterwards. Confirm on the test set once exploration is over.
+    source: Tuning Playbook FAQs; §"Additional guidance for the training pipeline"; Choi et al. 2019
+
+  - title: "Key results"
+    body: |
+      - Inclusion: SGD ⊆ Momentum ⊆ RMSProp; SGD ⊆ Momentum ⊆ Adam ($\epsilon\to\infty$, $\alpha$ scaled with ε); SGD ⊆ Nesterov ⊆ NAdam. Well-tuned general optimizers don't lose, and rankings depend on the tuning protocol.
+      - Adam budget: <10 trials LR; 10–25 +$\beta_1$; 25+ +$\epsilon$; ≫25 +$\beta_2$; log scales.
+      - Large-ε limit:
+
+      $$\Delta\theta\approx-\frac{\alpha(1-\beta_1)}{\epsilon}\,u$$
+
+      momentum with LR $\alpha(1-\beta_1)/\epsilon$ on $u$ (= $\alpha/\epsilon$ on $m$), once the bias factor is ≈1. So search $(\epsilon,\alpha/\epsilon)$. Gradient RMS ≈ ε halves the step.
+      - Label smoothing:
+
+      $$z_c-z_j=\log\frac{1-\varepsilon+\varepsilon/K}{\varepsilon/K}$$
+
+      (4.51 for $K=10$, $\varepsilon=0.1$).
+      - BN: per-device statistics unless synced; ghost batches of ~64; keep the statistics batch fixed when comparing batch sizes; average the EMAs before checkpointing.
+      - Multi-host: one host logs and checkpoints; sync BN before eval/checkpoint; same init seed, different data seeds; shard files; normalise by the global batch.
+      - Evaluation: step intervals; eval batch ≥ train batch; zero-weight padding; SE $=\sqrt{p(1-p)/n}$ (0.42% at $p=0.77$, $n=10^4$); log rare-class counts.
+      - Keep the $N$ best checkpoints and select afterwards; track every study; profile input-bound pipelines.
+    source: Tuning Playbook §"Additional guidance for the training pipeline", FAQs; Choi et al. 2019
+
+quiz:
+  - id: q1
+    prompt: |
+      Per the playbook, with a budget of about 15 trials per study, which Adam hyperparameters should be tuned?
+    correct: The learning rate and $\beta_1$
+    wrong:
+      - The learning rate only
+      - The learning rate, $\beta_1$ and $\epsilon$
+      - All four, including $\beta_2$
+    explanation: |
+      The rule of thumb: under 10 trials, LR only; 10–25, LR and $\beta_1$; 25+, add $\epsilon$; substantially more than 25, add $\beta_2$. Not all hyperparameters matter equally, so spend trials on the most sensitive first.
+    source: Tuning Playbook FAQ "How should Adam's hyperparameters be tuned?"
+
+  - id: q2
+    prompt: |
+      If Adam's $\epsilon$ is much larger than $\sqrt{\hat v}$ for every coordinate, what does Adam's update become (momentum buffer $u_{t+1}=\beta_1u_t+g_t$)?
+    correct: Momentum with LR $\alpha(1-\beta_1)/\epsilon$
+    wrong:
+      - Sign descent with step size $\alpha$ per coordinate
+      - Plain SGD with learning rate $\alpha$
+      - RMSProp with learning rate $\alpha\epsilon$
+    explanation: |
+      The step $\alpha b_t m/(\sqrt{v}+\epsilon)\approx(\alpha b_t/\epsilon)m$, and $m=(1-\beta_1)u$, giving momentum with LR $\alpha(1-\beta_1)b_t/\epsilon$, which tends to $\alpha(1-\beta_1)/\epsilon$ once the bias factor $b_t\to1$ (equivalently LR $\alpha/\epsilon$ on the EMA $m$). Sign-like, scale-free behaviour is the *opposite* limit, $\epsilon\ll\sqrt{\hat v}$.
+    source: Choi et al. 2019 App. A
+
+  - id: q3
+    prompt: |
+      Why did Choi et al. search Adam over $(\epsilon,\ \alpha/\epsilon)$ instead of $(\epsilon,\ \alpha)$?
+    correct: When ε matters the step scales like $\alpha/\epsilon$
+    wrong:
+      - Because ε must always be smaller than the learning rate
+      - Because $\alpha/\epsilon$ is the bias-correction factor
+      - Because ε only affects the first few steps of training
+    explanation: |
+      In the large-ε regime the update is about $(\alpha/\epsilon)\hat m$, so changing ε at fixed α rescales the step. Larger ε needs a larger α. Searching the ratio decouples "how adaptive" from "how big a step".
+    source: Choi et al. 2019 §4
+
+  - id: q4
+    prompt: |
+      A layer's gradient RMS has shrunk to exactly Adam's $\epsilon$. Roughly how large is its steady-state Adam step, compared with $\alpha$?
+    correct: About half of $\alpha$
+    wrong:
+      - About $\alpha$, since Adam is scale-invariant
+      - About $2\alpha$
+      - About $\alpha\epsilon$
+    explanation: |
+      For a steady gradient of size $r$, the step is $\alpha\,r/(r+\epsilon)$, which is $\alpha/2$ at $r=\epsilon$ and shrinks linearly below it. Scale invariance holds only when $r\gg\epsilon$. Wortsman et al. saw this in large models and fixed it by lowering ε.
+    source: Wortsman et al. 2023 §3.4
+
+  - id: q5
+    prompt: |
+      Which statement about optimizer inclusion relationships (Choi et al. 2019) is **false**?
+    correct: Adam with default ε and betas never loses to tuned momentum
+    wrong:
+      - Momentum with $\gamma=0$ reproduces plain SGD exactly
+      - Adam approximates momentum as $\epsilon\to\infty$ with $\alpha/\epsilon$ held fixed
+      - Optimizer rankings in the literature are sensitive to the tuning protocol
+    explanation: |
+      Inclusion guarantees a more general optimizer can match a special case only if its hyperparameters are tuned well enough to reach the matching setting. With ε and betas fixed at defaults, Adam can lose. That is exactly why rankings depend on protocol.
+    source: Choi et al. 2019 §1, §3, App. A
+
+  - id: q6
+    prompt: |
+      Label smoothing with $\varepsilon=0.1$ on $K=10$ classes. At the cross-entropy optimum, what is the logit gap between the correct class and any other class?
+    correct: '$\log 91\approx4.51$'
+    wrong:
+      - '$\log 9\approx2.20$'
+      - '$\log 10\approx2.30$'
+      - Unbounded, as with hard labels
+    explanation: |
+      Targets are $q_c=1-0.1+0.01=0.91$ and $q_j=0.01$. The optimum is $p=q$, so $z_c-z_j=\log(0.91/0.01)=\log91$. $\log 9$ forgets the $\varepsilon/K$ mass on the correct class. Hard labels give an unbounded optimum, which is the overconfidence smoothing prevents.
+    source: Müller et al. 2019 §1.1, §2
+
+  - id: q7
+    prompt: |
+      BN running statistics are kept per device during multi-device training. Why is it *exact*, not an approximation, to average the per-device running averages only once, at checkpoint time?
+    correct: EMAs are linear, so the mean of EMAs is the EMA of the means
+    wrong:
+      - The per-device statistics are identical, since all devices see the same data
+      - BN running averages are recomputed from scratch at evaluation time
+      - Averaging is approximate, but the error vanishes for large batches
+    explanation: |
+      An EMA is a fixed linear combination of past per-step statistics, and averaging commutes with linear maps, so averaging the device EMAs equals running one EMA on the device-averaged statistics. That's why the playbook only requires syncing before checkpoints, and why implementations that save device 0's EMA alone are a bug. Devices see different shards, so their statistics differ.
+    source: Tuning Playbook §"Batch normalization implementation details"
+
+  - id: q8
+    prompt: |
+      Why does the playbook value decoupling the BN statistics batch (e.g. ghost batches of 64) from the total batch size when comparing batch sizes?
+    correct: Else the batch size also changes BN's loss
+    wrong:
+      - Ghost batches make the gradient computation cheaper
+      - BN cannot run on batches larger than 64 examples
+      - It removes the need to re-tune the learning rate
+    explanation: |
+      BN's output for an example depends on the other examples in its statistics batch, so the statistics batch size is part of the loss function (Goyal et al.). Holding it fixed means a batch-size comparison changes only the gradient batch.
+    source: Tuning Playbook §"Batch normalization implementation details"; Goyal et al. 2017 §2.3
+
+  - id: q9
+    prompt: |
+      In a 4-host data-parallel job, each host reads the full dataset, and every host uses the same seed for both model initialisation and data shuffling. What goes wrong?
+    correct: Hosts read identical examples; the effective batch is 1/4
+    wrong:
+      - The replicas start from different weights and diverge
+      - Nothing, since identical seeds guarantee reproducibility
+      - Gradients are averaged over 16× too many examples
+    explanation: |
+      The init seed *should* be shared, so replicas start identical. The data seed should differ, or every host shuffles and augments identically and the global batch is four copies of one host's batch. Different init seeds would be the other bug.
+    source: Tuning Playbook §"Considerations for multi-host pipelines"
+
+  - id: q10
+    prompt: |
+      Each of $k$ workers averages its loss over its local $n$ examples, and gradients are combined with an all-reduce **sum**, with no further scaling. What is the effect?
+    correct: The gradient is $k\times$ the global mean (LR × $k$)
+    wrong:
+      - The gradient is $1/k$ of the global mean
+      - The gradient is exactly the global mean, as intended
+      - The gradient is the mean of a single worker's batch
+    explanation: |
+      The sum of $k$ local means is $k$ times the mean over all $kn$ examples. Goyal et al. normalise each worker's loss by $kn$ (or average after the all-reduce) to recover the global mean. "LR × $k$" holds for SGD; under Adam the scale mostly cancels.
+    source: Goyal et al. 2017 §3
+
+  - id: q11
+    prompt: |
+      Why should periodic evaluations run at fixed **step** intervals rather than fixed time intervals?
+    correct: Time-based spacing is uneven and hides periodic patterns
+    wrong:
+      - Step-based evals are computationally cheaper per evaluation
+      - Time-based evals cannot be used with checkpointing
+      - Step-based evals reduce the variance of each estimate
+    explanation: |
+      Preemptions and network hiccups make wall-clock spacing irregular, which makes curves hard to compare across runs. Regular step spacing also makes periodicity (a sign of leakage or broken shuffling) easy to spot.
+    source: Tuning Playbook §"Setting up periodic evaluations"
+
+  - id: q12
+    prompt: |
+      A periodic evaluation set has 10,000 examples and the model's accuracy is 77%. What is the standard error of that accuracy estimate?
+    correct: About 0.42%
+    wrong:
+      - About 0.04%
+      - About 1.33%
+      - About 0.18%
+    explanation: |
+      $\sqrt{p(1-p)/n}=\sqrt{0.77\times0.23/10^4}\approx0.0042$. 0.18% would need $n\approx55{,}000$. This assumes i.i.d. examples and counts sampling noise only. Single-model differences of 0.1% are well inside it, though a paired comparison on the same examples is less noisy.
+    source: Tuning Playbook §"Choosing a sample for periodic evaluation"; Miller 2024 (binomial standard error)
+
+  - id: q13
+    prompt: |
+      With a fixed step budget and the 5 best checkpoints saved, why does the playbook consider prospective early stopping usually unnecessary?
+    correct: The best checkpoint can be picked after the run anyway
+    wrong:
+      - Early stopping cannot be combined with learning-rate decay
+      - Validation loss never increases with a fixed step budget
+      - Patience-based rules are too slow to compute at scale
+    explanation: |
+      Retrospective selection already recovers the best point of the run, whatever happens later. The budget is pre-specified anyway, so stopping early would only save compute and adds a patience hyperparameter.
+    source: Tuning Playbook §"Saving checkpoints and retrospectively selecting the best checkpoint"
+
+cards:
+  - id: f1
+    front: Write the Adam update in the playbook's form, and the NAdam change.
+    back: |
+      $$\begin{aligned}m&\leftarrow\beta_1m+(1-\beta_1)g\\ v&\leftarrow\beta_2v+(1-\beta_2)g^2\\ \theta&\leftarrow\theta-\alpha\,b\,\frac{m}{\sqrt v+\epsilon}\end{aligned}$$
+
+      with bias correction $b=\sqrt{1-\beta_2^{t}}/(1-\beta_1^{t})$.
+
+      NAdam uses $\beta_1m+(1-\beta_1)g$ in the numerator (look-ahead).
+    source: Tuning Playbook FAQ "What are the update rules for all the popular optimization algorithms?"
+
+  - id: f2
+    front: The playbook's Adam tuning order by trial budget.
+    back: |
+      - <10 trials: LR only.
+      - 10–25: LR, $\beta_1$.
+      - 25+: LR, $\beta_1$, $\epsilon$.
+      - ≫25: also $\beta_2$.
+    source: Tuning Playbook FAQ "How should Adam's hyperparameters be tuned?"
+
+  - id: f3
+    front: What does Adam reduce to when $\epsilon\gg\sqrt{\hat v}$, and what follows for tuning?
+    back: |
+      $\Delta\theta\approx-(\alpha/\epsilon)\hat m$, i.e. heavy-ball momentum with LR $\alpha(1-\beta_1)/\epsilon$. ε and α are coupled, so search $(\epsilon,\alpha/\epsilon)$ jointly (Choi et al.).
+    source: Choi et al. 2019 §4, App. A
+
+  - id: f4
+    front: Label-smoothing target and optimal logit gap.
+    back: |
+      $$q_k=(1-\varepsilon)y_k+\varepsilon/K$$
+
+      $$z_c-z_j=\log\frac{1-\varepsilon+\varepsilon/K}{\varepsilon/K}$$
+
+      $K=10$, $\varepsilon=0.1$: $\log91\approx4.51$. Improves calibration, hurts distillation.
+    source: Müller et al. 2019 §1.1, §2
+
+  - id: f5
+    front: Four BatchNorm implementation details from the playbook.
+    back: |
+      1. Statistics are per device unless synchronised.
+      2. Ghost BN: ~64 examples per statistic often works better. Decouple it from the gradient batch, especially for batch-size comparisons.
+      3. Some ghost-BN code mishandles per-device batch > virtual batch (you must subsample or split).
+      4. EMA running statistics are linear: average them across devices before checkpointing (some implementations save device 0's only).
+    source: Tuning Playbook §"Batch normalization implementation details"
+
+  - id: f6
+    front: The playbook's multi-host checklist.
+    back: |
+      - Log and checkpoint on one host only.
+      - Sync BN statistics before evaluating or checkpointing.
+      - Same RNG seed for model init across hosts; different seeds for data shuffling and preprocessing.
+      - Shard data files across hosts.
+      - (Goyal) Normalise the loss by the global batch.
+    source: Tuning Playbook §"Considerations for multi-host pipelines"; Goyal et al. 2017 §3
+
+  - id: f7
+    front: Rules for periodic evaluation.
+    back: |
+      Fixed step intervals (not time). Eval batch ≥ train batch. Zero-weight padded examples. Save per-example predictions. The evaluation sample must match the full set and be large enough (SE $=\sqrt{p(1-p)/n}$). Log rare-class counts for imbalanced data.
+    source: Tuning Playbook §"Evaluating model performance"
+
+  - id: f8
+    type: open
+    front: "Explain why Adam's ε should not be tuned independently of the learning rate."
+    back: |
+      - The per-coordinate step is $\alpha\hat m/(\sqrt{\hat v}+\epsilon)$.
+      - When $\epsilon\ll\sqrt{\hat v}$: the step is ≈ α times a scale-free ratio, so ε barely matters.
+      - When $\epsilon\gg\sqrt{\hat v}$: the step is ≈ $(\alpha/\epsilon)\hat m$, i.e. momentum SGD with LR $\alpha(1-\beta_1)/\epsilon$. Adaptivity is gone, and ε acts as an inverse learning rate.
+      - In between, raising ε at fixed α shrinks the steps of small-gradient coordinates, so a "better ε" may really be a better effective LR. That confound is why Choi et al. searched $(\epsilon,\alpha/\epsilon)$.
+      - Failure at scale: gradient RMS ≈ ε halves updates and silently freezes layers (Wortsman et al.: ε = 1e-15 helped a 4.8B model).
+      - The playbook only adds ε to the search at ≥25 trials, after LR and $\beta_1$.
+    source: Choi et al. 2019 §4, App. A; Wortsman et al. 2023 §3.4; Tuning Playbook FAQ "How should Adam's hyperparameters be tuned?"
+
+  - id: f9
+    type: open
+    front: "A model trained on 16 GPUs evaluates 1.5% worse after reloading the checkpoint than during training. List the likely causes."
+    back: |
+      - **BN running statistics** not synchronised; only device 0's EMA was saved.
+      - **BN batch mismatch**: statistics batch at training (ghost/per-device) differs from what evaluation assumes; or train-mode BN accidentally used at eval.
+      - **Padded evaluation examples** counted in the metric (partial last batch).
+      - **Checkpoint written by multiple hosts**, giving a partial or corrupted save, or a different step than expected.
+      - **RNG/data**: the in-training evaluation used a different sample or split than the offline evaluation (check for skew).
+      - **Selection**: the in-training number was the best of many periodic evals (optimistic) and the reloaded checkpoint isn't that one.
+      - Fix order: sync BN EMAs before save, weight padding as 0, verify the checkpoint step, compare on identical examples.
+    source: Tuning Playbook §"Batch normalization implementation details", §"Considerations for multi-host pipelines", §"Setting up periodic evaluations"
+
+  - id: f10
+    type: open
+    front: "Derive the optimal logits under label smoothing and explain why smoothing regularizes."
+    back: |
+      - Smoothed target: $q_k=(1-\varepsilon)y_k+\varepsilon/K$, so $q_c=1-\varepsilon+\varepsilon/K$ and $q_j=\varepsilon/K$.
+      - Cross-entropy $H(q,p)=H(q)+\mathrm{KL}(q\|p)$ is minimised at $p=q$ (KL ≥ 0, equality iff equal).
+      - Softmax: $p_c/p_j=e^{z_c-z_j}$, so the optimum has $z_c-z_j=\log(q_c/q_j)$, finite (4.51 for K=10, ε=0.1).
+      - With hard labels, $q_j=0$ and the optimum is $z_c-z_j\to\infty$: logits and weights keep growing and predictions become overconfident.
+      - So smoothing bounds the logit scale, which acts as a regularizer and improves calibration (Müller et al.). It also compresses within-class representations and removes class-similarity information, which is why smoothed teachers distil worse.
+      - In tuning terms: including it is a scientific decision; ε is nuisance. For ResNet-50/ImageNet it mattered only at large batch, though on MNIST it helped at all batch sizes (Shallue §4.6). The technique is due to Szegedy et al. 2016.
+    source: Müller et al. 2019 §1.1, §2; Shallue et al. 2019 §4.6
+
+reading:
+  - title: "Deep Learning Tuning Playbook: 'Additional guidance for the training pipeline'"
+    url: https://github.com/google-research/tuning_playbook#additional-guidance-for-the-training-pipeline
+    kind: docs
+    note: Input pipelines, evaluation, checkpoints, tracking, BN details and the multi-host checklist.
+  - title: "Choi et al. 2019, On Empirical Comparisons of Optimizers for Deep Learning"
+    url: https://arxiv.org/abs/1910.05446
+    kind: paper
+    note: "Inclusion hierarchy (App. A proofs), the (ε, α/ε) search transform (§4), and how tuning protocols flip rankings."
+  - title: "Hoffer, Hubara & Soudry 2017, Train Longer, Generalize Better"
+    url: https://arxiv.org/abs/1705.08741
+    kind: paper
+    note: "Introduces ghost batch normalization (Alg. 1) and argues that large-batch gaps come from too few updates."
+  - title: "Müller, Kornblith & Hinton 2019, When Does Label Smoothing Help?"
+    url: https://arxiv.org/abs/1906.02629
+    kind: paper
+    note: Calibration benefits, the distillation cost, and what smoothing does to penultimate-layer representations.

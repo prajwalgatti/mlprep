@@ -1,0 +1,585 @@
+id: llm.self-attention
+area: llms
+title: Scaled Dot-Product & Multi-Head Attention
+summary: One attention layer from scratch. Queries, keys and values with every shape, the variance derivation behind 1/√d_k, multi-head attention, permutation equivariance, the FLOP and memory bill, and the backward pass through the softmax.
+order: 10
+level: core
+tags: [transformers, attention, derivations]
+prereqs: []
+
+explainer:
+  - title: "The problem: a lookup that can be learned"
+    body: |
+      A recurrent network reads a sequence one token at a time, $h_t=f(h_{t-1},x_t)$. That design has three costs:
+      - **Bottleneck.** Everything about the prefix must fit into one fixed-size vector $h_t$.
+      - **Long paths.** Information from token 1 reaches token 1000 only after 999 applications of $f$, and the gradient travels the same path back.
+      - **No parallelism over time.** $h_t$ can't be computed before $h_{t-1}$.
+
+      What we want instead: every position reads directly from every other position, with weights chosen by *content*, and the whole thing differentiable so the weights can be learned.
+
+      **Kernel regression already does this.** Given stored pairs $(k_j,v_j)$ and a query $q$, the Nadaraya–Watson estimator returns a similarity-weighted average of the stored values:
+
+      $$f(q)=\sum_j \alpha_j v_j,\qquad \alpha_j=\frac{\kappa(q,k_j)}{\sum_l \kappa(q,k_l)}$$
+
+      The weights are non-negative and sum to 1, so $f(q)$ is a convex combination of the values.
+
+      **From a Gaussian kernel to dot products.** Take $\kappa(q,k)=\exp(-\tfrac12\|q-k\|^2)$. Expanding the square, the log-weight is
+
+      $$-\tfrac12\|q-k_j\|^2=q\cdot k_j-\tfrac12\|k_j\|^2-\tfrac12\|q\|^2$$
+
+      The $\|q\|^2$ term is the same for every $j$, so it cancels in the normalisation. If the keys have roughly equal norms (LayerNorm tends to produce that), the $\|k_j\|^2$ term is nearly constant too. What remains is
+
+      $$\alpha_j=\frac{e^{q\cdot k_j}}{\sum_l e^{q\cdot k_l}}=\mathrm{softmax}_j(q\cdot k_j)$$
+
+      This is attention: a **soft dictionary lookup**. A hard lookup would return the value whose key matches best (an argmax, with zero gradient almost everywhere). The softmax blends values instead, so gradients reach every key and query. Dot products won over other scoring functions mainly because a batch of them is a single matrix multiply.
+    source: Vaswani et al. 2017 §3.2, §4 (pdf p.3–6); d2l §11.3.1; Bishop PRML §6.3.1
+
+  - title: "Queries, keys and values"
+    body: |
+      ![One multi-head self-attention layer. Every edge carries its tensor shape; the softmax runs along each row of the $n\times n$ score matrix.](llm.self-attention/dataflow)
+
+      Stack the $n$ input token vectors as rows of $X\in\mathbb{R}^{n\times d}$, where $d$ is the model width. Three learned matrices give each token three roles:
+
+      $$Q=XW_Q,\quad K=XW_K,\quad V=XW_V$$
+
+      with $W_Q,W_K\in\mathbb{R}^{d\times d_k}$ and $W_V\in\mathbb{R}^{d\times d_v}$.
+      - Row $q_i$ of $Q$ is token $i$'s **query**: what it is looking for.
+      - Row $k_j$ of $K$ is token $j$'s **key**: what it offers to be matched against.
+      - Row $v_j$ of $V$ is token $j$'s **value**: what it hands over if it is attended to.
+
+      Scaled dot-product attention is
+
+      $$\mathrm{Attn}(Q,K,V)=\mathrm{softmax}\Big(\frac{QK^\top}{\sqrt{d_k}}\Big)V$$
+
+      Shapes: the scores $S=QK^\top/\sqrt{d_k}$ are $n\times m$ for $n$ queries and $m$ keys ($m=n$ in self-attention). The softmax is applied to **each row separately**, normalising over keys, so each row $P_{i,:}$ is a probability distribution over the positions query $i$ reads from. The output $PV$ is $n\times d_v$: row $i$ is $\sum_j P_{ij}v_j$.
+
+      **Why separate $W_Q$ and $W_K$?** The score is $x_i^\top W_QW_K^\top x_j$, a bilinear form with matrix $W_QW_K^\top$ of rank at most $d_k$. That matrix need not be symmetric, so "$i$ looks for $j$" can differ from "$j$ looks for $i$", as with a verb looking for its subject. With raw dot products $x_i\cdot x_j$ the relation is symmetric, and a token is usually most similar to itself, so it would mostly attend to itself.
+
+      **Why separate $W_V$?** What makes a token relevant (its key) and what it should contribute (its value) are different features.
+
+      The $1/\sqrt{d_k}$ factor is derived two cards on.
+    source: Vaswani et al. 2017 §3.2.1 (pdf p.4); SLP3 ch. 7 §7.1.1, §7.3 (pdf p.5–7, p.13); d2l §11.3.3
+
+  - title: "Worked example: three tokens by hand"
+    body: |
+      Take $n=3$ tokens and $d_k=d_v=2$, and suppose the projections produced
+
+      $$Q=\begin{bmatrix}2&0\\0&2\\1&1\end{bmatrix},\quad K=\begin{bmatrix}1&0\\0&1\\1&1\end{bmatrix}$$
+
+      $$V=\begin{bmatrix}4&0\\0&4\\2&2\end{bmatrix}$$
+
+      **Row 1, step by step.** Dot $q_1=(2,0)$ with each key: $(2,0,2)$. Divide by $\sqrt{d_k}=\sqrt2$:
+
+      $$s_1=(1.414,\ 0,\ 1.414)$$
+
+      Exponentiate: $e^{1.414}=4.113$ and $e^0=1$, total $9.226$. Normalise:
+
+      $$P_{1,:}=(0.446,\ 0.108,\ 0.446)$$
+
+      Weight the value rows:
+
+      $$\begin{aligned} o_1&=0.446\,(4,0)+0.108\,(0,4)\\ &\quad+0.446\,(2,2)=(2.675,\ 1.325) \end{aligned}$$
+
+      **All rows.** The same steps give
+
+      $$P=\begin{bmatrix}0.446&0.108&0.446\\0.108&0.446&0.446\\0.248&0.248&0.504\end{bmatrix}$$
+
+      and $O=PV$ has rows $(2.675,1.325)$, $(1.325,2.675)$ and $(2,2)$.
+
+      **What to notice.**
+      - Each row of $P$ sums to 1; columns need not.
+      - Query 1 points along the first axis, so keys 1 and 3 (which have a first component) win, and its output leans toward their values.
+      - Without the $\sqrt2$, row 1 would be $(0.468,0.063,0.468)$: sharper. The bigger $d_k$ gets, the stronger this sharpening, which is the subject of the next card.
+    source: Vaswani et al. 2017 §3.2.1 (pdf p.4); SLP3 ch. 7 §7.1.1 (pdf p.6)
+
+  - title: "Why divide by √d_k"
+    body: |
+      **Refresher.** For independent random variables, variances add: $\mathrm{Var}(\sum_i Y_i)=\sum_i\mathrm{Var}(Y_i)$. For independent $A,B$, $\mathbb{E}[AB]=\mathbb{E}[A]\,\mathbb{E}[B]$.
+
+      **Step 1: the logits grow like $\sqrt{d_k}$.** At initialisation, model the components $q_i,k_i$ as independent with mean 0 and variance 1. Each term $q_ik_i$ has mean $\mathbb{E}[q_i]\mathbb{E}[k_i]=0$ and variance
+
+      $$\mathbb{E}[q_i^2k_i^2]-0=\mathbb{E}[q_i^2]\,\mathbb{E}[k_i^2]=1$$
+
+      The $d_k$ terms are independent, so
+
+      $$\mathrm{Var}(q\cdot k)=\sum_{i=1}^{d_k}\mathrm{Var}(q_ik_i)=d_k$$
+
+      The logits have standard deviation $\sqrt{d_k}$: 8 for $d_k=64$, 16 for $d_k=256$.
+
+      **Step 2: big logits kill the softmax gradient.** For $p=\mathrm{softmax}(z)$, $p_i=e^{z_i}/\sum_l e^{z_l}$. Differentiating with the quotient rule gives $\partial p_i/\partial z_j=p_i(\delta_{ij}-p_j)$, or in matrix form
+
+      $$\frac{\partial p}{\partial z}=\mathrm{diag}(p)-pp^\top$$
+
+      When the logits are spread over a range much wider than 1, the largest one dominates and $p$ approaches a one-hot vector $e_a$. Then $\mathrm{diag}(e_a)-e_ae_a^\top=0$: every entry of the Jacobian goes to zero, so almost no gradient reaches the scores, $W_Q$ or $W_K$.
+
+      ![Synthetic: one query vs 32 random keys, $q,k\sim\mathcal N(0,I)$. Unscaled, the rows saturate toward one-hot and the Jacobian norm collapses as $d_k$ grows; scaled, both stay flat.](llm.self-attention/saturation)
+
+      **The fix.** Dividing by $\sqrt{d_k}$ gives $\mathrm{Var}(q\cdot k/\sqrt{d_k})=1$ for every $d_k$. In the simulation above, at $d_k=256$ the mean largest weight is about 0.9 unscaled and about 0.17 scaled.
+
+      **Scope.** This argument holds **at initialisation**, under independence and unit variance. Training breaks both: queries and keys become correlated and can grow, so logits can grow without bound. That "attention logit growth" is a known instability in large models, fixed by normalising $q$ and $k$ (QK-norm; see `llm.training-stability`). μP uses $1/d_k$ instead, because aligned $q$ and $k$ make $q\cdot k$ grow like $d_k$ (see `llm.mup`).
+    source: Vaswani et al. 2017 §3.2.1 and footnote 4 (pdf p.4); d2l §11.3.1; Dao et al. 2022 App. B.2 (pdf p.18); Dehghani et al. 2023 §2 (pdf p.2); Wortsman et al. 2023 §3.1
+
+  - title: "Multi-head attention"
+    body: |
+      **The limitation of one head.** For each query, one head outputs one convex combination $\sum_jP_{ij}v_j$. Suppose a token needs both the previous token's identity and its sentence's subject. One head must split its weight between them and returns a blend of the two value vectors, both passed through the same $W_V$, so the two pieces of information land in the same subspace and can't be separated.
+
+      **Several heads.** Run $h$ attention functions in parallel, each with its own projections into $d_k=d/h$ dimensions:
+
+      $$\mathrm{head}_i=\mathrm{Attn}(XW_Q^{(i)},XW_K^{(i)},XW_V^{(i)})$$
+
+      $$\mathrm{MHA}(X)=[\mathrm{head}_1;\dots;\mathrm{head}_h]\,W_O$$
+
+      with $W_Q^{(i)},W_K^{(i)},W_V^{(i)}\in\mathbb{R}^{d\times d_k}$ and $W_O\in\mathbb{R}^{hd_k\times d}$. Each head has its own attention pattern.
+
+      **In code** the $h$ projections are one $d\times d$ matmul, reshaped from $(B,n,d)$ to $(B,n,h,d_k)$ and transposed to $(B,h,n,d_k)$. Scores are then $(B,h,n,n)$, the softmax runs over the last axis, and the heads are transposed back and merged to $(B,n,d)$ before $W_O$.
+
+      **Cost is the same as one wide head.**
+      - Parameters: $W_Q,W_K,W_V,W_O$ are each $d\times d$ in total, so $4d^2$ regardless of $h$, plus $4d$ if the projections have biases.
+      - Score FLOPs: $h$ heads $\times\,2n^2d_k=2n^2d$, as for one head of width $d$.
+      - Memory is the exception: there are $h$ score matrices of size $n\times n$, $h$ times more than one head.
+
+      **Heads are independent and additive.** Split $W_O$ into row blocks $W_O^{(i)}\in\mathbb{R}^{d_k\times d}$, one per head. Block multiplication gives
+
+      $$\mathrm{MHA}(X)=\sum_{i=1}^h P^{(i)}XW_V^{(i)}W_O^{(i)}$$
+
+      where $P^{(i)}$ is head $i$'s attention matrix. Each head reads with its own pattern, writes through its own $d\times d$ map $W_V^{(i)}W_O^{(i)}$ of rank at most $d_k$, and the results add. Interpretability work analyses heads this way: $W_Q^{(i)}W_K^{(i)\top}$ decides *where* to read, and $W_V^{(i)}W_O^{(i)}$ decides *what* gets written.
+    source: Vaswani et al. 2017 §3.2.2 (pdf p.4–5); d2l §11.5; SLP3 ch. 7 §7.1.1, §7.3 (pdf p.7, p.15); Elhage et al. 2021 "Attention Heads are Independent and Additive"
+
+  - title: "Permutation equivariance, and self- vs cross-attention"
+    body: |
+      **Claim.** Let $\Pi$ be an $n\times n$ permutation matrix, so $\Pi X$ reorders the tokens. Then
+
+      $$\mathrm{Attn}(\Pi X)=\Pi\,\mathrm{Attn}(X)$$
+
+      Reordering the input reorders the output in the same way and changes nothing else.
+
+      **Proof.** The projections act row by row, so $Q'=\Pi Q$, $K'=\Pi K$ and $V'=\Pi V$. The scores become
+
+      $$S'=\Pi QK^\top\Pi^\top/\sqrt{d_k}=\Pi S\,\Pi^\top$$
+
+      Left-multiplying by $\Pi$ reorders the rows; right-multiplying by $\Pi^\top$ reorders the columns. A row-wise softmax doesn't care about row order, and permuting the entries within a row permutes its softmax outputs the same way. So $\mathrm{softmax}(\Pi S\Pi^\top)=\Pi P\,\Pi^\top$. Finally, since $\Pi^\top\Pi=I$:
+
+      $$O'=\Pi P\,\Pi^\top\Pi V=\Pi PV=\Pi O$$
+
+      **Consequence.** The FFN and LayerNorm also act on each token separately, so a whole transformer stack with no position information is equivariant too. "Dog bites man" and "man bites dog" produce the same set of output vectors, just reordered. Order has to be injected, which is the job of positional encodings (`llm.positional-encodings`).
+
+      **What a causal mask does to the proof.** With a mask $M$ added to the scores, the permuted input sees $\Pi S\Pi^\top+M$, while equivariance would need $\Pi(S+M)\Pi^\top$. These agree only if $\Pi M\Pi^\top=M$, which for the triangular causal mask holds only for $\Pi=I$. So a causal model is not equivariant, and it can in fact recover positions with no encodings at all. If a head attends uniformly with a causal mask, position $t$ gives weight $1/t$ to the first token, so it can read off its own position (Kazemnejad et al. 2023, Theorem 1). Masks are covered in `llm.causal-attention`.
+
+      **Self- vs cross-attention.** In self-attention $Q$, $K$ and $V$ all come from the same sequence. In cross-attention the queries come from one sequence (decoder tokens, image latents) and the keys and values from another (encoder output, text). The scores are then $n\times m$ (see `llm.cross-attention`).
+    source: d2l §11.6.1, §11.6.3; Vaswani et al. 2017 §3.2.3, §3.5 (pdf p.5–6); Kazemnejad et al. 2023 §5.1, Theorem 1 (pdf p.6)
+
+  - title: "Cost: FLOPs, memory, path length"
+    body: |
+      **Convention.** A matmul of $(a\times b)(b\times c)$ costs $2abc$ FLOPs, one multiply and one add per term. Below are forward FLOPs for one layer on $n$ tokens, with $h$ heads, $d_k=d/h$ and no gating.
+      - Q, K, V, O projections: $4\times 2nd^2=8nd^2$
+      - Scores $QK^\top$: $h\cdot 2n^2d_k=2n^2d$
+      - Weighted sum $PV$: $2n^2d$
+      - MLP with hidden width $4d$: $2\times 2n\cdot d\cdot 4d=16nd^2$
+
+      The linear layers total $24nd^2$ and the attention matmuls $4n^2d$. They are equal when
+
+      $$4n^2d=24nd^2\iff n=6d$$
+
+      ![Attention's share of forward FLOPs vs $n/d$. Each quoted crossover depends on its conventions.](llm.self-attention/flop-share)
+
+      **Each crossover carries its conventions.**
+      - With a causal mask an efficient kernel skips about half the score entries, so attention costs $2n^2d$ and the crossover moves to $n=12d$. That is Kaplan et al.'s condition $d_{model}>n_{ctx}/12$.
+      - The Scaling Book's $T>8D$ assumes a *gated* MLP with $F=4D$. Its three matrices cost $24nd^2$, so the linear layers total $32nd^2$.
+      - Llama-style SwiGLU with $F\approx\tfrac83d$ is back to $24nd^2$ (a bit less with GQA).
+
+      For $d=4096$ and full attention, attention FLOPs pass the linear layers only beyond about 24.6k tokens.
+
+      **Memory.** A naive implementation materialises $S$ and $P$, which are $h\times n\times n$ per layer. With $h=32$, $n=8192$ and 2-byte entries, one copy is $32\cdot 8192^2\cdot 2$ bytes $=4$ GiB per layer, per sequence. FlashAttention avoids storing it (`llm.flash-attention`).
+
+      **Path length and parallelism** (Vaswani Table 1), for sequence length $n$:
+      - Self-attention: $O(n^2d)$ per layer, $O(1)$ sequential steps, path length $O(1)$ between any two positions.
+      - Recurrent: $O(nd^2)$, $O(n)$ sequential steps, path length $O(n)$.
+      - Convolution with kernel $k$: $O(knd^2)$, $O(1)$ steps, path length $O(\log_k n)$ with dilation.
+    source: Vaswani et al. 2017 §4, Table 1 (pdf p.6–7); Scaling Book Part 4 "Counting Dots", "Attention", "Fractional cost of attention"; Kaplan et al. 2020 §2.1, Table 1 (pdf p.7)
+
+  - title: "Backward pass: deriving the gradients"
+    body: |
+      **Setup.** One head, with $S=QK^\top/\sqrt{d_k}$, $P=\mathrm{softmax}_{\text{row}}(S)$ and $O=PV$. A scalar loss $L$ sits downstream, and we are handed $dO=\partial L/\partial O$ ($n\times d_v$). We want $dQ$, $dK$ and $dV$. The notation $dX$ means $\partial L/\partial X$, which has the shape of $X$.
+
+      **Refresher (matmul rule).** For $Y=AB$: $dA=dY\,B^\top$ and $dB=A^\top dY$ (`fund.backprop`).
+
+      **Through $O=PV$:**
+
+      $$dV=P^\top dO,\qquad dP=dO\,V^\top$$
+
+      So $dP_{ij}=dO_i\cdot v_j$, where $dO_i$ is row $i$ of $dO$.
+
+      **Through the row-wise softmax.** Row $i$ of $P$ depends only on row $i$ of $S$, through the Jacobian $\mathrm{diag}(p)-pp^\top$ (with $p=P_{i,:}$). The Jacobian is symmetric, so
+
+      $$dS_{i,:}=(\mathrm{diag}(p)-pp^\top)\,dP_{i,:}=p\odot dP_{i,:}-(p^\top dP_{i,:})\,p$$
+
+      Name the scalar $D_i=\sum_jP_{ij}dP_{ij}$. Then
+
+      $$dS_{ij}=P_{ij}\,(dP_{ij}-D_i)$$
+
+      **A shortcut for $D_i$.** Substitute $dP_{ij}=dO_i\cdot v_j$:
+
+      $$\begin{aligned} D_i&=\textstyle\sum_jP_{ij}\,dO_i\cdot v_j\\ &=dO_i\cdot\textstyle\sum_jP_{ij}v_j=dO_i\cdot O_i \end{aligned}$$
+
+      So $D$ is a row-wise dot product of two $n\times d_v$ matrices. It never needs a full row of $dP$, which is what lets FlashAttention's backward work tile by tile (`llm.flash-attention-2-3`).
+
+      **Sanity check.** $\sum_j dS_{ij}=D_i-D_i\sum_jP_{ij}=0$. It must be: adding a constant to every logit in a row leaves the softmax unchanged, so the gradient has no component along the all-ones direction.
+
+      **Through the scores.** With $S=QK^\top/\sqrt{d_k}$:
+
+      $$dQ=\frac{dS\,K}{\sqrt{d_k}},\qquad dK=\frac{dS^\top Q}{\sqrt{d_k}}$$
+
+      **Down to the weights.** $dW_Q=X^\top dQ$, and likewise for $W_K$ and $W_V$. $X$ feeds all three projections, so its gradient sums the three contributions: $dX=dQ\,W_Q^\top+dK\,W_K^\top+dV\,W_V^\top$.
+    source: Dao et al. 2022 App. B.2, Eqs. 3–6 (pdf p.18–19); Scaling Book Part 4 "Forward and reverse FLOPs"
+
+  - title: "Backward pass in code, and what it costs"
+    body: |
+      ```python
+      def attn_fwd(Q, K, V):
+          S = Q @ K.T / np.sqrt(Q.shape[1])
+          S -= S.max(1, keepdims=True)    # stable softmax
+          P = np.exp(S); P /= P.sum(1, keepdims=True)
+          return P @ V, P
+
+      def attn_bwd(Q, K, V, P, O, dO):
+          dV = P.T @ dO
+          dP = dO @ V.T
+          D = (dO * O).sum(1, keepdims=True)  # = rowsum(P*dP)
+          dS = P * (dP - D)
+          s = 1 / np.sqrt(Q.shape[1])
+          return dS @ K * s, dS.T @ Q * s, dV
+      ```
+
+      **Checked.** With random $Q$ (4×3), $K$ (5×3), $V$ (5×2) and the loss $\sum O\odot G$ (so $dO=G$), centred finite differences in float64 with $h=10^{-5}$ agree with `attn_bwd` to a maximum relative error of $3\times10^{-10}$.
+
+      **Numerics.** Subtracting the row max before `exp` leaves the softmax unchanged (the factor $e^{-m}$ cancels) and keeps every exponent at most 0, so nothing overflows. Masks enter as $-\infty$ added to $S$ before this step; the edge cases are in `llm.causal-attention`.
+
+      **FLOP count.** The forward has two $n\times n$ matmuls, $QK^\top$ and $PV$, totalling $4n^2d$. The backward has four of the same size: $dV$, $dP$, $dQ$ and $dK$, totalling $8n^2d$. So the attention core's backward costs about **2× its forward**, the same ratio as a linear layer's. The elementwise work ($dS$, $D$) is $O(n^2)$ and $O(nd)$.
+
+      **Memory.** The backward reads $P$, an $n\times n$ matrix per head. Either it was stored during the forward pass, which costs quadratic memory, or it is **recomputed** from $Q$, $K$ and the saved row normalisers, which costs extra FLOPs but only $O(n)$ extra storage. FlashAttention takes the second option and is faster anyway, because it moves far fewer bytes (`llm.flash-attention`).
+    source: Dao et al. 2022 App. B.2 (pdf p.18–19); Scaling Book Part 4 "Forward and reverse FLOPs"
+
+  - title: "Pitfalls and what interviewers probe"
+    body: |
+      **Pitfalls.**
+      - Softmax over the query axis instead of the key axis: columns sum to 1 instead of rows.
+      - Forgetting $1/\sqrt{d_k}$. It trains at small $d_k$ and fails quietly at large $d_k$.
+      - Treating the variance argument as a guarantee during training. It describes initialisation only.
+      - Quoting "$4d^2$ parameters" without saying "no biases", or "attention dominates at $n>6d$" without the MLP and masking conventions.
+      - Merging heads with a `view` after a `transpose` without making the tensor contiguous first. That scrambles the head dimension or raises an error.
+      - Saying MHA saves memory. Score memory grows with $h$.
+
+      **The follow-up chain.**
+      - *Why scale by $\sqrt{d_k}$?* $\mathrm{Var}(q\cdot k)=d_k$ at init, and large logits make $\mathrm{diag}(p)-pp^\top\to0$.
+      - *Why not divide by $d_k$?* At init that shrinks the logit std to $1/\sqrt{d_k}$, so attention starts nearly uniform. μP does use $1/d_k$, arguing that trained $q$ and $k$ are aligned.
+      - *Why multiple heads?* One head gives one convex combination per query. $h$ heads give $h$ patterns, written into separate subspaces, at the same parameter and FLOP cost.
+      - *Is attention permutation-invariant?* Equivariant, not invariant. Outputs move with inputs, and a causal mask breaks even that.
+      - *Where does the cost go?* $8nd^2$ in projections, $4n^2d$ in the two attention matmuls, and $h n^2$ memory for scores.
+      - *Derive the backward.* $dV=P^\top dO$, $dP=dO\,V^\top$, $dS=P\odot(dP-D)$ with $D_i=dO_i\cdot O_i$, then $dQ$ and $dK$ through $1/\sqrt{d_k}$.
+      - *Why must each row of $dS$ sum to zero?* The softmax is invariant to shifting a row of logits by a constant.
+      - *Versus an RNN?* $O(1)$ path length and full parallelism over positions, paid for with $O(n^2)$ compute and memory.
+    source: Vaswani et al. 2017 §3.2, §4 (pdf p.4–7); Dao et al. 2022 App. B.2 (pdf p.18–19); d2l §11.5
+
+  - title: "Key results"
+    body: |
+      - **Attention:** $\mathrm{softmax}(QK^\top/\sqrt{d_k})\,V$, with the softmax along each row (over keys). Scores are $n\times m$ and the output is $n\times d_v$.
+      - **Scale:** at init, $\mathrm{Var}(q\cdot k)=d_k$, so divide by $\sqrt{d_k}$.
+      - **Softmax Jacobian:** $\mathrm{diag}(p)-pp^\top$, which tends to $0$ as $p$ becomes one-hot.
+      - **MHA:** $h$ heads with $d_k=d/h$. Parameters are $4d^2$ without biases and independent of $h$; score memory is $hn^2$. Equivalently $\sum_i P^{(i)}XW_V^{(i)}W_O^{(i)}$.
+      - **Equivariance:** $\mathrm{Attn}(\Pi X)=\Pi\,\mathrm{Attn}(X)$ with no mask and no positions.
+      - **Forward FLOPs per layer:** projections $8nd^2$, attention $4n^2d$, a $4d$ MLP $16nd^2$. Crossovers: $n=6d$ (full, non-gated), $12d$ (causal), $8d$ (gated $F=4d$).
+      - **Backward:**
+
+      $$\begin{aligned} dV&=P^\top dO,\quad dP=dO\,V^\top\\ dS&=P\odot(dP-D),\quad D_i=dO_i\cdot O_i\\ dQ&=dS\,K/\sqrt{d_k},\quad dK=dS^\top Q/\sqrt{d_k} \end{aligned}$$
+
+      This costs about 2× the forward attention matmuls, and needs $P$ stored or recomputed.
+    source: Vaswani et al. 2017 §3.2 (pdf p.4–5); Dao et al. 2022 App. B.2 (pdf p.18–19); Scaling Book Part 4
+
+quiz:
+  - id: q9
+    prompt: |
+      One query $q=(1,0)$ attends over three keys $(1,0)$, $(0,1)$, $(1,1)$ with scalar values $3$, $0$, $6$, using scaled dot-product attention with $d_k=2$. What is the output?
+    correct: '$\approx 3.61$'
+    wrong:
+      - '$\approx 3.80$'
+      - '$\approx 3.00$'
+      - '$\approx 6.36$'
+    explanation: |
+      Scores are $(1,0,1)/\sqrt2=(0.707,0,0.707)$. The softmax gives $(0.401,0.198,0.401)$, so the output is $0.401\cdot3+0.401\cdot6=3.61$. The value 3.80 forgets the $\sqrt2$, which sharpens the weights to $(0.422,0.155,0.422)$. The value 3.00 is the plain mean, as if the weights were uniform. The value 6.36 multiplies the raw scaled scores by the values and skips the softmax.
+    source: Vaswani et al. 2017 §3.2.1 (pdf p.4)
+
+  - id: q3
+    prompt: |
+      In a batched multi-head implementation, `q` has shape (B, h, n, d_k) and `k` has shape (B, h, m, d_k). What is the shape of `q @ k.transpose(-2, -1)`, and along which axis does the softmax run?
+    correct: "(B, h, n, m), softmax over the last axis (m)"
+    wrong:
+      - "(B, h, m, n), softmax over the last axis (n)"
+      - "(B, h, n, m), softmax over axis −2 (n)"
+      - "(B, h, d_k, d_k), softmax over the last axis"
+    explanation: |
+      The batched matmul contracts $d_k$: $(n\times d_k)(d_k\times m)=n\times m$, one row per query and one column per key. Each query's weights over keys must sum to 1, so the softmax runs along the key axis, the last one. Normalising over axis −2 would make each *key's* weights over queries sum to 1, which is the classic wrong-axis bug.
+    source: d2l §11.3.2.2, §11.5; Vaswani et al. 2017 §3.2.1 (pdf p.4)
+
+  - id: q10
+    prompt: |
+      At initialisation, a model's query and key components are roughly independent with mean 0 and variance 1. You raise the head dimension from $d_k=64$ to $d_k=256$ but keep dividing the logits by $8=\sqrt{64}$. What happens to the attention logits and the softmax?
+    correct: "Std doubles from 1 to 2; rows get peakier and gradients shrink"
+    wrong:
+      - "Std quadruples from 1 to 4; rows become nearly one-hot"
+      - "Std unchanged, since LayerNorm keeps q and k at unit scale"
+      - "Rows get flatter, since summing more dimensions cancels noise"
+    explanation: |
+      $\mathrm{Var}(q\cdot k)=d_k$, so the raw std goes from 8 to 16, and after dividing by 8 it goes from 1 to 2. The *variance* quadruples but the std only doubles, which is the trap in the first distractor. LayerNorm makes each component unit-variance, so the dot product's spread still grows with $\sqrt{d_k}$. A sum of more terms spreads out more; it doesn't cancel.
+    source: Vaswani et al. 2017 footnote 4 (pdf p.4); d2l §11.3.1
+
+  - id: q11
+    prompt: |
+      The same random $q,k\sim\mathcal N(0,I)$ with $d_k=256$ were turned into attention maps (rows = queries) using three different logit scalings: $1/d_k$, none, and $1/\sqrt{d_k}$. Which panel used **no** scaling?
+
+      ![Three 6×6 attention maps from identical queries and keys; brighter means larger weight.](llm.self-attention/heatmaps-q)
+    correct: "Panel B"
+    wrong:
+      - "Panel A"
+      - "Panel C"
+      - "None of them: the scaling cannot change which key wins"
+    explanation: |
+      Unscaled logits have std $\sqrt{256}=16$, so the largest logit in each row dominates and the rows are almost one-hot (B). Dividing by $\sqrt{d_k}$ gives unit-variance logits and moderately peaked rows (C). Dividing by $d_k$ shrinks the std to $1/16$, so the rows are nearly uniform (A). It is true that the argmax doesn't move, but the softmax weights, and therefore the gradients, change a lot.
+    source: Vaswani et al. 2017 §3.2.1 (pdf p.4); d2l §11.3.1
+
+  - id: q12
+    prompt: |
+      A derivation reads: $\mathrm{Var}(q\cdot k)=\sum_i\mathrm{Var}(q_ik_i)$ (step 1) $=\sum_i\mathrm{Var}(q_i)\mathrm{Var}(k_i)$ (step 2) $=d_k$. Suppose instead every component is independent with variance 1 but **mean** $\mu\neq0$. Which statement is right?
+    correct: 'Step 2 fails: each term has variance $1+2\mu^2$, not 1'
+    wrong:
+      - "Step 1 fails: the products $q_ik_i$ are correlated across different $i$"
+      - "Neither fails: the variance stays $d_k$ for any mean"
+      - 'Step 2 fails: each term has variance $(1+\mu^2)^2$, not 1'
+    explanation: |
+      $\mathrm{Var}(q_ik_i)=\mathbb{E}[q_i^2]\mathbb{E}[k_i^2]-(\mathbb{E}[q_i]\mathbb{E}[k_i])^2=(1+\mu^2)^2-\mu^4=1+2\mu^2$. "Variance of a product = product of variances" holds only for zero-mean independent factors. $(1+\mu^2)^2$ is the second moment $\mathbb{E}[q_i^2k_i^2]$, before subtracting the squared mean. Step 1 is fine: different coordinates stay independent, so their variances add.
+    source: Vaswani et al. 2017 footnote 4 (pdf p.4); d2l §11.3.1
+
+  - id: q8
+    prompt: |
+      Compare single-head attention with $d_k=d$ against multi-head attention with $h$ heads of size $d/h$ (no biases). Which statement is correct?
+    correct: "Same projection parameters and score FLOPs, but $h$ attention patterns"
+    wrong:
+      - "$h$ times as many Q/K/V parameters, since each head has its own projections"
+      - "Less score memory, since each head's scores use only $d/h$ dimensions"
+      - "Same patterns in every head, computed $h$ times faster in parallel"
+    explanation: |
+      The per-head projections are $d\times d/h$, and $h$ of them make one $d\times d$ matrix, so there are $4d^2$ parameters either way. Score FLOPs are $h\cdot2n^2(d/h)=2n^2d$. Score *memory* is $h\cdot n^2$, which is $h$ times **more** than one head, because every head has its own $n\times n$ matrix whatever $d_k$ is.
+    source: Vaswani et al. 2017 §3.2.2 (pdf p.5); d2l §11.5
+
+  - id: q13
+    prompt: |
+      In the attention backward pass, one row has $P_{i,:}=(0.5,\,0.3,\,0.2)$ and $dP_{i,:}=(1,\,0,\,-1)$. What is $dS_{i,:}$?
+    correct: '$(0.35,\ -0.09,\ -0.26)$'
+    wrong:
+      - '$(0.50,\ 0,\ -0.20)$'
+      - '$(0.70,\ -0.30,\ -1.30)$'
+      - '$(0.65,\ 0.09,\ -0.14)$'
+    explanation: |
+      $D_i=\sum_jP_{ij}dP_{ij}=0.5-0.2=0.3$, and $dS_{ij}=P_{ij}(dP_{ij}-D_i)$ gives $(0.5\cdot0.7,\,0.3\cdot(-0.3),\,0.2\cdot(-1.3))$. The entries sum to 0, as they must. $(0.50,0,-0.20)$ drops the $-D_i$ term ($P\odot dP$ only) and doesn't sum to zero. $(0.70,-0.30,-1.30)$ forgets the outer factor $P_{ij}$. $(0.65,0.09,-0.14)$ adds $D_i$ instead of subtracting it.
+    source: Dao et al. 2022 App. B.2, Eq. 4 (pdf p.19)
+
+  - id: q14
+    prompt: |
+      Which statement about the backward pass of $O=\mathrm{softmax}(QK^\top/\sqrt{d_k})V$ is **false**?
+    correct: '$D_i=\sum_jP_{ij}dP_{ij}$ can only be formed from a full row of $dP$'
+    wrong:
+      - '$dV=P^\top dO$, so the backward reads the $n\times n$ matrix $P$'
+      - "Every row of $dS$ sums to zero, whatever the upstream gradient"
+      - "The four backward matmuls cost about twice the forward's two"
+    explanation: |
+      Because $dP_{ij}=dO_i\cdot v_j$, the sum collapses to $D_i=dO_i\cdot O_i$, a dot product of two length-$d_v$ rows. No row of $dP$ is ever needed, and FlashAttention relies on exactly this. The other three are true. $P$ is needed (stored or recomputed). Rows of $dS$ sum to zero because of the softmax's shift invariance. The backward has four $n\times n$ matmuls ($dV,dP,dQ,dK$) against the forward's two.
+    source: Dao et al. 2022 App. B.2 (pdf p.18–19)
+
+  - id: q15
+    prompt: |
+      A block has $d=4096$, standard MHA and a non-gated MLP with hidden width $4d$. Counting forward FLOPs with full (non-causal) attention, at roughly what sequence length do the two attention matmuls ($QK^\top$, $PV$) cost as much as all the linear layers?
+    correct: "About 24.6k tokens"
+    wrong:
+      - "About 4.1k tokens"
+      - "About 32.8k tokens"
+      - "About 49.2k tokens"
+    explanation: |
+      Linear layers cost $8nd^2+16nd^2=24nd^2$ and attention $4n^2d$, so they are equal at $n=6d=24{,}576$. 4.1k ($n=d$) confuses this with Vaswani's comparison of self-attention against a *recurrent* layer. 32.8k ($8d$) is the Scaling Book's figure for a gated MLP with $F=4d$. 49.2k ($12d$) applies when a causal kernel skips half the scores. The stem fixes non-gated and non-causal.
+    source: Scaling Book Part 4 "Fractional cost of attention"; Kaplan et al. 2020 §2.1 (pdf p.7); Vaswani et al. 2017 §4 (pdf p.6–7)
+
+  - id: q16
+    prompt: |
+      A single self-attention layer with **no positional information and no mask** is applied to a 6-token sequence. You swap tokens 2 and 5 in the input. What happens to the outputs?
+    correct: "Outputs 2 and 5 swap places; every other output is unchanged"
+    wrong:
+      - "Every output changes, since each token attends to tokens 2 and 5"
+      - "Nothing changes at all, outputs 2 and 5 included"
+      - "Outputs 2 and 5 swap, and the rest shift slightly via the softmax sum"
+    explanation: |
+      Self-attention is permutation-equivariant: $\mathrm{Attn}(\Pi X)=\Pi\,\mathrm{Attn}(X)$. Every other token sees the same *set* of keys and values, only listed in a different order. The softmax denominator is a sum, and a sum doesn't depend on order, so their outputs are bit-for-bit the same up to floating-point summation order. "Nothing changes" would be invariance, which is what you get after pooling over positions, not per-position outputs.
+    source: d2l §11.6.1; Vaswani et al. 2017 §3.5 (pdf p.6)
+
+  - id: q17
+    prompt: |
+      A naive attention implementation materialises the score tensor for one layer: $h=32$ heads, $n=8192$ tokens, 2-byte (fp16) entries, batch 1. How large is one copy of it?
+    correct: "4 GiB"
+    wrong:
+      - "128 MiB"
+      - "64 MiB"
+      - "8 GiB"
+    explanation: |
+      $h\cdot n^2\cdot 2=32\cdot 8192^2\cdot 2=2^{32}$ bytes $=4$ GiB. 128 MiB is a single head's $n\times n$ matrix, as if heads shared scores. 64 MiB is the size of an $n\times d$ activation such as $Q$ (with $d=4096$), not an $n\times n$ one. 8 GiB would need 4-byte entries.
+    source: Vaswani et al. 2017 §4, Table 1 (pdf p.6); SLP3 ch. 7 §7.3 (pdf p.13)
+
+  - id: q18
+    prompt: |
+      Every token must carry forward two things: the previous token's identity and the identity of the sentence's first token, kept separable downstream. Why does one head with $d_k=d$ do this worse than two heads with $d_k=d/2$?
+    correct: "One head gives one weighted average per query, so the values blend"
+    wrong:
+      - "One wide head has fewer parameters, so it lacks the capacity"
+      - "A head of width $d$ saturates its softmax, so it cannot attend at all"
+      - "Two heads cost half the FLOPs, so they can be trained for longer"
+    explanation: |
+      Per query, a head returns $\sum_jP_{ij}v_j$. To get both tokens it must split its weight, and their values come out through the same $W_V$ into the same subspace, mixed together. Two heads each put almost all their weight on one token and write through separate blocks of $W_O$. Parameter counts and FLOPs are identical in both designs, and with $1/\sqrt{d_k}$ scaling a wide head doesn't saturate at init.
+    source: Vaswani et al. 2017 §3.2.2 (pdf p.5); Elhage et al. 2021 "Attention Heads are Independent and Additive"
+
+cards:
+  - id: f1
+    front: Write scaled dot-product attention with the shapes of $Q$, $K$, $V$, the scores and the output, and say which axis the softmax normalises.
+    back: |
+      $$\mathrm{softmax}\Big(\frac{QK^\top}{\sqrt{d_k}}\Big)V$$
+
+      $Q: n\times d_k$, $K: m\times d_k$, $V: m\times d_v$. Scores are $n\times m$, the softmax runs along each row (over the $m$ keys), and the output is $n\times d_v$.
+    source: Vaswani et al. 2017 §3.2.1 (pdf p.4)
+
+  - id: f2
+    front: Derive why attention logits are divided by $\sqrt{d_k}$, and state the assumption.
+    back: |
+      Assume $q_i,k_i$ are independent with mean 0 and variance 1 (a model of initialisation). Then $\mathrm{Var}(q_ik_i)=\mathbb{E}[q_i^2]\mathbb{E}[k_i^2]=1$, and summing $d_k$ independent terms:
+
+      $$\mathrm{Var}(q\cdot k)=d_k$$
+
+      With std $\sqrt{d_k}\gg1$ the softmax is near one-hot, and its Jacobian $\mathrm{diag}(p)-pp^\top\to0$, so gradients vanish. Dividing by $\sqrt{d_k}$ restores unit variance. This holds at init only: trained $q$ and $k$ correlate and grow (logit growth, QK-norm).
+    source: Vaswani et al. 2017 footnote 4 (pdf p.4); d2l §11.3.1
+
+  - id: f7
+    front: Jacobian of $p=\mathrm{softmax}(z)$, and what it becomes when $p$ is one-hot.
+    back: |
+      $$\begin{aligned} \frac{\partial p_i}{\partial z_j}&=p_i(\delta_{ij}-p_j)\\ \frac{\partial p}{\partial z}&=\mathrm{diag}(p)-pp^\top \end{aligned}$$
+
+      It is symmetric, and each row sums to 0 (shift invariance). For $p=e_a$ it is $\mathrm{diag}(e_a)-e_ae_a^\top=0$.
+    source: Dao et al. 2022 App. B.2 (pdf p.18)
+
+  - id: f4
+    front: Per-layer forward FLOPs of attention vs the linear layers (MHA, non-gated $4d$ MLP), and the crossover length under each common convention.
+    back: |
+      Counting 2 FLOPs per multiply-add:
+      - Projections: $8nd^2$
+      - MLP: $16nd^2$
+      - Attention matmuls: $4n^2d$
+
+      Equal at $n=6d$ (full attention). With causal skipping, attention costs $2n^2d$ and the crossover is $n=12d$ (Kaplan's $n_{ctx}/12$). With a gated MLP of $F=4d$, the linear layers cost $32nd^2$ and the crossover is $n=8d$ (Scaling Book).
+    source: Scaling Book Part 4 "Fractional cost of attention"; Kaplan et al. 2020 §2.1 (pdf p.7)
+
+  - id: f9
+    front: In the attention backward, what is $D_i$, what identity does it satisfy, and why does it matter?
+    back: |
+      $D_i=\sum_jP_{ij}dP_{ij}$ is the correction term in $dS_{ij}=P_{ij}(dP_{ij}-D_i)$. Since $dP_{ij}=dO_i\cdot v_j$,
+
+      $$D_i=dO_i\cdot O_i$$
+
+      It can be computed from two $n\times d$ matrices before any tiling, so no tile ever needs a full row of $dP$. FlashAttention's backward relies on this.
+    source: Dao et al. 2022 App. B.2, Eq. 4 (pdf p.19)
+
+  - id: f10
+    front: Parameter count of an MHA layer, and the "independent and additive heads" form.
+    back: |
+      $W_Q,W_K,W_V,W_O$ are each $d\times d$ in total, so $4d^2$ (plus $4d$ with biases), independent of $h$. Splitting $W_O$ into per-head row blocks $W_O^{(i)}$:
+
+      $$\mathrm{MHA}(X)=\sum_i P^{(i)}XW_V^{(i)}W_O^{(i)}$$
+
+      The QK circuit $W_Q^{(i)}W_K^{(i)\top}$ and the OV circuit $W_V^{(i)}W_O^{(i)}$ each have rank at most $d_k$.
+    source: Vaswani et al. 2017 §3.2.2 (pdf p.5); Elhage et al. 2021 "Attention Heads are Independent and Additive"
+
+  - id: f13
+    front: How does softmax dot-product attention arise from Nadaraya–Watson kernel regression?
+    back: |
+      Nadaraya–Watson: $f(q)=\sum_j\alpha_jv_j$ with $\alpha_j\propto\kappa(q,k_j)$. With a Gaussian kernel the log-weight is
+
+      $$-\tfrac12\|q-k_j\|^2=q\cdot k_j-\tfrac12\|k_j\|^2-\tfrac12\|q\|^2$$
+
+      The $\|q\|^2$ term cancels in the normalisation. With roughly equal key norms the $\|k_j\|^2$ term is constant too, leaving $\alpha_j=\mathrm{softmax}_j(q\cdot k_j)$.
+    source: d2l §11.3.1; Bishop PRML §6.3.1
+
+  - id: f6
+    type: open
+    front: Prove that self-attention is permutation-equivariant, explain the consequence, and say what a causal mask changes.
+    back: |
+      **Proof.** For a permutation matrix $\Pi$: $Q'=\Pi Q$, $K'=\Pi K$, $V'=\Pi V$, so $S'=\Pi S\Pi^\top$. Row-wise softmax commutes with reordering rows and with permuting entries within each row, so $P'=\Pi P\Pi^\top$. Then $O'=\Pi P\Pi^\top\Pi V=\Pi O$, using $\Pi^\top\Pi=I$.
+
+      **Consequence.** With no position signal, FFN and LayerNorm are per-token too, so the whole stack is equivariant. "Dog bites man" and "man bites dog" give the same multiset of outputs. Order must be injected with positional encodings.
+
+      **Causal mask.** Equivariance would need $\Pi M\Pi^\top=M$, which fails for any nontrivial $\Pi$ when $M$ is triangular. The mask itself leaks position. For example, uniform causal attention gives weight $1/t$ to the first token, so a NoPE decoder can recover absolute positions (Kazemnejad et al. 2023, Thm 1).
+    source: d2l §11.6.1; Kazemnejad et al. 2023 §5.1 (pdf p.6)
+
+  - id: f8
+    type: open
+    front: Derive the backward pass of one attention head, given $dO$. Include the cost and the memory issue.
+    back: |
+      Forward: $S=QK^\top/\sqrt{d_k}$, $P=\mathrm{softmax}_{\text{row}}(S)$, $O=PV$.
+
+      1. Matmul rule on $O=PV$: $dV=P^\top dO$ and $dP=dO\,V^\top$.
+      2. Row-wise softmax Jacobian $\mathrm{diag}(p)-pp^\top$: $dS_{ij}=P_{ij}(dP_{ij}-D_i)$ with $D_i=\sum_jP_{ij}dP_{ij}$.
+      3. Substitute $dP_{ij}=dO_i\cdot v_j$ to get $D_i=dO_i\cdot O_i$.
+      4. Check: rows of $dS$ sum to 0, by shift invariance.
+      5. Through the scale: $dQ=dS\,K/\sqrt{d_k}$ and $dK=dS^\top Q/\sqrt{d_k}$.
+      6. Weights: $dW_Q=X^\top dQ$ and so on. $dX$ sums three terms because $X$ fans out to Q, K and V.
+
+      **Cost.** Four $n\times n$ matmuls against the forward's two, so about 2× the forward.
+
+      **Memory.** $P$ is $n\times n$ per head: store it (quadratic) or recompute it from $Q$, $K$ and the row normalisers (FlashAttention). Verify with centred differences in float64.
+    source: Dao et al. 2022 App. B.2 (pdf p.18–19)
+
+  - id: f11
+    type: open
+    front: An interviewer asks, "Why multiple heads? Wouldn't one big head do?" Give a precise answer.
+    back: |
+      - **Expressivity.** For each query, a head outputs one convex combination of values. Two different needs, say the previous token and the subject, force one head to split its weight, and the results blend in a single value subspace. With $h$ heads there are $h$ attention patterns, each writing through its own block $W_O^{(i)}$ into a separate subspace.
+      - **Cost.** Parameters stay $4d^2$ and score FLOPs stay $2n^2d$, independent of $h$. Score memory grows as $hn^2$.
+      - **Trade-off.** More heads means smaller $d_k$, so each head's bilinear form $W_QW_K^\top$ has lower rank. In Vaswani et al.'s ablation (Table 3, rows A), one head was 0.9 BLEU worse than the best setting, and quality also fell with too many heads.
+      - **Interpretability view.** MHA is a sum of independent heads. Each has a QK circuit that decides where to read and an OV circuit that decides what to write.
+      - **Related.** Many heads can share K/V (GQA/MQA) to shrink the KV cache (`llm.mqa-gqa-mla`).
+    source: Vaswani et al. 2017 §3.2.2, §6.2 Table 3 (pdf p.5, p.8–9); d2l §11.5; Elhage et al. 2021
+
+  - id: f12
+    type: open
+    front: Compare a self-attention layer with recurrent and convolutional layers on compute, parallelism and path length. When is each cheaper?
+    back: |
+      For sequence length $n$ and width $d$ (Vaswani Table 1):
+      - **Self-attention:** $O(n^2d)$ per layer, $O(1)$ sequential steps, $O(1)$ path between any two positions.
+      - **RNN:** $O(nd^2)$, $O(n)$ sequential steps, $O(n)$ path.
+      - **Convolution (kernel $k$):** $O(knd^2)$, $O(1)$ steps, $O(n/k)$ path, or $O(\log_k n)$ with dilation.
+
+      Self-attention is cheaper than recurrence per layer when $n<d$. Within a transformer block, the attention matmuls overtake the linear layers at about $n=6d$ (full) or $12d$ (causal). Short paths make long-range dependencies easier to learn, and full parallelism over positions is why transformers train fast. Recurrence wins on inference memory: constant state rather than a growing KV cache (see `llm.architecture-comparison`).
+    source: Vaswani et al. 2017 §4, Table 1 (pdf p.6–7); d2l §11.6.2
+
+reading:
+  - title: "Attention Is All You Need (Vaswani et al., 2017), §3.2 and §4"
+    url: https://arxiv.org/abs/1706.03762
+    kind: paper
+    note: The original definitions, footnote 4's variance argument, and Table 1's complexity and path-length comparison.
+  - title: "Dive into Deep Learning, §11.3 Attention Scoring Functions and §11.5 Multi-Head Attention"
+    url: https://d2l.ai/chapter_attention-mechanisms-and-transformers/attention-scoring-functions.html
+    kind: book
+    note: The Gaussian-kernel-to-dot-product derivation, the masked softmax and runnable code. §11.5 shows the reshape and transpose for heads.
+  - title: "FlashAttention (Dao et al., 2022), Appendix B.2: memory-efficient backward pass"
+    url: https://arxiv.org/abs/2205.14135
+    kind: paper
+    note: The cleanest written derivation of dV, dP, dS and the D_i = dO_i·O_i identity.
+  - title: "A Mathematical Framework for Transformer Circuits (Elhage et al., 2021)"
+    url: https://transformer-circuits.pub/2021/framework/index.html
+    kind: blog
+    note: Read "Attention Heads are Independent and Additive" for the per-head W_O split and the QK/OV circuit view.
+  - title: "All the Transformer Math You Need to Know (JAX Scaling Book, Part 4)"
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    kind: book
+    note: FLOP and parameter accounting for attention and MLP blocks, including the T > 8D crossover and its gated-MLP assumption.

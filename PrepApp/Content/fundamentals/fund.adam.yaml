@@ -1,0 +1,457 @@
+id: fund.adam
+area: fundamentals
+title: "Adam & AdamW"
+summary: How Adam combines momentum with per-coordinate scaling, why it needs bias correction (derived), what ε and β₂ really control, why L2 regularization is not weight decay under Adam, and the convergence and generalization caveats.
+order: 430
+level: core
+tags: [optimization, adam, adamw, weight-decay, training]
+prereqs: [fund.adaptive-lr, fund.regularization]
+
+explainer:
+  - title: "The problem, and how Adam is built"
+    body: |
+      **The problem.** SGD uses one learning rate for every parameter. But gradient scales differ by orders of magnitude across parameters: embeddings of rare tokens, layers at different depths, biases versus weights. A step size that is safe for the largest gradients is far too small for the rest. The fix is a per-coordinate step size, i.e. a diagonal preconditioner.
+
+      **The lineage, in brief** (derived in fund.adaptive-lr). All operations below are elementwise.
+      - **AdaGrad** divides by $\sqrt{\sum_{s\le t}g_s^2}$. The sum only grows, so the effective LR decays like $1/\sqrt t$ even when that's unwanted.
+      - **RMSProp** replaces the sum with an exponential moving average (EMA) of $g^2$, which forgets old gradients. But it has no momentum, and its EMA starts at 0, which biases its early estimates.
+
+      **Adam** = momentum (an EMA of $g$) + RMSProp (an EMA of $g^2$) + a correction for the zero start. With gradient $g_t$ at step $t$:
+
+      $$\begin{aligned}m_t&=\beta_1m_{t-1}+(1-\beta_1)g_t\\ v_t&=\beta_2v_{t-1}+(1-\beta_2)g_t^2\\ \hat m_t&=m_t/(1-\beta_1^t)\\ \hat v_t&=v_t/(1-\beta_2^t)\\ \theta_t&=\theta_{t-1}-\alpha\,\frac{\hat m_t}{\sqrt{\hat v_t}+\epsilon}\end{aligned}$$
+
+      - $m_t$ estimates the gradient's mean (first moment). $v_t$ estimates its *uncentered* second moment $\mathbb E[g^2]$, not its variance.
+      - Defaults: $\alpha=10^{-3}$, $\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$. The memory lengths are about $1/(1-\beta)$: 10 steps for $m$, 1000 for $v$.
+      - Kingma & Ba call the LR $\alpha$; Goodfellow et al. write $\rho_1,\rho_2$ for the betas and $\delta$ for $\epsilon$.
+
+      **NAdam** swaps the heavy-ball numerator for a Nesterov-style look-ahead, $\beta_1m_t+(1-\beta_1)g_t$, in place of $m_t$ (with the matching bias correction). The Tuning Playbook lists it alongside Adam as a default choice.
+    source: Kingma & Ba 2015 Alg. 1, §2; Goodfellow DL §8.5.3; Tuning Playbook FAQ "What are the update rules for all the popular optimization algorithms?"
+
+  - title: "Bias correction, derived"
+    body: |
+      $v_0=0$, so early EMAs are pulled toward zero. How much? Unroll the recursion:
+
+      $$v_t=(1-\beta_2)\sum_{i=1}^t\beta_2^{\,t-i}g_i^2.$$
+
+      Take expectations. Assume the second moment is **stationary**, $\mathbb E[g_i^2]=\mathbb E[g^2]$ for all $i$. (No independence across steps is needed: linearity of expectation does the work.)
+
+      $$\begin{aligned}\mathbb E[v_t]&=\mathbb E[g^2](1-\beta_2)\sum_{i=1}^t\beta_2^{\,t-i}\\&=\mathbb E[g^2]\,(1-\beta_2^t)\end{aligned}$$
+
+      The second line is a finite geometric series. So dividing by $1-\beta_2^t$ removes the bias, and the same argument works for $m_t$. If the second moment drifts slowly, a small extra error remains, which stays small because old gradients get exponentially small weight.
+
+      **Why it matters more for $v$.** The factor $1-\beta^t$ approaches 1 after roughly $1/(1-\beta)$ steps. That is about 10 steps for $\beta_1=0.9$ but thousands for $\beta_2=0.999$: $1-0.999^{1000}\approx0.63$. Without correction, $\sqrt{v_t}$ is too small for much longer than $m_t$, so the step $m/\sqrt v$ is too **large**.
+
+      **Worked numbers** (constant gradient $g$, $\epsilon\approx0$). At $t=1$: $m_1=0.1g$ and $v_1=0.001g^2$. The uncorrected step is $\alpha\cdot0.1/\sqrt{0.001}\approx3.16\alpha$. The corrected one is $\alpha\cdot g/|g|=\alpha\,\mathrm{sign}(g)$. The uncorrected step then keeps *growing*, to about $6.6\alpha$ at $t\approx12$, and returns to within 3% of the corrected step only after about 3000 steps.
+
+      ![Top: raw EMAs lag the true $|g|=1$, and $\sqrt{v}$ lags far more. Bottom: the uncorrected step overshoots the corrected one, peaking at 6.6×.](fund.adam/bias-correction)
+    source: Kingma & Ba 2015 §3 (eqs. 1–4); Goodfellow DL §8.5.3
+
+  - title: "Step size, invariances and the preconditioner view"
+    body: |
+      **The step is bounded by about $\alpha$.** Ignore $\epsilon$. The step per coordinate is $\Delta_t=\alpha\,\hat m_t/\sqrt{\hat v_t}$. Since $|\mathbb E[g]|\le\sqrt{\mathbb E[g^2]}$, the ratio is typically at most about 1, so $|\Delta_t|\lesssim\alpha$. Kingma & Ba make this precise: $|\Delta_t|\le\alpha(1-\beta_1)/\sqrt{1-\beta_2}$ in the extreme sparse case where $1-\beta_1>\sqrt{1-\beta_2}$, and $|\Delta_t|\le\alpha$ otherwise. So $\alpha$ acts like a trust-region radius in parameter units, which makes its scale easy to guess.
+
+      **Signal-to-noise reading.** $\hat m/\sqrt{\hat v}$ is near $\pm1$ when gradients agree in sign, and near 0 when they are noise around zero, as happens close to an optimum. So steps shrink automatically there.
+
+      **Scale invariance.** Multiply all gradients by $c>0$, for example by scaling the loss. Then $\hat m\to c\hat m$ and $\sqrt{\hat v}\to c\sqrt{\hat v}$, so the step is unchanged (as long as $\epsilon$ is negligible). SGD's step would scale by $c$. The same holds coordinate by coordinate: Adam is invariant to a *diagonal* rescaling of the gradient.
+
+      **Sign descent.** With $\beta_1=\beta_2=0$, the step is $\alpha\,g/|g|=\alpha\,\mathrm{sign}(g)$. Adam is a smoothed, momentum version of sign descent.
+
+      **Preconditioner view.** The update is $\theta\leftarrow\theta-\alpha P_t^{-1}\hat m_t$ with $P_t=\mathrm{diag}(\sqrt{\hat v_t})+\epsilon I$. This is diagonal preconditioning, as in fund.gradient-descent. But $\sqrt{\hat v}$ is the RMS gradient, not the Hessian diagonal; the link to curvature is heuristic. Preconditioning also helps at scale: Adam (and K-FAC) keep scaling perfectly to larger batch sizes than momentum SGD (Zhang et al. 2019).
+
+      ![50 deterministic steps on $\tfrac12(x^2+100y^2)$, step sizes picked by hand (illustrative, not a ranking). RMSProp and Adam take similar-sized steps in both coordinates despite the 100× curvature gap.](fund.adam/optimizer-race)
+    source: Kingma & Ba 2015 §2.1; Zhang et al. 2019 §1; Murphy PML1 §8.4.6
+
+  - title: "ε: a numerical guard and a hidden learning rate"
+    body: |
+      $\epsilon$ keeps the division finite when $\hat v\approx0$. But it also changes the algorithm whenever it is not negligible next to $\sqrt{\hat v}$.
+
+      **Large-$\epsilon$ limit.** If $\epsilon\gg\sqrt{\hat v}$ in every coordinate:
+
+      $$\Delta\theta\approx-\frac{\alpha}{\epsilon}\,\hat m$$
+
+      This is momentum SGD with LR $\alpha/\epsilon$, applied to the EMA $\hat m$, with no per-coordinate adaptivity. So Adam *contains* momentum SGD as $\epsilon\to\infty$ with $\alpha/\epsilon$ held fixed. Changing $\epsilon$ at fixed $\alpha$ changes the effective step size whenever gradients are comparable to $\epsilon$. That's why Choi et al. searched $(\epsilon,\alpha/\epsilon)$ jointly, and why optimizer rankings in papers flip with the tuning protocol. Choi et al. found that, with all four hyperparameters tuned, Adam never lost to momentum SGD.
+
+      **Small gradients.** When a layer's gradient RMS $r$ falls to about $\epsilon$, its step is scaled by $r/(r+\epsilon)$: halved at $r=\epsilon$, and shrinking further below. Wortsman et al. saw gradient RMS near the default $10^{-8}$ in a 4.8B-parameter model, where lowering $\epsilon$ to $10^{-15}$ improved the loss.
+
+      **Precision.** In fp16, $10^{-8}$ underflows to zero, so keep optimizer state in fp32 or pick $\epsilon$ for the format. Some recipes use larger values; Llama 2 used $10^{-5}$.
+
+      **Convention traps.** Some implementations add $\epsilon$ inside the square root, $\sqrt{\hat v+\epsilon}$. Kingma & Ba's "efficient" ordering folds the bias corrections into the LR and uses an $\hat\epsilon$ in the denominator that is not the same number as $\epsilon$. Either way, the same "eps" value means different things in different libraries.
+
+      The full derivation (including the heavy-ball constant) and the tuning protocol are in sys.tuning-pipeline.
+    source: Choi et al. 2019 §3–4, App. A; Wortsman et al. 2023 §3.4; Kingma & Ba 2015 §2; Touvron et al. 2023 §2.2
+
+  - title: "β₂, loss spikes, warmup and memory"
+    body: |
+      **What $\beta_2$ controls.** The memory of $v$ is about $1/(1-\beta_2)$ steps. A long memory gives a smooth, accurate scale estimate, but one that reacts slowly when gradients change scale.
+
+      **An outlier after a quiet stretch.** Suppose a coordinate's gradients have been near zero for a long time, so $m,v\approx0$ and the bias factors are about 1. Then a single gradient $G$ arrives: $m=(1-\beta_1)G$ and $v=(1-\beta_2)G^2$, so the step is
+
+      $$|\Delta|=\alpha\,\frac{1-\beta_1}{\sqrt{1-\beta_2}}.$$
+
+      This is Kingma & Ba's worst case: $3.16\alpha$ for $\beta_2=0.999$, but $0.45\alpha$ for $\beta_2=0.95$. Afterwards $m$ decays by $\beta_1$ per step and $\sqrt v$ only by $\sqrt{\beta_2}$, so the coordinate keeps moving. Summing the geometric series, one outlier moves it about $32\alpha$ in total with $\beta_2=0.999$, against about $6\alpha$ with $0.95$. A "stale" second moment plausibly drives the loss spikes seen in large transformers, and lowering $\beta_2$ is a standard fix. Llama 2 used $\beta_2=0.95$.
+
+      **A stability threshold.** Freeze the preconditioner $P$ and ignore bias correction. Then Adam is heavy ball on the preconditioned Hessian $P^{-1}H$, with LR $\alpha(1-\beta_1)$, because $m=(1-\beta_1)\times$ the heavy-ball buffer. The heavy-ball limit $\eta\lambda<2+2\beta$ (fund.sgd-momentum) becomes
+
+      $$\lambda_{max}(P^{-1}H)<\frac{2+2\beta_1}{(1-\beta_1)\alpha}=\frac{38}{\alpha}$$
+
+      for $\beta_1=0.9$. This matches the adaptive edge-of-stability threshold that Cohen et al. report (cited by Wortsman et al.) and Gilmer et al.'s empirical "about $40/\eta$". It holds only as long as $P$ changes slowly.
+
+      **Warmup.** Early $\hat v$ rests on a few samples even after bias correction, which is one reason Adam runs use LR warmup (RAdam tries to correct for it directly). See sys.tuning-diagnostics.
+
+      **Memory.** $m$ and $v$ add two fp32 values per parameter, 8 bytes. For 7B parameters that is 56 GB of optimizer state, which is what ZeRO stage 1 shards.
+    source: Kingma & Ba 2015 §2.1; Wortsman et al. 2023, Related work; Touvron et al. 2023 §2.2; Cohen et al. 2021 §2; Gilmer et al. 2021 App. (Adam)
+
+  - title: "L2 regularization is not weight decay under Adam"
+    body: |
+      **Two ways to shrink weights.** *L2 regularization* adds $\frac{\lambda'}2\|\theta\|^2$ to the loss, so $\lambda'\theta$ is added to the gradient. *Weight decay* multiplies the weights by $(1-\lambda)$ each step, separately from the gradient step.
+
+      **For SGD they coincide.** SGD on the L2-regularized loss gives
+
+      $$\begin{aligned}\theta^+&=\theta-\alpha(g+\lambda'\theta)\\&=(1-\alpha\lambda')\theta-\alpha g\end{aligned}$$
+
+      This is weight decay with $\lambda=\alpha\lambda'$ (Loshchilov & Hutter, Prop. 1). Note the coupling: if the best per-step decay is fixed, the best $\lambda'$ moves whenever $\alpha$ changes.
+
+      **For Adam they don't.** The penalty gradient enters $m$ and is divided by $\sqrt{\hat v}$ along with everything else. Coordinate $i$ shrinks by roughly $\alpha\lambda'\theta_i/\sqrt{\hat v_i}$ per step (assuming the loss gradient dominates $\hat v$). **Weights with a large gradient history are barely regularized**, and weights with tiny gradients are hammered. No choice of $\lambda'$ reproduces uniform decay for any preconditioner that is not a multiple of $I$ (Prop. 2).
+
+      **The equivalent penalty.** Take an optimizer with a fixed diagonal preconditioner, $\theta\leftarrow\theta-\alpha\,\mathrm{diag}(1/s)\nabla f$. Adding decay $\lambda\theta$ is the same as adding $\alpha\,\mathrm{diag}(1/s)\nabla R$ with $\nabla R=(\lambda/\alpha)\,s\odot\theta$, that is
+
+      $$R(\theta)=\frac{\lambda}{2\alpha}\sum_i s_i\theta_i^2.$$
+
+      So decoupled decay is an L2 penalty that weights each coordinate by its gradient scale $s_i$ (Prop. 3). It regularizes high-gradient weights *more* than plain L2 would.
+
+      **AdamW** decouples the two:
+
+      $$\theta_t=\theta_{t-1}-\eta_t\Big(\frac{\alpha\,\hat m_t}{\sqrt{\hat v_t}+\epsilon}+\lambda\theta_{t-1}\Big)$$
+
+      Here $\eta_t$ is a schedule multiplier, and the decay never passes through $\sqrt{\hat v}$.
+
+      ![Per-step shrinkage from the regularizer vs a weight's gradient RMS, assuming the loss gradient dominates $\hat v$. Adam+L2 (coefficient $10^{-3}$, LR $10^{-3}$) vs AdamW (LR $10^{-3}$, decay 0.1).](fund.adam/l2-vs-wd)
+    source: Loshchilov & Hutter 2019 §2 (Prop. 1–3, Alg. 2), App. A
+
+  - title: "AdamW in practice"
+    body: |
+      - **Two conventions for the decay coefficient.** The AdamW paper multiplies $\lambda$ by the schedule multiplier $\eta_t$ only. PyTorch's `AdamW` multiplies `weight_decay` by the full learning rate: each step does $\theta\leftarrow(1-\mathrm{lr}\cdot\mathrm{wd})\,\theta$, then the Adam step. With lr $10^{-3}$ and wd $0.1$, that is a factor $1-10^{-4}$ per step, or $e^{-1}\approx0.37$ over 10,000 steps if gradients were zero. The same "weight decay" number therefore means different amounts of decay in different codebases.
+      - **`torch.optim.Adam(weight_decay=...)` is L2 regularization**, not AdamW.
+      - **What to decay.** Usually only weight matrices. Biases and normalization gains and shifts are excluded; shrinking a norm's scale toward 0 fights the normalization and adds little regularization. Some recipes also exclude embeddings.
+      - **Decoupled tuning.** Loshchilov & Hutter found the good region in $(\alpha,\lambda)$ space far less diagonal for AdamW than for Adam+L2, so the two can be tuned more independently. They also found that AdamW closed much of Adam's generalization gap to SGD on image classification.
+      - **Run length.** The best $\lambda$ depended on the training budget. The paper proposes a *normalized* decay $\lambda=\lambda_{norm}\sqrt{b/(BT)}$ (batch size $b$, $B$ training points, $T$ epochs) to reduce that dependence.
+      - **A typical LLM recipe** (Llama 2): AdamW with $\beta_1=0.9$, $\beta_2=0.95$, $\epsilon=10^{-5}$, weight decay 0.1, gradient clipping at 1.0, 2000 warmup steps, then cosine decay to 10% of the peak LR.
+      - **How to tune Adam on a budget** (Tuning Playbook): fewer than 10 trials, tune only the LR; 10–25, add $\beta_1$; 25+, add $\epsilon$; many more, add $\beta_2$. Search $1-\beta$ on a log scale (sys.tuning-pipeline).
+    source: Loshchilov & Hutter 2019 §2, §4, App. B.1; Touvron et al. 2023 §2.2; Tuning Playbook FAQ "How should Adam's hyperparameters be tuned?"
+
+  - title: "Convergence caveats and the generalization debate"
+    body: |
+      **Adam can fail to converge on a convex problem** (Reddi et al. 2018). Online losses on $x\in[-1,1]$: $f_t(x)=Cx$ on every third step and $-x$ otherwise, with $C>2$. The average gradient per cycle is $(C-2)/3>0$, so the best point is $x=-1$. Take $\beta_1=0$ and $\beta_2=1/(1+C^2)$; for $C=3$, $\beta_2=0.1$. Because $v$ forgets quickly, the normalized steps settle into a cycle: about $+1.05$ for the big gradient, but $-0.76$ and $-0.97$ for the two small ones. Net drift points toward $+1$, the *worst* point. The rare large gradient gets divided by its own large $\sqrt v$, and its information is forgotten before it can count. Reddi et al. show any constant $\epsilon$, and any $\beta_1<\sqrt{\beta_2}$, admits such an example. They also show the original Adam convergence proof was wrong.
+
+      **AMSGrad** fixes this by normalizing with $\hat v_t=\max(\hat v_{t-1},v_t)$, so the effective step never grows. On the example above it converges to $-1$. In deep learning, practitioners rarely find this necessary.
+
+      **Generalization.** Wilson et al. (2017) built a separable problem where AdaGrad, RMSProp and Adam converge to a solution $\propto\mathrm{sign}(X^\top y)$ that misclassifies new data with probability near ½, while SGD finds the minimum-norm solution, which generalizes. With equal tuning effort in their image and language experiments, SGD and momentum reached better test error. Counterpoints:
+      - Choi et al. (2019): with $\epsilon$ and the betas tuned, Adam includes momentum SGD and did not lose. Rankings depend on the tuning protocol.
+      - AdamW narrowed the gap on images.
+      - For transformers, Adam(W) is the standard choice.
+
+      **Successors, named only.** AdaMax uses an infinity-norm $u_t=\max(\beta_2u_{t-1},|g_t|)$ in place of $\sqrt v$ (Kingma & Ba §7.1). Adafactor factors $v$ into row and column statistics to save memory. Lion steps by the sign of a momentum mixture. Shampoo and SOAP use Kronecker-factored preconditioners. Muon orthogonalizes the momentum update of each weight matrix.
+    source: Reddi et al. 2018 §3–4 (Thm 1–2, Alg. 2); Wilson et al. 2017 §3.2, §4; Choi et al. 2019 §3; Kingma & Ba 2015 §7.1; Jordan 2024 (Muon)
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Write Adam."* Two EMAs, two bias corrections, $\alpha\hat m/(\sqrt{\hat v}+\epsilon)$. Defaults 1e-3, 0.9, 0.999, 1e-8.
+      - *"Derive bias correction."* Unroll $v_t=(1-\beta_2)\sum\beta_2^{t-i}g_i^2$. Under stationarity, $\mathbb E v_t=(1-\beta_2^t)\mathbb E g^2$. Without correction the first step is $3.16\alpha$ and the step peaks at about $6.6\alpha$.
+      - *"Why does the first Adam step equal $\alpha\,\mathrm{sign}(g)$?"* $\hat m_1=g$ and $\sqrt{\hat v_1}=|g|$.
+      - *"Multiply the loss by 100. What changes?"* SGD's steps grow 100×. Adam's are unchanged unless gradients are comparable to $\epsilon$.
+      - *"L2 vs weight decay?"* Equal for SGD, with $\lambda=\alpha\lambda'$. Under Adam, L2 is divided by $\sqrt{\hat v}$, so high-gradient weights escape regularization. AdamW decays outside the adaptive step.
+      - *"Why $\beta_2=0.95$ for LLMs?"* $v$ adapts faster, and the worst-case step after an outlier drops from $3.16\alpha$ to $0.45\alpha$.
+      - *"What does ε do?"* Numerical safety, plus a hidden LR. For large $\epsilon$, Adam becomes momentum SGD with LR $\alpha/\epsilon$, so tune them jointly.
+      - *"Does Adam converge?"* Not always (Reddi's counterexample). AMSGrad fixes the theory; practice rarely needs it.
+      - *"Adam or SGD?"* Adam(W) for transformers. SGD with momentum is competitive on CNN image classification. Tuned properly, Adam shouldn't lose, but it has more knobs and twice the optimizer memory.
+    source: Kingma & Ba 2015 §2–3; Loshchilov & Hutter 2019 §2; Reddi et al. 2018 §3; Choi et al. 2019
+
+  - title: "Key results"
+    body: |
+      - Update:
+
+      $$\theta\leftarrow\theta-\alpha\frac{m_t/(1-\beta_1^t)}{\sqrt{v_t/(1-\beta_2^t)}+\epsilon}$$
+
+      with $m,v$ the EMAs of $g$ and $g^2$.
+      - Bias: $\mathbb Ev_t=(1-\beta_2^t)\mathbb Eg^2$ (needs stationarity, not independence). The uncorrected step is $3.16\alpha$ at $t=1$ and peaks at about $6.6\alpha$ near $t=12$. The corrected first step is $\alpha\,\mathrm{sign}(g)$.
+      - $|\Delta|\lesssim\alpha$; invariant to gradient rescaling (ignoring $\epsilon$); $\beta_1=\beta_2=0$ gives sign descent.
+      - Large $\epsilon$: $\Delta\approx-(\alpha/\epsilon)\hat m$, i.e. momentum SGD. Gradient RMS $=\epsilon$ halves the step.
+      - Outlier step $\alpha(1-\beta_1)/\sqrt{1-\beta_2}$: $3.16\alpha$ ($\beta_2=0.999$) vs $0.45\alpha$ ($0.95$). Frozen-preconditioner stability: $\lambda_{max}(P^{-1}H)<38/\alpha$.
+      - SGD: L2 $\lambda'$ = decay $\alpha\lambda'$. Adam+L2 shrinks coordinate $i$ by about $\alpha\lambda'/\sqrt{\hat v_i}$. AdamW: $\theta\leftarrow\theta-\eta_t(\alpha\hat m/(\sqrt{\hat v}+\epsilon)+\lambda\theta)$. PyTorch: factor $1-\mathrm{lr}\cdot\mathrm{wd}$ per step.
+      - Memory: +8 bytes/param (56 GB for 7B). Reddi: Adam can diverge from the optimum; AMSGrad uses $\max\hat v$.
+    source: Kingma & Ba 2015; Loshchilov & Hutter 2019; Reddi et al. 2018
+
+quiz:
+  - id: q2
+    prompt: |
+      Adam with defaults ($\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$), learning rate $\alpha$. At step $t=1$ one coordinate sees $g=0.001$ and another sees $g=1000$. How large are their first updates?
+    correct: About $\alpha$ for both
+    wrong:
+      - About $0.001\alpha$ and $1000\alpha$
+      - About $3.16\alpha$ for both
+      - About $\alpha$ for $g=1000$, much less for $g=0.001$ (ε dominates)
+    explanation: |
+      $\hat m_1=g$ and $\hat v_1=g^2$, so the step is $\alpha g/(|g|+\epsilon)\approx\alpha\,\mathrm{sign}(g)$. $\epsilon=10^{-8}$ is negligible even next to $|g|=10^{-3}$. $3.16\alpha$ is the step *without* bias correction, $0.1/\sqrt{0.001}$. The answer $0.001\alpha$ and $1000\alpha$ is what SGD would do.
+    source: Kingma & Ba 2015 §2.1, §3
+
+  - id: q3
+    prompt: |
+      Why does adding $\frac{\lambda'}2\|\theta\|^2$ to the loss behave differently from AdamW's decoupled weight decay?
+    correct: Its gradient is divided by $\sqrt{\hat v}$, so high-gradient weights decay less
+    wrong:
+      - The $\lambda'\theta$ term enters only $v$, so it reduces the effective learning rate
+      - Bias correction cancels the $\lambda'\theta$ term during the first few thousand steps
+      - L2 shrinks weights by a constant amount per step rather than a constant fraction
+    explanation: |
+      L2's gradient goes through Adam's per-coordinate normalization: coordinate $i$ shrinks by about $\alpha\lambda'\theta_i/\sqrt{\hat v_i}$. Weights with large gradient history are barely regularized. AdamW subtracts $\eta_t\lambda\theta$ directly, the same fraction for every weight. The penalty term does enter $v$ too, but its main effect is through $m$ and the normalization. Bias correction rescales whole EMAs; it doesn't cancel any term.
+    source: Loshchilov & Hutter 2019 §2 (Prop. 2)
+
+  - id: q5
+    prompt: |
+      Which statement is **false**?
+    correct: For plain SGD, L2 and weight decay differ for every choice of coefficients
+    wrong:
+      - Adam stores two extra state values for every parameter it trains
+      - PyTorch's `Adam` with nonzero `weight_decay` implements L2 regularization
+      - With $\beta_2=0.999$, bias correction still matters after 1,000 steps
+    explanation: |
+      For SGD, $\theta-\alpha(g+\lambda'\theta)=(1-\alpha\lambda')\theta-\alpha g$: L2 with $\lambda'$ equals decay $\lambda=\alpha\lambda'$ (Prop. 1). The coefficients are coupled through the LR, but equivalent. At $t=1000$, $1-0.999^{1000}\approx0.63$, so $\hat v$ is still about 1.6× the raw $v$, and the correction matters.
+    source: Loshchilov & Hutter 2019 §2 (Prop. 1); Kingma & Ba 2015 §3
+
+  - id: q8
+    prompt: |
+      Which parameters are usually **excluded** from weight decay when training transformers with AdamW?
+    correct: Biases and normalization gains and shifts
+    wrong:
+      - Attention query and key projection matrices
+      - All parameters of the final output layer
+      - The feed-forward (MLP) weight matrices
+    explanation: |
+      Shrinking a LayerNorm or RMSNorm scale toward zero fights the normalization, and decaying biases adds little regularization. Common codebases decay only parameters with 2 or more dimensions (weight matrices). Some also exclude embeddings.
+    source: Loshchilov & Hutter 2019 §2
+
+  - id: q9
+    prompt: |
+      A coordinate's gradients have been essentially zero for thousands of steps ($m,v\approx0$, bias factors ≈1). Then one gradient $G$ arrives. With $\beta_1=0.9$, how big is that step for $\beta_2=0.999$ vs $\beta_2=0.95$?
+    correct: '$3.16\alpha$ vs $0.45\alpha$'
+    wrong:
+      - About $\alpha$ in both cases
+      - '$0.32\alpha$ vs $2.2\alpha$'
+      - '$1000\alpha$ vs $20\alpha$'
+    explanation: |
+      $m=(1-\beta_1)G$ and $\sqrt v=\sqrt{1-\beta_2}\,|G|$, so the step is $\alpha(1-\beta_1)/\sqrt{1-\beta_2}$: $0.1/0.0316=3.16$ and $0.1/0.224=0.45$. "About $\alpha$" assumes $\hat m/\sqrt{\hat v}\approx\pm1$, which needs a consistent gradient history. The inverted pair comes from swapping the two terms of the ratio.
+    source: Kingma & Ba 2015 §2.1
+
+  - id: q10
+    prompt: |
+      You multiply the training loss by 100 (gradients scale by 100) and keep all hyperparameters. What happens to the per-step updates?
+    correct: SGD's grow 100×; Adam's stay about the same unless gradients near ε
+    wrong:
+      - Both grow 100×, since both step along the gradient direction
+      - SGD's grow 100×; Adam's grow 10×, because of the square root on $v$
+      - Both stay the same, since the minimizer of the loss is unchanged
+    explanation: |
+      Adam's step $\hat m/\sqrt{\hat v}$ is homogeneous of degree 0 in the gradient: $c\hat m/\sqrt{c^2\hat v}=\hat m/\sqrt{\hat v}$. The square root applies to $v\propto g^2$, so it exactly cancels the scale. If gradients are comparable to $\epsilon$, scaling them up makes $\epsilon$ matter *less*. The minimizer is unchanged, but SGD's path is not.
+    source: Kingma & Ba 2015 §2.1
+
+  - id: q11
+    prompt: |
+      PyTorch `AdamW` with lr $10^{-3}$ and `weight_decay=0.1`, constant LR. Ignoring gradients, what fraction of a weight remains after 10,000 steps?
+    correct: About 0.37
+    wrong:
+      - About 0.90
+      - About 0.0
+      - About 0.99
+    explanation: |
+      Each step multiplies by $1-\mathrm{lr}\cdot\mathrm{wd}=1-10^{-4}$, and $(1-10^{-4})^{10^4}\approx e^{-1}\approx0.37$. Reading `weight_decay=0.1` as "10% per step" gives about 0. The AdamW paper's convention multiplies $\lambda$ by the schedule multiplier only, so the same number there would mean far stronger decay.
+    source: Loshchilov & Hutter 2019 §2 (Alg. 2)
+
+  - id: q12
+    prompt: |
+      ![Per-step shrinkage from the regularizer against a weight's gradient RMS, for two optimizer setups (A, B).](fund.adam/l2-vs-wd-quiz)
+
+      One curve is Adam with an L2 penalty, the other AdamW. Which is Adam+L2, and which weights does it regularize least?
+    correct: A; the weights with the largest gradient RMS
+    wrong:
+      - A; the weights with the smallest gradient RMS
+      - B; every weight is shrunk by the same fraction
+      - B; the weights with the largest gradient RMS
+    explanation: |
+      Under Adam+L2, the penalty gradient is divided by $\sqrt{\hat v}$, so the shrink rate falls like $1/\sqrt{\hat v}$ (A, slope −1 on log–log axes). High-gradient weights are barely decayed, while near-silent ones are decayed hard. AdamW's decay $\eta\lambda$ is the same fraction for every weight (B, flat).
+    source: Loshchilov & Hutter 2019 §2
+
+  - id: q13
+    prompt: |
+      Training a 7B-parameter model with Adam, $m$ and $v$ kept in fp32. How much memory do the optimizer moments alone take?
+    correct: 56 GB
+    wrong:
+      - 28 GB
+      - 112 GB
+      - 14 GB
+    explanation: |
+      Two fp32 values per parameter: $7\times10^9\times2\times4$ bytes $=56$ GB. 28 GB counts only one moment. 112 GB is the full mixed-precision model state (bf16 weights and gradients, fp32 master weights, $m$ and $v$: 16 bytes/param), not just the moments.
+    source: Kingma & Ba 2015 Alg. 1
+
+  - id: q14
+    prompt: |
+      In deriving $\mathbb E[v_t]=(1-\beta_2^t)\,\mathbb E[g^2]$ from $v_t=(1-\beta_2)\sum_i\beta_2^{t-i}g_i^2$, which assumption is actually needed?
+    correct: $\mathbb E[g_i^2]$ is the same at every step
+    wrong:
+      - The gradients $g_i$ are mutually independent across steps
+      - The gradients have zero mean, $\mathbb E[g_i]=0$
+      - The decay rates satisfy $\beta_1<\sqrt{\beta_2}$
+    explanation: |
+      Linearity of expectation turns $\mathbb E\sum_i\beta_2^{t-i}g_i^2$ into $\sum_i\beta_2^{t-i}\mathbb E[g_i^2]$ with no independence needed. Stationarity then lets $\mathbb E[g^2]$ come out, leaving a geometric series. Independence would matter for the *variance* of $v_t$, not its mean. $\beta_1<\sqrt{\beta_2}$ is a condition from the convergence analyses.
+    source: Kingma & Ba 2015 §3
+
+  - id: q15
+    prompt: |
+      In Reddi et al.'s counterexample (gradient $C$ every third step, $-1$ otherwise, $C>2$), Adam drifts to the worst point $x=+1$. Which change provably fixes it?
+    correct: Normalize by the running maximum of $v$ (AMSGrad)
+    wrong:
+      - Use a larger constant $\epsilon$ in the denominator
+      - Add momentum with any $\beta_1<\sqrt{\beta_2}$
+      - Apply the usual bias correction to both $m_t$ and $v_t$
+    explanation: |
+      The failure comes from $v$ forgetting the rare large gradient, so the effective LR can *increase*. AMSGrad's $\hat v_t=\max(\hat v_{t-1},v_t)$ keeps the effective step non-increasing; in simulation it converges to $-1$. Reddi et al. show non-convergence examples exist for any constant $\epsilon>0$ and for any $\beta_1<\sqrt{\beta_2}$. Bias correction only affects early steps.
+    source: Reddi et al. 2018 §3–4
+
+  - id: q16
+    prompt: |
+      Freeze Adam's preconditioner $P$ and ignore bias correction, with $\beta_1=0.9$ and LR $\alpha$. On a quadratic, up to what top eigenvalue of $P^{-1}H$ is it stable?
+    correct: '$38/\alpha$'
+    wrong:
+      - '$2/\alpha$'
+      - '$3.8/\alpha$'
+      - '$20/\alpha$'
+    explanation: |
+      $m=(1-\beta_1)u$ with heavy-ball buffer $u\leftarrow\beta_1u+g$, so Adam is heavy ball on $P^{-1}H$ with LR $\alpha(1-\beta_1)$. The heavy-ball limit $\eta\lambda<2+2\beta_1$ gives $\lambda<3.8/(0.1\alpha)=38/\alpha$. $3.8/\alpha$ forgets the $(1-\beta_1)$ factor, and $20/\alpha$ ignores momentum's extra stability. Real preconditioners move, so treat this as a guide; Gilmer et al. found about $40/\eta$ empirically.
+    source: Cohen et al. 2021 §2 (eq. 1); Wortsman et al. 2023, Related work; Gilmer et al. 2021 App. (Adam)
+
+cards:
+  - id: f1
+    front: Write the full Adam update.
+    back: |
+      $$\begin{aligned}m_t&=\beta_1m_{t-1}+(1-\beta_1)g_t\\v_t&=\beta_2v_{t-1}+(1-\beta_2)g_t^2\\ \theta_t&=\theta_{t-1}-\alpha\frac{m_t/(1-\beta_1^t)}{\sqrt{v_t/(1-\beta_2^t)}+\epsilon}\end{aligned}$$
+
+      Defaults: $\alpha=10^{-3}$, $\beta_1=0.9$, $\beta_2=0.999$, $\epsilon=10^{-8}$. Elementwise.
+    source: Kingma & Ba 2015 Alg. 1
+
+  - id: f2
+    front: Why does Adam need bias correction, and what goes wrong without it?
+    back: |
+      $m_0=v_0=0$, so $\mathbb Ev_t=(1-\beta_2^t)\mathbb Eg^2$ (and likewise for $m$). $v$ is biased for about $1/(1-\beta_2)\approx1000$ steps, $m$ for only about 10. So uncorrected $m/\sqrt v$ is too large: $3.16\times$ at $t=1$, peaking near $6.6\times$ at $t\approx12$ (constant gradient). With correction, the first step is $\alpha\,\mathrm{sign}(g)$.
+    source: Kingma & Ba 2015 §3
+
+  - id: f3
+    front: L2 regularization vs weight decay. When are they equivalent, and what does AdamW change?
+    back: |
+      SGD: $\theta-\alpha(g+\lambda'\theta)=(1-\alpha\lambda')\theta-\alpha g$, so L2 $\lambda'$ equals decay $\alpha\lambda'$.
+
+      Adam: the L2 gradient is divided by $\sqrt{\hat v}$, so the decay is non-uniform and high-gradient weights escape. AdamW applies $-\eta_t\lambda\theta$ outside the adaptive step:
+
+      $$\theta\leftarrow\theta-\eta_t\Big(\frac{\alpha\hat m}{\sqrt{\hat v}+\epsilon}+\lambda\theta\Big)$$
+    source: Loshchilov & Hutter 2019 §2
+
+  - id: f4
+    front: Give a typical AdamW configuration for LLM pretraining (e.g. Llama 2).
+    back: |
+      $\beta_1=0.9$, $\beta_2=0.95$, $\epsilon=10^{-5}$, weight decay 0.1 (on matrices, not biases or norms), gradient clipping at 1.0, 2000 linear warmup steps, then cosine decay to 10% of the peak LR.
+    rev: 2
+    source: Touvron et al. 2023 §2.2
+
+  - id: f5
+    type: open
+    front: Walk an interviewer from SGD to AdamW, saying what problem each step fixes.
+    back: |
+      - **SGD**: one global LR. It is noisy, and slow in ill-conditioned valleys because the stiffest direction caps the LR.
+      - **Momentum**: EMA of gradients. It amplifies consistent directions by $1/(1-\beta)$ and damps oscillations; $\sqrt\kappa$ on quadratics.
+      - **AdaGrad**: per-coordinate scaling by accumulated $g^2$, which helps sparse or badly scaled features. But the effective LR decays forever.
+      - **RMSProp**: an EMA of $g^2$ instead, so it forgets. No momentum, and the zero start biases it.
+      - **Adam**: momentum + RMSProp + bias correction. Steps of about $\alpha$, invariant to gradient scale.
+      - **AdamW**: L2 inside Adam is divided by $\sqrt{\hat v}$, so it becomes non-uniform. Decoupled decay restores true weight decay and decouples the tuning of LR and decay.
+
+      Costs: twice the parameter memory in state, four hyperparameters that can all matter, and convergence caveats (Reddi). Large runs add warmup and clipping, and often $\beta_2=0.95$.
+    source: Goodfellow DL §8.3.2, §8.5; Kingma & Ba 2015; Loshchilov & Hutter 2019
+
+  - id: f6
+    front: Why can Adam produce sudden large steps after quiet periods, and what are the usual mitigations?
+    back: |
+      If a coordinate's gradients stay near zero, $v$ decays toward zero. A sudden gradient $G$ then gives a step of $\alpha(1-\beta_1)/\sqrt{1-\beta_2}$ ($3.16\alpha$ at $\beta_2=0.999$). It keeps moving afterwards because $\sqrt v$ decays slowly: about $32\alpha$ in total.
+
+      Mitigations: lower $\beta_2$ (0.95 gives $0.45\alpha$, about $6\alpha$ in total), gradient clipping, warmup, a lower LR, architectural stabilizers (e.g. QK-norm), and skipping bad batches or rewinding to a checkpoint.
+    source: Kingma & Ba 2015 §2.1; Wortsman et al. 2023, Related work
+
+  - id: f7
+    front: Per the Tuning Playbook, which Adam hyperparameters should you tune for a given trial budget?
+    back: |
+      - Fewer than 10 trials: the learning rate only.
+      - 10–25: add $\beta_1$.
+      - 25+: add $\epsilon$ (jointly with the LR, since large $\epsilon$ makes the step scale like $\alpha/\epsilon$).
+      - Substantially more than 25: add $\beta_2$.
+
+      Search the LR, $\epsilon$, $1-\beta_1$ and $1-\beta_2$ on log scales. See sys.tuning-pipeline.
+    source: Tuning Playbook FAQ "How should Adam's hyperparameters be tuned?"
+
+  - id: f8
+    type: open
+    front: Derive Adam's bias-correction factor and state the assumption it needs.
+    back: |
+      1. Unroll from $v_0=0$: $v_t=(1-\beta_2)\sum_{i=1}^t\beta_2^{t-i}g_i^2$.
+      2. Take expectations. By linearity (no independence needed): $\mathbb Ev_t=(1-\beta_2)\sum_i\beta_2^{t-i}\mathbb E[g_i^2]$.
+      3. Assume stationarity, $\mathbb E[g_i^2]=\mathbb E[g^2]$. The geometric series gives $(1-\beta_2)\frac{1-\beta_2^t}{1-\beta_2}=1-\beta_2^t$.
+      4. So $\hat v_t=v_t/(1-\beta_2^t)$ is unbiased; the same holds for $m$ with $\beta_1$.
+      5. Consequences: the correction lasts about $1/(1-\beta)$ steps, far longer for $v$. Without it, $m/\sqrt v$ starts at $(1-\beta_1)/\sqrt{1-\beta_2}=3.16$ and the step is too large. With it, the first step is exactly $\alpha\,\mathrm{sign}(g)$ (for $\epsilon\to0$).
+      6. If $\mathbb E g^2$ drifts, a residual bias remains, kept small because old terms are down-weighted geometrically.
+    source: Kingma & Ba 2015 §3
+
+  - id: f9
+    type: open
+    front: Explain to an interviewer exactly how L2 regularization and decoupled weight decay differ under an adaptive optimizer.
+    back: |
+      - **SGD**: L2 $\lambda'$ gives $(1-\alpha\lambda')\theta-\alpha g$, identical to decay $\lambda=\alpha\lambda'$, though coupled to the LR (Prop. 1).
+      - **Adaptive**: write the optimizer as $\theta\leftarrow\theta-\alpha M\nabla f$. With L2 the step is $-\alpha M(\nabla f+\lambda'\theta)$, so the decay of coordinate $i$ is $\alpha\lambda'M_{ii}$. For Adam, $M_{ii}\approx1/\sqrt{\hat v_i}$. No $\lambda'$ matches uniform decay unless $M\propto I$ (Prop. 2).
+      - **Equivalent penalty of decoupled decay** with a fixed $M=\mathrm{diag}(1/s)$: you need $\alpha M\nabla R=\lambda\theta$, so $\nabla R=\frac\lambda\alpha s\odot\theta$ and $R=\frac{\lambda}{2\alpha}\sum_is_i\theta_i^2$. High-gradient coordinates get *more* penalty than with plain L2 (Prop. 3).
+      - **AdamW**: $\theta\leftarrow\theta-\eta_t(\alpha\hat m/(\sqrt{\hat v}+\epsilon)+\lambda\theta)$.
+      - **Practice**: PyTorch multiplies wd by the LR; exclude biases and norms; Loshchilov & Hutter found LR and decay easier to tune separately, with better generalization on images.
+    source: Loshchilov & Hutter 2019 §2, App. A
+
+  - id: f10
+    front: State Reddi et al.'s counterexample to Adam's convergence and the AMSGrad fix.
+    back: |
+      On $x\in[-1,1]$, $f_t(x)=Cx$ every third step and $-x$ otherwise ($C>2$), so the optimum is $x=-1$. With $\beta_1=0$ and $\beta_2=1/(1+C^2)$, Adam converges to $+1$. The rare large gradient is divided by its own large $\sqrt v$ and then forgotten, so the effective LR can increase. Such examples exist for any constant $\epsilon$ and any $\beta_1<\sqrt{\beta_2}$.
+
+      **AMSGrad**: use $\hat v_t=\max(\hat v_{t-1},v_t)$, a non-increasing effective step, which restores the convergence guarantee.
+    source: Reddi et al. 2018 §3–4
+
+  - id: f11
+    type: open
+    front: Adam or SGD with momentum? Give an interviewer a nuanced answer.
+    back: |
+      - **The case for SGD**: Wilson et al. (2017) built a separable problem where adaptive methods converge to a sign-pattern solution that generalizes at chance, while SGD finds the min-norm solution. Under equal tuning in their image and language experiments, SGD and momentum reached better test error. SGD also uses less memory (one buffer, not two).
+      - **The case for Adam**: Choi et al. (2019) showed Adam includes momentum SGD (large $\epsilon$, with $\alpha/\epsilon$ fixed). With all hyperparameters tuned it never lost; published rankings largely reflect tuning protocols. AdamW narrowed the gap on images. For transformers, Adam(W) is the default. Preconditioning extends perfect batch-size scaling (Zhang et al. 2019).
+      - **Practical answer**: use what's standard for the problem class (AdamW for transformers; momentum SGD is still strong for CNN classification), and tune more than the LR if comparing.
+      - **Caveats**: Adam's convergence theory has gaps (Reddi); it has four knobs; it has 2× state memory.
+    source: Wilson et al. 2017 §3–4; Choi et al. 2019 §3; Loshchilov & Hutter 2019 §4; Zhang et al. 2019 §1
+
+reading:
+  - title: "Kingma & Ba 2015, Adam: A Method for Stochastic Optimization"
+    url: https://arxiv.org/abs/1412.6980
+    kind: paper
+    note: Algorithm 1, the step-size bounds (§2.1), the bias-correction derivation (§3) and AdaMax (§7.1). Short and readable.
+  - title: "Loshchilov & Hutter 2019, Decoupled Weight Decay Regularization"
+    url: https://arxiv.org/abs/1711.05101
+    kind: paper
+    note: Propositions 1–3 on L2 vs weight decay, the AdamW algorithm, and normalized weight decay.
+  - title: "Reddi, Kale & Kumar 2018, On the Convergence of Adam and Beyond"
+    url: https://arxiv.org/abs/1904.09237
+    kind: paper
+    note: The one-dimensional non-convergence example (§3) and AMSGrad (§4).
+  - title: "Choi et al. 2019, On Empirical Comparisons of Optimizers for Deep Learning"
+    url: https://arxiv.org/abs/1910.05446
+    kind: paper
+    note: Optimizer inclusion relations and why tuning protocols decide rankings.
+  - title: "Wilson et al. 2017, The Marginal Value of Adaptive Gradient Methods in Machine Learning"
+    url: https://arxiv.org/abs/1705.08292
+    kind: paper
+    note: The generalization argument against adaptive methods, with a constructed example.

@@ -1,0 +1,539 @@
+id: fund.linear-regression
+area: fundamentals
+title: "Linear Regression: OLS & its Geometry"
+summary: Least squares from the problem up. The normal equations, OLS as an orthogonal projection, leverage, the sampling distribution of the coefficients and why σ̂² divides by N−p, the Gauss–Markov proof, collinearity, the min-norm solution when p > N, and how OLS is actually computed.
+order: 210
+level: core
+tags: [linear-regression, least-squares, statistics, geometry, classical-ml]
+prereqs: [fund.gaussian, fund.mle]
+
+explainer:
+  - title: "The problem: fit a linear model, and why squared error"
+    body: |
+      We observe $N$ pairs $(x_i, y_i)$ with $x_i \in \mathbb{R}^d$ and real $y_i$, and want to predict $y$ from $x$. Linear regression restricts the predictor to
+
+      $$f(x) = w_0 + w_1 x_1 + \dots + w_d x_d.$$
+
+      **Notation.** Stack the inputs into the **design matrix** $X \in \mathbb{R}^{N\times p}$ whose row $i$ is $(1, x_i^\top)$. So $p = d+1$ columns, and the column of ones carries the intercept $w_0$. Stack the targets into $y \in \mathbb{R}^N$. The model is
+
+      $$y = Xw + \varepsilon,$$
+
+      where $\varepsilon$ is noise with $\mathbb{E}[\varepsilon] = 0$. "Linear" means linear **in $w$**, not in $x$: columns can be $x^2$, $\log x$, one-hot codes or products of features.
+
+      **Which $w$?** Ordinary least squares (OLS) minimizes the residual sum of squares
+
+      $$\mathrm{RSS}(w) = \sum_{i=1}^N (y_i - x_i^\top w)^2 = \|y - Xw\|^2.$$
+
+      Here $x_i^\top$ denotes row $i$ of $X$, including its leading 1. There are three reasons to use squared error:
+      - **It is the Gaussian MLE.** If $\varepsilon_i \sim \mathcal{N}(0,\sigma^2)$ i.i.d., the negative log-likelihood is
+
+      $$\begin{aligned} -\log p(y \mid X, w) &= \frac{1}{2\sigma^2}\|y - Xw\|^2 \\ &\quad + \frac{N}{2}\log(2\pi\sigma^2). \end{aligned}$$
+
+        Only the first term depends on $w$, so the MLE of $w$ is the least-squares solution (`fund.mle`). Setting the $\sigma^2$-derivative to zero gives $\hat\sigma^2_{\text{MLE}} = \mathrm{RSS}/N$, which is biased low (card 5 fixes this).
+      - **It is a convex quadratic in $w$.** It has a closed-form minimizer, and every stationary point is a global minimum.
+      - **It has clean geometry and sampling theory** (cards 3–6).
+
+      The cost: one point with a large residual contributes its *square*, so OLS is sensitive to outliers. Heavy-tailed noise calls for robust losses (card 9).
+
+      **Notation warning.** ESL writes the coefficients as $\beta$ and counts $p$ inputs *excluding* the intercept, so its $N-p-1$ is our $N-p$. Bishop uses $\beta$ for the noise precision $1/\sigma^2$.
+    source: "ESL §3.2; Murphy PML1 §11.2.2; CS229 notes §1.3; Bishop PRML §3.1.1"
+
+  - title: "The normal equations, and a worked example"
+    body: |
+      **Refresher (matrix calculus).** For $a \in \mathbb{R}^p$ and $A \in \mathbb{R}^{p\times p}$:
+      - $\nabla_w (a^\top w) = a$
+      - $\nabla_w (w^\top A w) = (A + A^\top) w$, which is $2Aw$ when $A$ is symmetric.
+
+      Expand the RSS. The two cross terms $y^\top Xw$ and $w^\top X^\top y$ are the same scalar:
+
+      $$\begin{aligned} \mathrm{RSS}(w) &= (y - Xw)^\top (y - Xw) \\ &= y^\top y - 2 w^\top X^\top y \\ &\quad + w^\top X^\top X w. \end{aligned}$$
+
+      Apply the identities ($X^\top X$ is symmetric) and set the gradient to zero:
+
+      $$\nabla_w \mathrm{RSS} = -2X^\top y + 2X^\top X w = 0.$$
+
+      This gives the **normal equations** $X^\top X \hat w = X^\top y$.
+
+      **Is it a minimum, and is it unique?** The Hessian is $2X^\top X$, and $v^\top X^\top X v = \|Xv\|^2 \ge 0$, so RSS is convex and every solution of the normal equations is a global minimum. $X^\top X$ is positive definite iff $Xv \ne 0$ for all $v \ne 0$, i.e. iff $X$ has **full column rank** $p$ (which needs $N \ge p$). Then
+
+      $$\hat w = (X^\top X)^{-1} X^\top y.$$
+
+      **One feature plus intercept.** The normal-equation row for the ones column says $\sum_i (y_i - \hat y_i) = 0$, so the line passes through $(\bar x, \bar y)$. Solving the $2\times2$ system gives
+
+      $$\hat w_1 = \frac{S_{xy}}{S_{xx}}, \qquad \hat w_0 = \bar y - \hat w_1 \bar x,$$
+
+      where $S_{xy} = \sum_i (x_i - \bar x)(y_i - \bar y)$ and $S_{xx} = \sum_i (x_i - \bar x)^2$.
+
+      **Worked example.** Take the points $(0,1), (1,3), (2,2), (3,5)$.
+      - $\bar x = 1.5$, $\bar y = 2.75$, $S_{xx} = 5$, $S_{xy} = 5.5$. So $\hat w_1 = 1.1$ and $\hat w_0 = 2.75 - 1.65 = 1.1$.
+      - Fitted values $\hat y = (1.1, 2.2, 3.3, 4.4)$. Residuals $r = (-0.1, 0.8, -1.3, 0.6)$.
+      - Check both normal equations: $\sum r_i = 0$, and $\sum x_i r_i = 0 + 0.8 - 2.6 + 1.8 = 0$.
+      - $\mathrm{RSS} = 0.01 + 0.64 + 1.69 + 0.36 = 2.70$.
+
+      Later cards reuse these four points.
+    source: "CS229 notes §1.2; ESL §3.2 (eqs. 3.3–3.6); Murphy PML1 §11.2.2.1, §11.2.3.2"
+
+  - title: "Geometry: OLS is an orthogonal projection"
+    body: |
+      Read $y$ as a single vector in $\mathbb{R}^N$, and each column of $X$ as a vector in $\mathbb{R}^N$ too. A prediction vector $Xw$ is a linear combination of the columns, so it ranges over the **column space** $\mathrm{col}(X)$, a $p$-dimensional subspace of $\mathbb{R}^N$. Least squares picks the point of $\mathrm{col}(X)$ closest to $y$.
+
+      The normal equations say $X^\top (y - X\hat w) = 0$: the residual $r = y - \hat y$ is orthogonal to every column of $X$. So $\hat y$ is the **orthogonal projection** of $y$ onto $\mathrm{col}(X)$.
+
+      ![The residual is perpendicular to the plane spanned by the columns; $\hat y$ is the closest point of that plane to $y$.](fund.linear-regression/projection)
+
+      **The hat matrix.** $\hat y = Hy$ with
+
+      $$H = X (X^\top X)^{-1} X^\top.$$
+
+      Its properties each take one line:
+      - **Symmetric**: transpose each factor.
+      - **Idempotent**: $H^2 = X(X^\top X)^{-1}X^\top X (X^\top X)^{-1}X^\top = H$. Projecting twice changes nothing.
+      - **$I - H$ projects onto the orthogonal complement**: $r = (I-H)y$, and $(I-H)X = 0$.
+      - **Eigenvalues are 0 or 1**: $H^2 = H$ forces $\lambda^2 = \lambda$.
+      - **Trace**, by the cyclic property:
+
+      $$\operatorname{tr} H = \operatorname{tr}\big((X^\top X)^{-1} X^\top X\big) = \operatorname{tr} I_p = p.$$
+
+      $\operatorname{tr} H$ counts the **degrees of freedom** of the fit. The same definition carries over to ridge and smoothers, where it is no longer an integer.
+
+      **Consequences.**
+      - Pythagoras: $\|y\|^2 = \|\hat y\|^2 + \|r\|^2$. In the worked example, $39 = 36.3 + 2.7$.
+      - With an intercept column, the residuals sum to zero and are uncorrelated (in-sample) with every feature and with $\hat y$. So a trend in a residual plot means the *model* is misspecified (e.g. a missing curvature term); it is never a failure of the fitting.
+      - If $X$ is rank-deficient, $\hat w$ is not unique but $\hat y$ still is: the projection of $y$ onto $\mathrm{col}(X)$ doesn't depend on how you write it as a combination of columns.
+    source: "ESL §3.2 (eq. 3.7, Fig. 3.2); Murphy PML1 §11.2.2.2; Bishop PRML §3.1.2"
+
+  - title: "Leverage and influential points"
+    body: |
+      The diagonal of $H$ measures how strongly each point controls its own fitted value:
+
+      $$h_{ii} = x_i^\top (X^\top X)^{-1} x_i = \frac{\partial \hat y_i}{\partial y_i}.$$
+
+      - **Range $0 \le h_{ii} \le 1$.** Because $H$ is symmetric and idempotent, $h_{ii} = (H^2)_{ii} = \sum_j h_{ij}^2 \ge h_{ii}^2$.
+      - **Average $p/N$**, since $\sum_i h_{ii} = \operatorname{tr} H = p$.
+      - **It depends only on $X$**, not on $y$: leverage measures how far $x_i$ sits from the bulk of the inputs. For one feature plus intercept, $h_{ii} = 1/N + (x_i - \bar x)^2/S_{xx}$. In the worked example $h = (0.7, 0.3, 0.3, 0.7)$, which sums to $p = 2$.
+
+      **Why leverage matters.**
+      - **High-leverage points hide in residual plots.** Since $r = (I-H)\varepsilon$, $\mathrm{Var}(r_i) = \sigma^2 (1 - h_{ii})$. A high-leverage point pulls the line toward itself, so its own residual looks small.
+      - **Leave-one-out residual.** Refitting without point $i$ and predicting it gives $r_i/(1 - h_{ii})$ (ESL eq. 7.51; derived in `fund.cross-validation` via a rank-one update of $(X^\top X)^{-1}$). In the worked example, the point $(3,5)$ has $r = 0.6$ but a leave-one-out residual of $0.6/0.3 = 2.0$. Deleting it moves the slope from 1.1 to 0.5.
+      - **Influence needs leverage *and* surprise.** A point changes the fit a lot when it is far out in $x$ *and* disagrees with the trend of the others. A far-out point lying on the trend is harmless. A big residual at the centre of the inputs shifts the intercept but barely tilts the slope. Cook's distance combines the two into one number.
+
+      ![Synthetic data; marker area ∝ leverage. The far point (h = 0.82) tilts the whole line, while the central outlier, with a much larger vertical deviation, barely matters.](fund.linear-regression/leverage)
+    source: "ESL §3.2 (eq. 3.7), §7.10 (eq. 7.51); Murphy PML1 §11.2.2.2"
+
+  - title: "Sampling distribution: unbiased, its covariance, and why N − p"
+    body: |
+      **Assumptions.** The model is correct, $y = Xw + \varepsilon$. $X$ is fixed (we condition on the inputs). $\mathbb{E}[\varepsilon] = 0$ and $\mathrm{Cov}(\varepsilon) = \sigma^2 I$, i.e. errors are uncorrelated with equal variance. Substitute the model into $\hat w$:
+
+      $$\begin{aligned} \hat w &= (X^\top X)^{-1} X^\top (Xw + \varepsilon) \\ &= w + (X^\top X)^{-1} X^\top \varepsilon. \end{aligned}$$
+
+      **Unbiased**: the noise term has mean zero, so $\mathbb{E}[\hat w] = w$.
+
+      **Covariance**: for a fixed matrix $A$, $\mathrm{Cov}(A\varepsilon) = A\,\mathrm{Cov}(\varepsilon)\,A^\top$. With $A = (X^\top X)^{-1}X^\top$:
+
+      $$\mathrm{Cov}(\hat w) = \sigma^2 A A^\top = \sigma^2 (X^\top X)^{-1}.$$
+
+      Precise coefficients need $X^\top X$ to be "large": many points, spread-out inputs, and columns far from collinear (card 7).
+
+      **Estimating $\sigma^2$.** The residuals are $r = (I-H)y = (I-H)\varepsilon$, because $(I-H)X = 0$. Since $I-H$ is symmetric and idempotent, $\mathrm{RSS} = \varepsilon^\top (I-H)\varepsilon$. For any fixed $M$, $\mathbb{E}[\varepsilon^\top M \varepsilon] = \sigma^2 \operatorname{tr} M$ when $\mathrm{Cov}(\varepsilon) = \sigma^2 I$. So
+
+      $$\mathbb{E}[\mathrm{RSS}] = \sigma^2 \operatorname{tr}(I - H) = \sigma^2 (N - p).$$
+
+      The unbiased estimator is $\hat\sigma^2 = \mathrm{RSS}/(N-p)$. Fitting $p$ parameters absorbs $p$ dimensions of the noise into $\hat y$, and the residuals live in the remaining $N-p$. In the worked example, $\hat\sigma^2 = 2.7/2 = 1.35$, while the MLE $2.7/4 = 0.675$ underestimates.
+
+      **Inference with Gaussian noise.** Then $\hat w \sim \mathcal{N}(w, \sigma^2 (X^\top X)^{-1})$ and $(N-p)\hat\sigma^2/\sigma^2 \sim \chi^2_{N-p}$, independent of $\hat w$. Hence, under $w_j = 0$,
+
+      $$t_j = \frac{\hat w_j}{\hat\sigma \sqrt{v_j}} \sim t_{N-p}, \quad v_j = [(X^\top X)^{-1}]_{jj}.$$
+
+      Worked example: the slope's standard error is $\sqrt{1.35 \times 0.2} = 0.52$ and $t = 1.1/0.52 = 2.12$ on 2 degrees of freedom. The 5% two-sided critical value is 4.30, so the slope is not significant.
+
+      Without Gaussian noise, $\hat w$ is still unbiased with the same covariance, and the $t$-intervals become approximately right as $N$ grows.
+    source: "ESL §3.2 (eqs. 3.8–3.12, 3.14); Murphy PML1 §11.2.2"
+
+  - title: "Gauss–Markov: best linear unbiased, and what that doesn't mean"
+    body: |
+      **Question.** Among estimators that are linear in $y$ and unbiased, does OLS have the smallest variance? Yes, under the card-5 assumptions: correct model, $\mathbb{E}[\varepsilon] = 0$, $\mathrm{Cov}(\varepsilon) = \sigma^2 I$. **Gaussianity is not needed.**
+
+      **Proof.** Take any linear estimator $\tilde w = Cy$, where the $p\times N$ matrix $C$ may depend on $X$ but not on $y$. Unbiasedness for every $w$ means $\mathbb{E}[\tilde w] = CXw = w$ for all $w$, i.e. $CX = I$.
+
+      Write $C = (X^\top X)^{-1}X^\top + D$. Then $CX = I + DX$, so unbiasedness forces $DX = 0$. The covariance is
+
+      $$\begin{aligned} \mathrm{Cov}(\tilde w) &= \sigma^2 C C^\top \\ &= \sigma^2 \big[(X^\top X)^{-1} + DD^\top\big]. \end{aligned}$$
+
+      The cross terms are $\sigma^2 (X^\top X)^{-1} X^\top D^\top$ and its transpose, and both vanish because $DX = 0$. $DD^\top$ is positive semidefinite, so $\mathrm{Cov}(\tilde w) - \mathrm{Cov}(\hat w) \succeq 0$. Every linear combination $a^\top \tilde w$ has variance at least that of $a^\top \hat w$. OLS is **BLUE**, the best linear unbiased estimator.
+
+      **What the theorem does not say.**
+      - **Unbiased is a restriction.** Mean squared error = variance + bias². A biased estimator such as ridge (`fund.ridge-lasso`) can have lower MSE by trading a little bias for a big drop in variance, especially under collinearity.
+      - **Linear is a restriction too.** With heavy-tailed noise, nonlinear estimators such as least absolute deviations can do better than OLS.
+      - **The covariance assumption matters.** With heteroscedastic noise ($\mathrm{Var}(\varepsilon_i)$ varying) or correlated noise, OLS stays unbiased but is no longer best: weighted or generalized least squares has lower variance (card 9). The usual standard errors $\hat\sigma^2 (X^\top X)^{-1}$ also become wrong.
+      - **Gaussianity is only needed for exact $t$ and $F$ distributions** (card 5).
+    source: "ESL §3.2.2 (eqs. 3.17–3.20), §10.6; Murphy PML1 §11.6"
+
+  - title: "What a coefficient means, and collinearity"
+    body: |
+      $\hat w_j$ is the change in prediction per unit change in $x_j$ **with all other features held fixed**. It is *not* the slope you'd get by regressing $y$ on $x_j$ alone.
+
+      **Successive orthogonalization makes this exact.** Regress $x_j$ on all the other columns and keep the residual $z_j$: the part of $x_j$ that the other features can't explain. Then
+
+      $$\begin{aligned} \hat w_j &= \frac{\langle z_j, y \rangle}{\langle z_j, z_j \rangle}, \\ \mathrm{Var}(\hat w_j) &= \frac{\sigma^2}{\|z_j\|^2}. \end{aligned}$$
+
+      Why: replacing $x_j$ by $z_j$ doesn't change $\mathrm{col}(X)$, and $z_j$ is orthogonal to the other columns. So the projection of $y$ splits into a piece along the others plus a piece along $z_j$, and only $z_j$ contains $x_j$ (with coefficient 1). If all columns are mutually orthogonal, $z_j = x_j$ and each $\hat w_j$ is just a one-variable regression.
+
+      **Collinearity.** If $x_j$ is nearly a linear combination of the other features, $z_j \approx 0$ and $\mathrm{Var}(\hat w_j)$ blows up. Let $R_j^2$ be the $R^2$ (card 9) from regressing $x_j$ on the others, with an intercept. That regression's residual sum of squares is $\|z_j\|^2$ and its total sum of squares is $\|x_j - \bar x_j \mathbf{1}\|^2$, so
+
+      $$\|z_j\|^2 = (1 - R_j^2)\, \|x_j - \bar x_j \mathbf{1}\|^2.$$
+
+      Collinearity inflates the variance by the **variance inflation factor** $\mathrm{VIF}_j = 1/(1 - R_j^2)$. Two features with correlation 0.9 give $R^2 = 0.81$, VIF 5.3, and standard errors 2.3 times larger.
+
+      ![Synthetic standardized features. With correlated features the RSS bowl becomes a long thin valley along $w_1 + w_2 = \text{const}$: the data pin down the sum, not the split.](fund.linear-regression/collinearity)
+
+      The symptoms are large standard errors, coefficients that flip sign between subsamples, and $t$-statistics that are individually insignificant while the features are jointly significant. Predictions inside the data's range can still be fine: $w$ is poorly determined, not $\hat y$.
+
+      **Edge cases.**
+      - **Duplicated column**: $X^\top X$ is singular. Any split with $w_j + w_k = c$ fits equally well, and $\hat y$ is unchanged.
+      - **Rescaling $x_j$ by $c$**: $\hat w_j \to \hat w_j / c$. Predictions, residuals and $t$-statistics are unchanged because $\mathrm{col}(X)$ is unchanged. Penalized versions (next lesson) are *not* scale-invariant.
+    source: "ESL §3.2.3 (Alg. 3.1, eqs. 3.28–3.29); Murphy PML1 §11.2.3.3, §11.7.6"
+
+  - title: "More features than data, and how OLS is computed"
+    body: |
+      If $p > N$, or the columns are dependent, $X^\top X$ is singular. The minimizers form an affine set $\hat w + z$ for any $z$ in the null space $\mathrm{null}(X)$. With $p > N$ and independent rows, they all interpolate: RSS = 0.
+
+      **Min-norm solution.** The standard choice is the one with the smallest $\|w\|$. With independent rows,
+
+      $$w^+ = X^\top (XX^\top)^{-1} y = X^+ y,$$
+
+      where $X^+$ is the pseudo-inverse. **Why it is smallest:** $w^+ = X^\top(\cdot)$ lies in the row space of $X$, which is orthogonal to $\mathrm{null}(X)$. Any other solution is $w^+ + z$ with $z \in \mathrm{null}(X)$, and Pythagoras gives $\|w^+ + z\|^2 = \|w^+\|^2 + \|z\|^2$.
+
+      **Gradient descent finds it.** Each step $w \leftarrow w - \eta X^\top (Xw - y)$ adds a vector in the row space. From $w_0 = 0$ the iterates stay in the row space. If they converge to an interpolating solution, it must be the only interpolant in the row space, which is $w^+$. From $w_0 \ne 0$, the null-space part of $w_0$ is never touched, so GD ends at the solution closest to $w_0$. Example: the single equation $w_1 + w_2 = 2$ has min-norm solution $(1,1)$. Started at $(3, 0)$, GD ends at $(2.5, -0.5)$. This implicit bias of GD is the starting point of double descent (`fund.double-descent`).
+
+      **Computing OLS in practice.** Never form $(X^\top X)^{-1}$ explicitly.
+      - **Cholesky on $X^\top X$**: the cheapest, $O(Np^2 + p^3)$. But the condition number gets squared, $\kappa(X^\top X) = \kappa(X)^2$. A matrix $X$ with $\kappa = 10^4$ becomes a system with $\kappa = 10^8$, losing about twice as many digits.
+      - **QR**: $X = QR$ with $Q^\top Q = I$ and $R$ upper triangular. Then $R\hat w = Q^\top y$ is solved by back-substitution. It works with $\kappa(X)$ and costs $O(Np^2)$. It is the matrix form of the successive orthogonalization in card 7.
+      - **SVD** $X = U\Sigma V^\top$: $\hat w = V\Sigma^+ U^\top y$. It handles rank deficiency and returns the min-norm solution, at a larger constant cost.
+      - **Large $N$ or streaming data: SGD (the LMS rule)**, $w \leftarrow w + \eta (y_i - x_i^\top w) x_i$. The update is the negative gradient of $\tfrac12 (y_i - x_i^\top w)^2$.
+    source: "Murphy PML1 §7.7.2, §11.2.2.3; ESL §3.2.3 (eqs. 3.30–3.32); CS229 notes §1.1; Bishop PRML §3.1.3"
+
+  - title: "Extensions and goodness of fit"
+    body: |
+      The same machinery covers several variations by changing $X$ or the weights:
+      - **Basis functions.** Replace $x$ by $\phi(x) = (1, x, x^2, \dots)$ or by splines. The model is still linear in $w$, so everything above applies with $\Phi$ in place of $X$. Capacity grows with the number of basis functions (`fund.bias-variance`).
+      - **Weighted least squares.** If $\mathrm{Var}(\varepsilon_i) = \sigma_i^2$, minimize $\sum_i (y_i - x_i^\top w)^2/\sigma_i^2$. Dividing row $i$ of $X$ and $y_i$ by $\sigma_i$ makes the noise homoscedastic, and OLS on the rescaled data gives
+
+      $$\hat w = (X^\top \Lambda X)^{-1} X^\top \Lambda y, \quad \Lambda = \mathrm{diag}(1/\sigma_i^2).$$
+
+        This is the Gaussian MLE under heteroscedastic noise, and the BLUE by Gauss–Markov applied to the rescaled problem.
+      - **Robust losses.** Absolute error (which estimates the conditional median) or Huber loss (quadratic near zero, linear in the tails) limit the pull of outliers. There is no closed form, so they are solved iteratively.
+      - **Locally weighted regression.** For each query $x$, solve a weighted least squares with weights $\exp(-\|x_i - x\|^2/2\tau^2)$. It is nonparametric: the whole training set is kept and a new fit is made per query.
+
+      **Goodness of fit.** With $\mathrm{TSS} = \sum_i (y_i - \bar y)^2$,
+
+      $$R^2 = 1 - \frac{\mathrm{RSS}}{\mathrm{TSS}}.$$
+
+      It is the fraction of variance explained relative to always predicting $\bar y$. Worked example: $\mathrm{TSS} = 8.75$, so $R^2 = 1 - 2.7/8.75 = 0.69$.
+      - **Training $R^2$ never decreases when a feature is added.** The bigger column space contains the old one, so the projection can only get closer to $y$.
+      - **Adjusted $R^2$** $= 1 - \frac{\mathrm{RSS}/(N-p)}{\mathrm{TSS}/(N-1)}$ divides by degrees of freedom to offset this (worked example: 0.54).
+      - **Test $R^2$ can be negative**: the model predicts worse than the training mean.
+      - **$R^2$ measures fit, not correctness.** A high $R^2$ with patterned residuals still signals a misspecified model.
+    source: "Murphy PML1 §11.2.2.4, §11.2.4, §11.6; ESL §3.2, §10.6; CS229 notes §1.4"
+
+  - title: "Pitfalls and what interviewers probe"
+    body: |
+      **Pitfalls.**
+      - **Forgetting the intercept column.** The fit is forced through the origin, residuals no longer sum to zero, and $R^2 = 1 - \mathrm{RSS}/\mathrm{TSS}$ can even go negative in-sample.
+      - **Solving the normal equations by explicit inversion** on ill-conditioned data. Use QR or SVD.
+      - **Reading $\hat w_j$ as a marginal effect** when features are correlated. Dropping a correlated feature changes the other coefficients (omitted-variable effect).
+      - **Extrapolating.** The prediction variance at a new input is $\mathrm{Var}(x_0^\top \hat w) = \sigma^2 x_0^\top (X^\top X)^{-1} x_0$ (from card 5), which grows as $x_0$ moves away from the data.
+      - **Mixing up conventions**: $\hat\sigma^2$ with $N$ vs $N-p$, and ESL's $p$ (inputs only) vs ours (all columns).
+
+      **What interviewers probe** (question → short answer).
+      - *Why squared loss?* → Gaussian MLE, convex with a closed form, and BLUE under Gauss–Markov.
+      - *When is $\hat w$ unique, and what if it isn't?* → Iff $X$ has full column rank. Otherwise take the min-norm solution $X^+y$, which GD from zero also finds.
+      - *What is $\operatorname{tr} H$?* → $p$, by the cyclic property of the trace.
+      - *Why divide by $N - p$?* → The residuals live in an $(N-p)$-dimensional subspace, so $\mathbb{E}[\mathrm{RSS}] = \sigma^2(N-p)$.
+      - *Does Gauss–Markov need Gaussian noise? Does it mean OLS has the lowest MSE?* → No and no: ridge is biased and can have lower MSE.
+      - *Duplicate a feature, or rescale one by 10?* → Singular $X^\top X$ with $\hat y$ unchanged; the coefficient divides by 10.
+      - *Why QR rather than the normal equations?* → Conditioning: $\kappa(X)$ instead of $\kappa(X)^2$.
+      - *An outlier in $y$: does its position in $x$ matter?* → Yes. At high leverage it tilts the line; at the centre it mostly shifts the intercept.
+      - *$p > N$?* → Infinitely many interpolants. Min-norm and its implicit regularization lead to double descent.
+    source: "ESL §3.2; Murphy PML1 §11.2; CS229 notes ch.1"
+
+  - title: "Key results"
+    body: |
+      - Model $y = Xw + \varepsilon$, $X \in \mathbb{R}^{N\times p}$ with a ones column. OLS minimizes $\|y - Xw\|^2$, which is the Gaussian MLE.
+      - Normal equations $X^\top X \hat w = X^\top y$. Unique iff full column rank:
+
+      $$\hat w = (X^\top X)^{-1} X^\top y$$
+
+      - $\hat y = Hy$, $H = X(X^\top X)^{-1}X^\top$: symmetric, idempotent, $\operatorname{tr} H = p$. The residual is orthogonal to $\mathrm{col}(X)$.
+      - Leverage $h_{ii} \in [0, 1]$, average $p/N$. $\mathrm{Var}(r_i) = \sigma^2(1 - h_{ii})$. Leave-one-out residual $r_i/(1 - h_{ii})$.
+      - $\mathbb{E}[\hat w] = w$, $\mathrm{Cov}(\hat w) = \sigma^2 (X^\top X)^{-1}$, $\hat\sigma^2 = \mathrm{RSS}/(N-p)$.
+      - Gauss–Markov: OLS is BLUE under zero-mean, homoscedastic, uncorrelated errors. No Gaussianity needed, and biased estimators can beat it in MSE.
+      - $\mathrm{Var}(\hat w_j) = \sigma^2/\|z_j\|^2$, $\mathrm{VIF}_j = 1/(1 - R_j^2)$.
+      - $p > N$: min-norm $w^+ = X^\top (XX^\top)^{-1}y$, reached by GD from 0.
+      - Compute with QR or SVD; the normal equations square $\kappa$.
+      - $R^2 = 1 - \mathrm{RSS}/\mathrm{TSS}$ never decreases in-sample as features are added.
+    source: "ESL §3.2; Murphy PML1 §7.7.2, §11.2"
+
+quiz:
+  - id: q1
+    prompt: |
+      An OLS fit has $N = 100$ observations and $p = 5$ columns in $X$, **including** the intercept column. The residual sum of squares is 190. What is the unbiased estimate $\hat\sigma^2$ of the noise variance?
+    correct: "2.00"
+    wrong:
+      - "1.90"
+      - "2.02"
+      - "38.0"
+    explanation: |
+      $\mathbb{E}[\mathrm{RSS}] = \sigma^2(N - p)$, so $\hat\sigma^2 = 190/95 = 2.00$. Dividing by $N$ gives the biased MLE, 1.90. The value 2.02 comes from $N - p - 1 = 94$, ESL's formula, where $p$ counts the inputs *excluding* the intercept. Here $p$ already includes it, so subtracting one more double-counts the intercept.
+    source: "ESL §3.2 (σ̂² below eq. 3.8); Murphy PML1 §11.2.2"
+
+  - id: q2
+    prompt: |
+      $H = X(X^\top X)^{-1}X^\top$ for a full-column-rank $X \in \mathbb{R}^{N\times p}$ with $N > p$. Which statement is **false**?
+    correct: "$\\operatorname{tr} H = N$, since $H$ maps $\\mathbb{R}^N$ to itself"
+    wrong:
+      - "$H$ is idempotent: $H^2 = H$"
+      - "The residual $(I - H)y$ is orthogonal to every column of $X$"
+      - "Every eigenvalue of $H$ is either 0 or 1"
+    explanation: |
+      By the cyclic property, $\operatorname{tr} H = \operatorname{tr}((X^\top X)^{-1}X^\top X) = \operatorname{tr} I_p = p$. $H$ is $N\times N$, but it projects onto a $p$-dimensional subspace, so only $p$ eigenvalues equal 1. The other three statements are true: projection is idempotent, $X^\top(I - H) = 0$, and $H^2 = H$ forces $\lambda \in \{0, 1\}$.
+    source: "ESL §3.2 (eq. 3.7); Murphy PML1 §11.2.2.2"
+
+  - id: q3
+    prompt: |
+      You accidentally include the same feature column twice in $X$ and run OLS. What happens?
+    correct: "$X^\\top X$ is singular, so $\\hat w$ is not unique, but the fitted values $\\hat y$ are unchanged"
+    wrong:
+      - "Each copy gets exactly half the original coefficient, which is the unique solution"
+      - "Training RSS drops, because the model now has one more free parameter"
+      - "The fitted values change, because the hat matrix now has trace $p + 1$"
+    explanation: |
+      Duplicating a column doesn't change $\mathrm{col}(X)$, so the projection $\hat y$, the RSS and $\operatorname{tr} H = \mathrm{rank}(X)$ are all unchanged. Any split with $w_j + w_k$ equal to the old coefficient fits equally well. Equal halves is the *min-norm* choice (what the pseudo-inverse returns), not the unique solution. The extra parameter adds no new direction, so the RSS cannot drop.
+    source: "ESL §3.2 (rank-deficient case); Murphy PML1 §11.2.2.1"
+
+  - id: q4
+    prompt: |
+      The noise in a linear model is i.i.d. Laplace (heavy-tailed), with mean zero and finite variance. The model is otherwise correct. Which statement is true?
+    correct: "OLS is still the best linear unbiased estimator, though a nonlinear estimator may beat it"
+    wrong:
+      - "OLS is biased, because unbiasedness requires Gaussian noise"
+      - "OLS is no longer BLUE, because Gauss–Markov assumes Gaussian noise"
+      - "OLS has the lowest variance of all unbiased estimators, linear or not"
+    explanation: |
+      Gauss–Markov needs only zero-mean, homoscedastic, uncorrelated errors, so OLS is unbiased and BLUE here. But "linear" is a real restriction. For heavy-tailed noise a nonlinear estimator such as least absolute deviations (the Laplace MLE) can have lower variance, so the last option is false. Gaussianity is only needed for exact $t$/$F$ inference.
+    source: "ESL §3.2.2, §10.6; Murphy PML1 §11.6.1"
+
+  - id: q5
+    prompt: |
+      Simple regression with an intercept on inputs $x = 0, 1, 2, 3, 4$. What is the leverage $h_{ii}$ of the point at $x = 4$?
+    correct: "0.6"
+    wrong:
+      - "0.4"
+      - "0.2"
+      - "0.9"
+    explanation: |
+      $h_{ii} = 1/N + (x_i - \bar x)^2/S_{xx}$ with $N = 5$, $\bar x = 2$, $S_{xx} = 10$: $h = 0.2 + 4/10 = 0.6$. The value 0.4 drops the $1/N$ term; it also happens to equal the average leverage $p/N = 2/5$. The value 0.2 keeps only $1/N$. Check: the five leverages are $0.6, 0.3, 0.2, 0.3, 0.6$, summing to $p = 2$.
+    source: "ESL §3.2 (eq. 3.7); Murphy PML1 §11.2.2.2"
+
+  - id: q6
+    prompt: |
+      Synthetic data: a cloud of points plus three marked points A, B and C, with the OLS line fitted to all of them. Deleting which **single** marked point would change the fitted slope the most?
+
+      ![Synthetic data with three marked points and the OLS line fitted to all points.](fund.linear-regression/leverage-quiz)
+    correct: "B"
+    wrong:
+      - "A"
+      - "C"
+      - "All three change it by about the same amount"
+    explanation: |
+      Influence needs both leverage and disagreement with the other points. A has the highest leverage (0.66) but lies exactly on the line fitted to the others, so its leave-one-out residual is 0 and deleting it changes nothing. C has the largest residual but sits near the centre of the inputs (leverage 0.06), so deleting it barely tilts the line (slope 0.334 → 0.348). B is moderately far out (leverage 0.23) and off the trend. Deleting it moves the slope from 0.334 to 0.415.
+    source: "ESL §3.2, §7.10 (eq. 7.51)"
+
+  - id: q7
+    prompt: |
+      In deriving $\mathbb{E}[\mathrm{RSS}] = \sigma^2(N - p)$, which justification is **wrong**?
+    correct: "$r = (I - H)\\varepsilon$ because $H\\varepsilon = 0$ for zero-mean noise"
+    wrong:
+      - "$r = (I - H)\\varepsilon$ because $(I - H)X = 0$"
+      - "$\\mathrm{RSS} = \\varepsilon^\\top (I - H)\\varepsilon$ because $I - H$ is symmetric and idempotent"
+      - "$\\mathbb{E}[\\varepsilon^\\top M \\varepsilon] = \\sigma^2 \\operatorname{tr} M$ when $\\mathrm{Cov}(\\varepsilon) = \\sigma^2 I$"
+    explanation: |
+      $H\varepsilon$ is the projection of the noise onto $\mathrm{col}(X)$, which is not zero; that part of the noise ends up in $\hat y$. The correct reason is $r = (I - H)(Xw + \varepsilon)$ and $(I - H)X = 0$. The other two steps are valid: $(I - H)^\top(I - H) = I - H$, and $\mathbb{E}[\varepsilon^\top M\varepsilon] = \operatorname{tr}(M\,\mathbb{E}[\varepsilon\varepsilon^\top])$.
+    source: "ESL §3.2 (eq. 3.8 and the unbiasedness of σ̂²)"
+
+  - id: q8
+    prompt: |
+      Solve $w_1 + w_2 = 2$ (one equation, two unknowns) by gradient descent on $\tfrac12(w_1 + w_2 - 2)^2$ with a small step size, **starting from** $w_0 = (3, 0)$. Where does GD converge?
+    correct: "$(2.5, -0.5)$"
+    wrong:
+      - "$(1, 1)$"
+      - "$(2, 0)$"
+      - "$(3, -1)$"
+    explanation: |
+      Every gradient is a multiple of the row $(1, 1)$, so GD never changes the null-space component of $w_0$. Split $w_0 = (1.5, 1.5) + (1.5, -1.5)$. The row-space part converges to the min-norm solution $(1, 1)$ and the null-space part $(1.5, -1.5)$ stays, giving $(2.5, -0.5)$: the solution closest to $w_0$. GD reaches $(1, 1)$ only from a start in the row space, such as $w_0 = 0$.
+    source: "Murphy PML1 §7.7.2"
+
+  - id: q9
+    prompt: |
+      A model has an intercept and two features, standardized, with sample correlation $0.95$. Compared with uncorrelated features (same $N$ and $\sigma^2$), by what factor is the **standard error** of each slope inflated?
+    correct: "About 3.2"
+    wrong:
+      - "About 10.3"
+      - "About 20"
+      - "About 1.05"
+    explanation: |
+      With one other feature, $R_j^2 = \rho^2 = 0.9025$, so $\mathrm{VIF} = 1/(1 - 0.9025) = 10.3$. VIF inflates the *variance*, so the standard error grows by $\sqrt{10.3} \approx 3.2$. The value 10.3 confuses variance with standard deviation, and 20 uses $1/(1 - \rho)$ instead of $1/(1 - \rho^2)$.
+    source: "ESL §3.2.3 (eq. 3.29); Murphy PML1 §11.7.6"
+
+  - id: q10
+    prompt: |
+      You add a column of pure random noise, independent of $y$, to an OLS model with $N = 50$ and $p = 4$. What happens to the **training** $R^2$?
+    correct: "It cannot decrease, and almost surely rises slightly"
+    wrong:
+      - "It decreases, because noise degrades the fit"
+      - "It stays exactly the same, because the column is independent of $y$"
+      - "It is equally likely to rise or fall, depending on the noise draw"
+    explanation: |
+      The new column space contains the old one, so the projection of $y$ is at least as close as before: RSS can't increase. Sample correlation with the residual is almost never exactly zero, so RSS drops a little. This is why adjusted $R^2$ and held-out evaluation exist. Independence holds in the population, not exactly in a finite sample.
+    source: "Murphy PML1 §11.2.4.2; ESL §3.2"
+
+  - id: q11
+    prompt: |
+      $X$ has condition number $\kappa(X) = 10^6$, and you work in double precision (about 16 significant digits). Compare solving the normal equations by Cholesky with solving by Householder QR.
+    correct: "The normal equations face $\\kappa = 10^{12}$, so expect about 6 fewer accurate digits than QR"
+    wrong:
+      - "Both give the same accuracy, since in exact arithmetic they compute the same $\\hat w$"
+      - "QR also squares $\\kappa$, because $R^\\top R = X^\\top X$"
+      - "Cholesky is more accurate, because it exploits the symmetry of $X^\\top X$"
+    explanation: |
+      Forming $X^\top X$ squares the condition number, $\kappa(X^\top X) = \kappa(X)^2 = 10^{12}$, so roughly 12 digits are at risk instead of 6. QR solves $R\hat w = Q^\top y$, and $\kappa(R) = \kappa(X)$ because $Q$ has orthonormal columns. It is true that $R^\top R = X^\top X$, but QR never forms that product. Exact-arithmetic equivalence says nothing about rounding error.
+    source: "Murphy PML1 §11.2.2.3; ESL §3.2.3 (eqs. 3.31–3.32)"
+
+  - id: q12
+    prompt: |
+      With strongly collinear features, ridge regression often has lower test MSE than OLS. How does this square with Gauss–Markov?
+    correct: "Ridge is biased, and Gauss–Markov only ranks unbiased linear estimators"
+    wrong:
+      - "It contradicts it: OLS is BLUE, so nothing linear can have lower MSE"
+      - "Collinearity makes OLS biased, so Gauss–Markov no longer applies"
+      - "Ridge is unbiased with lower variance, a known exception to the theorem"
+    explanation: |
+      MSE = variance + bias². Gauss–Markov says OLS has the lowest variance *among unbiased* linear estimators. Ridge is linear in $y$ but biased. Under collinearity it removes far more variance than the bias² it adds. Collinearity inflates the OLS variance but leaves OLS unbiased.
+    source: "ESL §3.2.2 (eq. 3.20)"
+
+  - id: q13
+    prompt: |
+      Salary is regressed on years of experience and age, whose correlation is 0.9. The experience coefficient is near zero and insignificant. When age is dropped, it becomes large and significant. Best explanation?
+    correct: "With age in the model, the coefficient measures experience's effect at fixed age, and the two features overlap heavily"
+    wrong:
+      - "OLS is biased whenever features are correlated, so the first fit is wrong"
+      - "The near-zero coefficient shows that experience has no effect on salary"
+      - "Dropping age removes a singularity in $X^\\top X$, so only the second fit is valid"
+    explanation: |
+      $\hat w_j$ is the regression of $y$ on the part of $x_j$ not explained by the other features. With $\rho = 0.9$ that part is small, so the coefficient is noisy and reflects only the effect at fixed age. Without age, experience also absorbs age's effect (omitted-variable effect). Correlation alone doesn't bias OLS, and $X^\top X$ is invertible at $\rho = 0.9$, just ill-conditioned.
+    source: "ESL §3.2.3; Murphy PML1 §11.2.3.3"
+
+cards:
+  - id: f1
+    front: State the normal equations, the OLS solution, and the condition for uniqueness.
+    back: |
+      $$X^\top X \hat w = X^\top y$$
+
+      If $X$ has full column rank ($X^\top X \succ 0$, needs $N \ge p$): $\hat w = (X^\top X)^{-1}X^\top y$. Otherwise there are infinitely many minimizers, all giving the same $\hat y$.
+    source: "ESL §3.2 (eqs. 3.4–3.6)"
+  - id: f2
+    front: List the properties of the hat matrix $H = X(X^\top X)^{-1}X^\top$.
+    back: |
+      Symmetric, idempotent ($H^2 = H$), eigenvalues 0 or 1, $\operatorname{tr} H = p$. It projects orthogonally onto $\mathrm{col}(X)$, and $I - H$ projects onto the complement: $r = (I - H)y$, $(I - H)X = 0$.
+    source: "ESL §3.2 (eq. 3.7)"
+  - id: f3
+    front: Under $\mathrm{Cov}(\varepsilon) = \sigma^2 I$ with fixed $X$, give $\mathbb{E}[\hat w]$, $\mathrm{Cov}(\hat w)$ and the unbiased $\hat\sigma^2$.
+    back: |
+      $\mathbb{E}[\hat w] = w$, $\mathrm{Cov}(\hat w) = \sigma^2 (X^\top X)^{-1}$, $\hat\sigma^2 = \mathrm{RSS}/(N - p)$ with $p$ the number of columns including the intercept (ESL writes $N - p - 1$ with $p$ inputs).
+    source: "ESL §3.2 (eq. 3.8)"
+  - id: f4
+    front: Define leverage and give its range, its average, and the leave-one-out residual.
+    back: |
+      $h_{ii} = x_i^\top (X^\top X)^{-1}x_i = \partial\hat y_i/\partial y_i$. Range $[0, 1]$, average $p/N$. $\mathrm{Var}(r_i) = \sigma^2(1 - h_{ii})$. Leave-one-out residual $r_i/(1 - h_{ii})$.
+    source: "ESL §3.2, §7.10 (eq. 7.51)"
+  - id: f5
+    front: State the Gauss–Markov theorem with its assumptions.
+    back: |
+      If $y = Xw + \varepsilon$ with $\mathbb{E}[\varepsilon] = 0$, $\mathrm{Cov}(\varepsilon) = \sigma^2 I$ and fixed full-rank $X$, then for any linear unbiased $\tilde w = Cy$, $\mathrm{Cov}(\tilde w) - \mathrm{Cov}(\hat w_{OLS}) \succeq 0$. OLS is BLUE. Gaussianity is not required, and biased estimators can have lower MSE.
+    source: "ESL §3.2.2"
+  - id: f6
+    front: Give $\mathrm{Var}(\hat w_j)$ via successive orthogonalization, and the variance inflation factor.
+    back: |
+      $\mathrm{Var}(\hat w_j) = \sigma^2/\|z_j\|^2$, where $z_j$ is the residual of $x_j$ regressed on the other columns. $\|z_j\|^2 = (1 - R_j^2)\|x_j - \bar x_j\mathbf 1\|^2$, so $\mathrm{VIF}_j = 1/(1 - R_j^2)$.
+    source: "ESL §3.2.3 (eq. 3.29)"
+  - id: f7
+    front: When $p > N$, which solution does the pseudo-inverse return, and which does gradient descent find?
+    back: |
+      $w^+ = X^\top(XX^\top)^{-1}y$, the minimum-norm interpolant (it lies in the row space, orthogonal to $\mathrm{null}(X)$). GD started at $w_0$ converges to the solution closest to $w_0$, which is $w^+$ when $w_0 = 0$.
+    source: "Murphy PML1 §7.7.2"
+  - id: f8
+    front: In OLS, what happens if you multiply feature $x_j$ by $c$? If you add a copy of $x_j$?
+    back: |
+      Scaling: $\hat w_j \to \hat w_j / c$, and predictions, residuals and $t$-statistics are unchanged ($\mathrm{col}(X)$ is unchanged). Copy: $X^\top X$ becomes singular, $\hat w$ is non-unique (only $w_j + w_k$ is determined), and $\hat y$ is unchanged.
+    source: "ESL §3.2"
+  - id: f9
+    type: open
+    front: Derive the OLS solution with matrix calculus and explain when it is unique.
+    back: |
+      1. $\mathrm{RSS} = \|y - Xw\|^2 = y^\top y - 2w^\top X^\top y + w^\top X^\top Xw$.
+      2. Use $\nabla(a^\top w) = a$ and $\nabla(w^\top Aw) = 2Aw$ for symmetric $A$: $\nabla \mathrm{RSS} = -2X^\top y + 2X^\top Xw$.
+      3. Set to zero to get the normal equations $X^\top X\hat w = X^\top y$.
+      4. Hessian $2X^\top X$: $v^\top X^\top Xv = \|Xv\|^2 \ge 0$, so RSS is convex and any solution is global.
+      5. Positive definite iff $Xv \ne 0$ for all $v \ne 0$, i.e. full column rank. Then $\hat w = (X^\top X)^{-1}X^\top y$ is unique.
+      6. Geometric reading: $X^\top(y - X\hat w) = 0$ says the residual is orthogonal to $\mathrm{col}(X)$, so $\hat y$ is the orthogonal projection of $y$.
+      7. Mention: compute with QR, not the explicit inverse. Rank-deficient → min-norm via pseudo-inverse.
+    source: "CS229 notes §1.2; ESL §3.2"
+  - id: f10
+    type: open
+    front: Prove the Gauss–Markov theorem.
+    back: |
+      - Setup: $y = Xw + \varepsilon$, $\mathbb{E}[\varepsilon] = 0$, $\mathrm{Cov}(\varepsilon) = \sigma^2 I$, $X$ fixed with full rank.
+      - Any linear estimator is $\tilde w = Cy$. Unbiased for all $w$ ⇔ $CX = I$.
+      - Write $C = (X^\top X)^{-1}X^\top + D$. Then $CX = I + DX$, so $DX = 0$.
+      - $\mathrm{Cov}(\tilde w) = \sigma^2 CC^\top = \sigma^2[(X^\top X)^{-1} + (X^\top X)^{-1}X^\top D^\top + DX(X^\top X)^{-1} + DD^\top]$. The middle terms vanish since $DX = 0$.
+      - So $\mathrm{Cov}(\tilde w) - \mathrm{Cov}(\hat w) = \sigma^2 DD^\top \succeq 0$, and every $a^\top\tilde w$ has variance $\ge$ that of $a^\top\hat w$.
+      - Caveats to volunteer: no Gaussianity used. It compares only *unbiased linear* estimators, so ridge can win on MSE and nonlinear estimators can win under heavy tails. It fails under heteroscedastic or correlated noise, where GLS/WLS is BLUE.
+    source: "ESL §3.2.2 (Ex. 3.3)"
+  - id: f11
+    type: open
+    front: Show that $\hat\sigma^2 = \mathrm{RSS}/(N - p)$ is unbiased, and explain the $N - p$ intuitively.
+    back: |
+      - $r = (I - H)y = (I - H)(Xw + \varepsilon) = (I - H)\varepsilon$, since $(I - H)X = 0$.
+      - $I - H$ is symmetric and idempotent, so $\mathrm{RSS} = r^\top r = \varepsilon^\top(I - H)\varepsilon$.
+      - $\mathbb{E}[\varepsilon^\top M\varepsilon] = \operatorname{tr}(M\,\mathbb{E}[\varepsilon\varepsilon^\top]) = \sigma^2\operatorname{tr}M$.
+      - $\operatorname{tr}(I - H) = N - \operatorname{tr}H = N - p$ (cyclic trace). So $\mathbb{E}[\mathrm{RSS}] = \sigma^2(N - p)$.
+      - Intuition: the residual is the projection of the noise onto an $(N - p)$-dimensional subspace. The other $p$ dimensions of noise were absorbed into $\hat y$ by fitting $p$ parameters, so RSS/N underestimates $\sigma^2$.
+      - Under Gaussian noise, $(N - p)\hat\sigma^2/\sigma^2 \sim \chi^2_{N-p}$, which gives the $t$-tests.
+    source: "ESL §3.2 (eqs. 3.8, 3.11)"
+  - id: f12
+    type: open
+    front: Compare the ways to compute a least-squares fit and say when you'd use each.
+    back: |
+      - **Normal equations + Cholesky**: form $X^\top X$ in $O(Np^2)$ and factor it in $O(p^3)$. Fastest, but $\kappa(X^\top X) = \kappa(X)^2$, so it loses digits on ill-conditioned data. Fine for well-conditioned, tall problems.
+      - **QR (Householder)**: $X = QR$, solve $R\hat w = Q^\top y$ by back-substitution. $O(Np^2)$, works with $\kappa(X)$. The default for full-rank problems. It is Gram–Schmidt / successive orthogonalization in matrix form.
+      - **SVD**: $\hat w = V\Sigma^+U^\top y$. Most robust: handles rank deficiency and gives the min-norm solution, and you can truncate tiny singular values. Larger constant cost.
+      - **Iterative (GD/SGD/LMS, conjugate gradient)**: for huge $N$, streaming, or sparse $X$. Only needs matrix-vector products. GD from 0 converges to the min-norm solution.
+      - Never form $(X^\top X)^{-1}$ explicitly.
+    source: "Murphy PML1 §11.2.2.3; ESL §3.2.3; CS229 notes §1.1"
+
+reading:
+  - title: "The Elements of Statistical Learning, §3.2 (Linear Regression Models and Least Squares)"
+    url: https://hastie.su.domains/ElemStatLearn/
+    kind: book
+    note: The projection picture, the sampling distribution and t/F tests, the Gauss–Markov theorem and successive orthogonalization (Alg. 3.1) in a few dense pages.
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, §11.2 (Least squares linear regression)"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: The MLE view, the geometric interpretation, QR vs SVD in practice, weighted least squares and R². §7.7.2 has the min-norm solution.
+  - title: "CS229 Lecture Notes, ch. 1 (Linear regression)"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: A gentle derivation of the normal equations with matrix calculus, LMS/SGD, the probabilistic interpretation and locally weighted regression.
+  - title: "Bishop, Pattern Recognition and Machine Learning, §3.1 (Linear Basis Function Models)"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: Basis functions, the Gaussian-likelihood derivation, the geometry of least squares and sequential (LMS) learning.

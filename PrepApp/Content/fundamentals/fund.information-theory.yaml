@@ -1,0 +1,564 @@
+id: fund.information-theory
+area: fundamentals
+title: Entropy, Cross-Entropy & Mutual Information
+summary: Information content from first principles, entropy and its maximum, differential entropy, the chain rule, cross-entropy as a loss with a floor, perplexity, mutual information and the data processing inequality.
+order: 90
+level: core
+tags: [information-theory, probability, entropy, cross-entropy, mutual-information, perplexity]
+prereqs: [fund.probability-basics]
+
+explainer:
+  - title: "The problem: how much does an outcome tell you?"
+    body: |
+      We want a number $h(x)$ for how much we learn when an outcome $x$ of probability $p(x)$ occurs. Three requirements pin it down:
+      - It depends only on $p(x)$ and grows as $p(x)$ shrinks: a rare event is more informative.
+      - A certain event ($p=1$) carries no information.
+      - Learning two independent outcomes gives the sum of their information: $h$ applied to $p_1p_2$ must equal $h(p_1)+h(p_2)$.
+
+      The last condition turns products into sums. Writing $g(t)=h(e^{t})$ gives $g(s+t)=g(s)+g(t)$, whose only continuous solutions are linear, $g(t)=-ct$. So $h(p)=-c\log p$, and $c>0$ makes it decreasing. Choosing $c$ is the same as choosing the base of the log, i.e. the unit. The **information content** (surprise) is
+
+      $$h(x) = -\log p(x) = \log\frac{1}{p(x)}.$$
+
+      **Units.** With $\log_2$ the unit is the **bit**; with $\ln$ it is the **nat**. Since $\log_2 y=\ln y/\ln 2$, 1 nat $\approx 1.443$ bits and 1 bit $=\ln 2\approx 0.693$ nats. A fair coin landing heads carries 1 bit, an event of probability $1/8$ carries 3 bits, and a fair die roll carries $\log_2 6\approx 2.585$ bits.
+
+      **Entropy** is the expected surprise of a random variable $X$ with distribution $p$:
+
+      $$H(X) = \mathbb{E}\big[-\log p(X)\big] = -\sum_x p(x)\log p(x).$$
+
+      It measures how uncertain we are about $X$ before seeing it. Terms with $p(x)=0$ count as 0, because $t\log t\to 0$ as $t\to 0$. $H(X)$ and $H(p)$ are both common notation for the same quantity.
+    source: Goodfellow DL §3.13; MacKay ITILA §2.4; Murphy PML1 §6.1.1
+
+  - title: "Entropy: worked example, codes and the maximum"
+    body: |
+      **Worked example.** For $p=(\tfrac12,\tfrac14,\tfrac14)$ over $\{a,b,c\}$:
+
+      $$H = \tfrac12\cdot 1 + \tfrac14\cdot 2 + \tfrac14\cdot 2 = 1.5\ \text{bits}.$$
+
+      **Coding view.** Use the prefix-free code $a\to 0$, $b\to 10$, $c\to 11$. Each outcome gets a codeword of length $\log_2(1/p)$, and the average length is $\tfrac12\cdot1+\tfrac14\cdot2+\tfrac14\cdot2=1.5$ bits, exactly $H$. The **source coding theorem** says no uniquely decodable code has a shorter expected length than $H$ (in bits), and a prefix code with $H\le L<H+1$ always exists. Lengths $\log_2(1/p)$ are whole numbers only when the probabilities are powers of $\tfrac12$, which is why the bound has the $+1$.
+
+      ![Binary entropy $H(\theta)$. Zero for a certain outcome, 1 bit for a fair coin, and symmetric: $\theta$ and $1-\theta$ are equally uncertain.](fund.information-theory/binary-entropy)
+
+      **Properties.**
+      - $H\ge 0$, because every $-\log p(x)\ge 0$. It is 0 only for a deterministic $X$.
+      - $H$ is **concave** in $p$. Each term $-t\log t$ has second derivative $-1/t<0$, and a sum of concave functions is concave. So mixing two distributions never lowers entropy below the average of theirs.
+      - **Maximum $\log K$ for $K$ outcomes, reached only by the uniform distribution.**
+
+      *Jensen refresher:* for a concave $f$, $\mathbb{E}f(Y)\le f(\mathbb{E}Y)$. If $f$ is strictly concave, equality holds only when $Y$ is constant. Apply it with $f=\log$ and $Y=1/p(X)$, where $S$ is the set of outcomes with $p(x)>0$:
+
+      $$\begin{aligned} H(X) &= \mathbb{E}\Big[\log\frac{1}{p(X)}\Big] \\ &\le \log\mathbb{E}\Big[\frac{1}{p(X)}\Big] \\ &= \log\sum_{x\in S}p(x)\frac{1}{p(x)} \\ &= \log|S| \;\le\; \log K. \end{aligned}$$
+
+      Equality needs $1/p(x)$ to be constant on $S$ and $S$ to contain all $K$ outcomes, which means $p$ is uniform. A uniform distribution over 8 outcomes has 3 bits.
+    source: MacKay ITILA §2.4, §2.7, §5.3–5.4 (Thm 5.1); Murphy PML1 §6.1.1; Bishop PRML §1.6
+
+  - title: "Differential entropy: the continuous case"
+    body: |
+      For a continuous $X$ with density $p$, the **differential entropy** is
+
+      $$h(X) = -\int p(x)\log p(x)\,dx.$$
+
+      It is **not** the limit of discrete entropy. Bin $X$ into cells of width $\Delta$, so cell $i$ has probability $\approx p(x_i)\Delta$. Using $\sum_i p(x_i)\Delta\approx1$:
+
+      $$\begin{aligned} H_\Delta &= -\textstyle\sum_i p(x_i)\Delta\log\big(p(x_i)\Delta\big) \\ &\approx -\textstyle\int p\log p\,dx-\log\Delta \\ &= h(X)-\log\Delta. \end{aligned}$$
+
+      That diverges as $\Delta\to0$, because pinning down a real number exactly takes infinitely many bits. So $h$ is entropy measured relative to the grid, and this causes three surprises.
+
+      **It can be negative.** For $X\sim U(0,a)$, $h=\log a$, so $U(0,\tfrac18)$ has $h=-3$ bits. Densities can exceed 1, so $-\log p$ can be negative.
+
+      **It depends on units.** If $Y=aX$, the change-of-variables rule gives $p_Y(y)=p_X(y/a)/|a|$. Then
+
+      $$\begin{aligned} h(Y) &= -\mathbb{E}\big[\log p_X(X)-\log|a|\big] \\ &= h(X)+\log|a|. \end{aligned}$$
+
+      Converting metres to centimetres adds $\ln 100\approx 4.61$ nats. (KL divergence and mutual information don't have this problem, as the next lesson shows.)
+
+      **The Gaussian value.** For $\varphi=\mathcal N(\mu,\sigma^2)$, $-\log\varphi(x)=\tfrac12\log(2\pi\sigma^2)+\frac{(x-\mu)^2}{2\sigma^2}$. Taking the expectation, with $\mathbb{E}(X-\mu)^2=\sigma^2$:
+
+      $$h(\varphi) = \tfrac12\log(2\pi\sigma^2)+\tfrac12 = \tfrac12\log(2\pi e\sigma^2).$$
+
+      It is negative when $\sigma<1/\sqrt{2\pi e}\approx 0.242$. In $d$ dimensions it is $\tfrac12\log\det(2\pi e\Sigma)$.
+
+      **The Gaussian has maximum entropy for a fixed variance.** Let $p$ be any density with mean $\mu$ and variance $\sigma^2$. Because $\log\varphi$ is quadratic in $x$, $\mathbb{E}_p[-\log\varphi(X)]$ depends only on the first two moments of $p$, so it equals $h(\varphi)$. Then, by Jensen on the concave log:
+
+      $$\begin{aligned} h(p)-h(\varphi) &= \mathbb{E}_p\Big[\log\frac{\varphi(X)}{p(X)}\Big] \\ &\le \log\mathbb{E}_p\Big[\frac{\varphi(X)}{p(X)}\Big] \\ &= \log\int_{p>0}\varphi\,dx \;\le\; 0. \end{aligned}$$
+
+      Equality holds only if $p=\varphi$. This is Gibbs' inequality, which the next lesson proves in general.
+    source: Bishop PRML §1.6 (eqs. 1.102–1.110); Murphy PML1 §6.1.6
+
+  - title: "Joint and conditional entropy, and the chain rule"
+    body: |
+      For two discrete variables, the **joint entropy** $H(X,Y)=-\sum_{x,y}p(x,y)\log p(x,y)$ is the entropy of the pair. The **conditional entropy** is the uncertainty left in $Y$ once $X$ is known, averaged over $X$:
+
+      $$\begin{aligned} H(Y\mid X) &= \textstyle\sum_x p(x)\,H(Y\mid X{=}x) \\ &= -\textstyle\sum_{x,y}p(x,y)\log p(y\mid x). \end{aligned}$$
+
+      **Chain rule.** Take $-\mathbb{E}$ of $\log p(x,y)=\log p(x)+\log p(y\mid x)$:
+
+      $$H(X,Y) = H(X)+H(Y\mid X).$$
+
+      Repeating this gives $H(X_1,\dots,X_n)=\sum_i H(X_i\mid X_{<i})$, the same factorization an autoregressive language model's loss uses. Because $H(Y\mid X)\ge0$, we also get $H(X,Y)\ge\max\{H(X),H(Y)\}$, with equality to $H(X)$ when $Y$ is a function of $X$.
+
+      **Subadditivity.** Apply Jensen to the concave log, summing over pairs with $p(x,y)>0$:
+
+      $$\begin{aligned} &H(X,Y)-H(X)-H(Y) \\ &= \mathbb{E}\Big[\log\frac{p(X)p(Y)}{p(X,Y)}\Big] \\ &\le \log\textstyle\sum_{x,y}p(x)p(y) \;\le\; 0. \end{aligned}$$
+
+      So $H(X,Y)\le H(X)+H(Y)$, with equality iff $X$ and $Y$ are independent. Dependence removes uncertainty.
+
+      **Conditioning reduces entropy, but only on average.** Combining the two results gives $H(Y\mid X)=H(X,Y)-H(X)\le H(Y)$. A single observation can still *increase* uncertainty. Let $P(Y{=}0)=0.8$ with $X=0$ whenever $Y=0$, and let $X$ be a fair coin when $Y=1$. Then $P(X{=}1)=0.1$ and:
+      - $H(X)=0.469$ bits.
+      - $H(X\mid Y{=}1)=1$ bit, which is larger than $H(X)$.
+      - $H(X\mid Y)=0.2\times1=0.2$ bits on average, which is smaller than $H(X)$.
+
+      The rare observation $Y=1$ leaves us more confused than before. The common one, $Y=0$, removes all doubt.
+    source: MacKay ITILA §8.1; Murphy PML1 §6.1.3–6.1.4
+
+  - title: "Cross-entropy: the classification loss and its floor"
+    body: |
+      Data come from $p$, but we predict (or encode) with a model $q$. The **cross-entropy** is the model's average surprise on real data, or the average code length when the code is built for $q$:
+
+      $$H(p,q) = -\sum_x p(x)\log q(x) = \mathbb{E}_p[-\log q(X)].$$
+
+      **Decomposition.** Add and subtract $\log p(X)$ inside the expectation:
+
+      $$\begin{aligned} H(p,q) &= \mathbb{E}_p[-\log p(X)] + \mathbb{E}_p\Big[\log\frac{p(X)}{q(X)}\Big] \\ &= H(p)+\mathrm{KL}(p\,\|\,q). \end{aligned}$$
+
+      The second term is the **KL divergence**, the extra cost of using the wrong distribution. It is $\ge0$ with equality iff $q=p$; the proof is the same Jensen step as on the max-entropy card, and the next lesson covers it in full.
+
+      ![$H(p,q)=H(p)+\mathrm{KL}(p\|q)$ for a fixed $p$. The bottom segment, $H(p)$, never moves. Only the top segment, the KL, depends on the model, and a confidently wrong $q$ pays the most.](fund.information-theory/ce-decomposition)
+
+      **Consequences.**
+      - $H(p)$ does not depend on $q$, so minimizing cross-entropy over $q$ is the same as minimizing $\mathrm{KL}(p\|q)$. When $p$ is the empirical distribution of a training set, $H(p,q)=-\frac1N\sum_n\log q(x_n)$, the average negative log-likelihood. So cross-entropy training is maximum likelihood.
+      - With a one-hot label on class $y$, $H(p,q)=-\log q_y$. With soft targets (label smoothing, distillation), every class contributes.
+      - **The floor is $H(p)$, not 0.** Suppose each binary label is a deterministic function of $x$, then flipped with probability 0.1. Every $p(y\mid x)$ is then $(0.9,0.1)$, so no model can get an expected test loss below $H(0.1)=0.325$ nats (0.469 bits). A training loss far below that means the model has memorized the noise.
+
+      **Notation trap:** $H(p,q)$ is the cross-entropy of two distributions over one variable. $H(X,Y)$ is the joint entropy of two variables. Cross-entropy is not symmetric in $p$ and $q$.
+    source: Murphy PML1 §6.1.2, §6.2.2, §6.2.5; Goodfellow DL §3.13; d2l §22.11.5
+
+  - title: "Perplexity, bits and nats"
+    body: |
+      **Perplexity** is the exponential of the cross-entropy, using the same base as the log. On a test sequence $x_1,\dots,x_N$:
+
+      $$\begin{aligned} \mathrm{PPL} &= \exp\Big(-\tfrac1N\textstyle\sum_n\log q(x_n)\Big) \\ &= \Big(\textstyle\prod_n \frac{1}{q(x_n)}\Big)^{1/N}. \end{aligned}$$
+
+      This is the geometric mean of the inverse probabilities the model gave to what actually happened.
+
+      **Effective branching factor.** A model that is uniform over $V$ choices at every step has cross-entropy $\log V$ and perplexity exactly $V$. So a perplexity of 20 means the model is as uncertain as picking uniformly among 20 tokens at each step. Perplexity is at least $\exp(H(p))$, because the cross-entropy is at least the true entropy.
+
+      **Worked conversions.** A model with a cross-entropy of 2.0 nats per token:
+      - Perplexity $e^{2}\approx 7.39$.
+      - In bits, $2.0/\ln2\approx 2.885$ bits per token, and $2^{2.885}\approx 7.39$. The perplexity is the same in either base.
+      - If a token averages 4 characters, the total bits stay the same, so this is $2.885/4\approx0.72$ **bits per character** (bpc).
+
+      **Sanity check at initialization.** An untrained language model with vocabulary $V=50{,}000$ and near-uniform outputs should start at a loss of about $\ln 50{,}000\approx 10.8$ nats. A much higher starting loss usually means overconfident initial logits or a bug.
+
+      **Units in practice.** PyTorch's cross-entropy loss uses nats. Papers often report bits per character or byte for text, and bits per dimension for images; to convert, divide nats by $\ln 2$ and by the number of characters, bytes or dimensions. Perplexities are comparable only between models with the same tokenizer on the same text. Bits per byte is tokenizer-independent.
+    source: Murphy PML1 §6.1.5; MacKay ITILA §2.4
+
+  - title: "Mutual information"
+    body: |
+      How much does observing $Y$ tell us about $X$? Define the **mutual information** as the average reduction in uncertainty:
+
+      $$I(X;Y) = H(X)-H(X\mid Y).$$
+
+      **Equivalent forms.** Substituting the chain rule $H(X\mid Y)=H(X,Y)-H(Y)$ gives
+
+      $$I(X;Y) = H(X)+H(Y)-H(X,Y).$$
+
+      This is symmetric, so it also equals $H(Y)-H(Y\mid X)$: $X$ tells us as much about $Y$ as $Y$ tells us about $X$. Writing each entropy as an expected log:
+
+      $$\begin{aligned} I(X;Y) &= \mathbb{E}\Big[\log\frac{p(X,Y)}{p(X)p(Y)}\Big] \\ &= \mathrm{KL}\big(p(x,y)\,\|\,p(x)p(y)\big). \end{aligned}$$
+
+      So MI is how far the joint distribution is from independence. By subadditivity, $I\ge0$, with $I=0$ iff $X$ and $Y$ are independent.
+
+      ![Information diagram for the worked example, in bits. Each circle is a marginal entropy, the overlap is $I(X;Y)$, and the union is $H(X,Y)$.](fund.information-theory/entropy-venn)
+
+      **Worked example.** Take $p(x,y)$ with $0.4$ on the diagonal and $0.1$ off it, over $x,y\in\{0,1\}$:
+      - Both marginals are uniform, so $H(X)=H(Y)=1$ bit.
+      - Given $Y$, $X$ equals $Y$ with probability 0.8, so $H(X\mid Y)=H(0.2)=0.722$ bits.
+      - $I(X;Y)=1-0.722=0.278$ bits, and $H(X,Y)=1.722$ bits.
+
+      **MI vs correlation.** Pearson $\rho$ only detects linear dependence. Let $X$ be uniform on $\{-1,0,1\}$ and $Y=X^2$. Then $\mathrm{Cov}(X,Y)=\mathbb{E}X^3-\mathbb{E}X\,\mathbb{E}X^2=0$, so $\rho=0$. But $Y$ is a function of $X$, so $H(Y\mid X)=0$ and $I=H(Y)=H(\tfrac13,\tfrac23)\approx0.918$ bits. For a jointly Gaussian pair, MI is a function of $\rho$ alone. Using $h(X)=\tfrac12\log(2\pi e\sigma_x^2)$, the same for $Y$, and $h(X,Y)=\tfrac12\log[(2\pi e)^2\sigma_x^2\sigma_y^2(1-\rho^2)]$ (the 2-D Gaussian entropy with $\det\Sigma=\sigma_x^2\sigma_y^2(1-\rho^2)$), everything cancels in $h(X)+h(Y)-h(X,Y)$ except
+
+      $$I(X;Y)=-\tfrac12\log(1-\rho^2),$$
+
+      which is 0.223 nats at $\rho=0.6$.
+
+      MI between continuous variables is $\ge0$ and unit-free, even though each $h$ can be negative. The $\log|a|$ terms from rescaling cancel inside the ratio.
+    source: Murphy PML1 §6.3.1–6.3.3, §6.3.5; MacKay ITILA §8.1
+
+  - title: "Conditional MI, data processing and ML uses"
+    body: |
+      **Conditional MI** is what $Y$ tells us about $X$ beyond what $Z$ already did:
+
+      $$I(X;Y\mid Z) = H(X\mid Z)-H(X\mid Y,Z).$$
+
+      It is the average over $z$ of $I(X;Y\mid Z{=}z)$, and each of those is an ordinary MI, so $I(X;Y\mid Z)\ge0$.
+
+      **Chain rule for MI.** Add and subtract $H(X\mid Y)$:
+
+      $$\begin{aligned} I(X;Y,Z) &= H(X)-H(X\mid Y,Z) \\ &= I(X;Y)+I(X;Z\mid Y). \end{aligned}$$
+
+      Conditioning can *raise* MI. Let $X$ and $Y$ be independent fair bits and $Z=X\oplus Y$ (XOR). Then $I(X;Y)=0$, but once $Z$ is known, $Y$ determines $X$, so $I(X;Y\mid Z)=1$ bit.
+
+      **Data processing inequality (DPI).** Say $X\to Y\to Z$ is a Markov chain: $Z$ depends on $X$ only through $Y$, so $I(X;Z\mid Y)=0$. Expand $I(X;Y,Z)$ with the chain rule in both orders:
+
+      $$\begin{aligned} I(X;Y,Z) &= I(X;Z)+I(X;Y\mid Z) \\ &= I(X;Y)+I(X;Z\mid Y). \end{aligned}$$
+
+      The last term is 0 and $I(X;Y\mid Z)\ge0$, so $I(X;Z)\le I(X;Y)$. **Post-processing cannot create information.**
+
+      **What it means for networks.** With label $Y$, input $X$ and hidden layers $h_k$, the chain $Y\to X\to h_1\to h_2\to\cdots$ gives $I(Y;h_k)\le I(Y;X)$. Layers can only discard information about the label or make it easier to read out. An invertible layer $f$ loses nothing: $X\to f(X)\to X$ is also a chain, so the DPI holds in both directions and $I(Y;f(X))=I(Y;X)$.
+
+      **Where MI shows up in ML.**
+      - Decision trees split on the feature with the largest **information gain**, $H(Y)-H(Y\mid\text{split})=I(Y;\text{split})$ (fund.decision-trees).
+      - **Sufficient statistics:** treating $\theta$ as random (the Bayesian view), $s(D)$ is sufficient for $\theta$ when $I(\theta;s(D))=I(\theta;D)$, so the DPI is tight.
+      - **InfoNCE**, the contrastive loss, is a lower bound on the MI between two views. With $K$ samples per batch the estimate is $\log K$ minus a $K$-way cross-entropy, which is $\ge0$, so it can never exceed $\log K$.
+      - The **information bottleneck** learns a representation $Z$ that trades high $I(Z;Y)$ against low $I(Z;X)$.
+    source: Murphy PML1 §6.3.4, §6.3.8–6.3.9; Murphy PML2 §5.3.6.4, §5.6.1
+
+  - title: "Pitfalls and what interviewers probe"
+    body: |
+      **Pitfalls**
+      - Mixing bases. Compare losses in the same unit: nats $=$ bits $\times\ln2$.
+      - Treating differential entropy like discrete entropy. It can be negative and changes with units. MI and KL are safe, because the Jacobians cancel inside their ratios.
+      - Comparing perplexities across tokenizers (see above).
+      - "Conditioning reduces entropy" holds only on average, and conditioning can increase MI (the XOR example).
+      - $\rho=0$ does not mean independence. $I=0$ does.
+      - Writing $H(p,q)$ when you mean $H(X,Y)$, or the reverse.
+
+      **Probes**
+      - *Why a log?* It is the only continuous choice that makes the information of independent events add.
+      - *Why cross-entropy for classification?* It is the negative log-likelihood of a categorical model. Minimizing it minimizes $\mathrm{KL}(p_{\text{data}}\|q)$, and its gradient with respect to the logits is $q-y$ (derived in fund.logistic-regression).
+      - *Your LM's loss is 3.0 nats. What's the perplexity?* $e^3\approx20.1$.
+      - *Can the loss go below the label entropy?* Training loss can, by memorizing. Expected test loss can't, because $H(p,q)\ge H(p)$.
+      - *Which distribution has maximum entropy?* The uniform over $K$ outcomes ($\log K$), and the Gaussian for a fixed variance on $\mathbb R$. Both follow from Jensen.
+      - *How would you estimate MI from samples?* Discretize and use the plug-in formula (sensitive to the bin choice), use $k$-nearest-neighbour estimators such as KSG for low dimensions, or use variational lower bounds such as InfoNCE in high dimensions.
+    source: Murphy PML1 §6.1.5–6.1.6, §6.3.5; Murphy PML2 §5.3.6
+
+  - title: Key results
+    body: |
+      $$h(x)=-\log p(x),\qquad H(X)=\mathbb{E}[-\log p(X)]$$
+
+      $$0\le H(X)\le\log K\ \ (\text{max iff uniform})$$
+
+      $$\begin{aligned} h(\mathcal N(\mu,\sigma^2)) &= \tfrac12\log(2\pi e\sigma^2) \\ h(aX) &= h(X)+\log|a| \end{aligned}$$
+
+      $$\begin{aligned} H(X,Y) &= H(X)+H(Y\mid X) \\ &\le H(X)+H(Y) \end{aligned}$$
+
+      $$H(p,q)=H(p)+\mathrm{KL}(p\|q)\ \ge H(p)$$
+
+      $$\mathrm{PPL}=e^{\text{CE in nats}},\quad 1\text{ nat}=1.443\text{ bits}$$
+
+      $$\begin{aligned} I(X;Y) &= H(X)-H(X\mid Y) \\ &= H(X)+H(Y)-H(X,Y) \\ &= \mathrm{KL}(p(x,y)\|p(x)p(y)) \end{aligned}$$
+
+      $$X\to Y\to Z\ \Rightarrow\ I(X;Z)\le I(X;Y)$$
+
+      - One-hot target: $H(p,q)=-\log q_y$. Uniform over $V$: loss $\log V$, perplexity $V$.
+      - Gaussian MI: $-\tfrac12\log(1-\rho^2)$.
+    source: Murphy PML1 §6.1–6.3; MacKay ITILA §2.4, §8.1; Bishop PRML §1.6
+
+quiz:
+  - id: q1
+    prompt: |
+      $X$ takes one value with probability $\tfrac12$ and four others with probability $\tfrac18$ each. What is $H(X)$?
+    correct: 2 bits
+    wrong:
+      - 2.32 bits
+      - 1.5 bits
+      - 2.5 bits
+    explanation: |
+      $H=\tfrac12\log_2 2+4\cdot\tfrac18\log_2 8=0.5+1.5=2$ bits. The tempting 2.32 bits is $\log_2 5$, the entropy of the *uniform* distribution over 5 outcomes. That is the maximum, and this skewed distribution falls below it.
+    source: MacKay ITILA §2.4
+
+  - id: q2
+    prompt: |
+      A language model's validation cross-entropy is 2.0 nats per token. How should it be reported in bits per token, and what is its perplexity?
+    correct: 2.89 bits per token; perplexity 7.39
+    wrong:
+      - 1.39 bits per token; perplexity 7.39
+      - 2.89 bits per token; perplexity 4.00
+      - 2.00 bits per token; perplexity 7.39
+    explanation: |
+      Bits $=$ nats $/\ln2=2.0/0.693\approx2.89$. Perplexity is $e^{2.0}\approx7.39$, the same as $2^{2.89}$, because the base cancels. The 1.39 option multiplies by $\ln 2$ instead of dividing. A perplexity of 4.00 comes from computing $2^{2.0}$, which treats the nats as bits.
+    source: Murphy PML1 §6.1.5; Murphy PML2 §5.1.3.1
+
+  - id: q3
+    prompt: |
+      Binary $X,Y$ have $p(0,0)=p(1,1)=0.45$ and $p(0,1)=p(1,0)=0.05$. What is $I(X;Y)$?
+    correct: 0.531 bits
+    wrong:
+      - 0.469 bits
+      - 0.800 bits
+      - 1.469 bits
+    explanation: |
+      Both marginals are uniform, so $H(X)=1$ bit. Given $Y$, $X$ matches it with probability 0.9, so $H(X\mid Y)=H(0.1)=0.469$ bits, and $I=1-0.469=0.531$ bits. The option 0.469 is $H(X\mid Y)$ itself, 1.469 is $H(X,Y)$, and 0.800 is the Pearson correlation of this table, which is not an information quantity.
+    source: Murphy PML1 §6.3.2
+
+  - id: q4
+    prompt: |
+      Which statement about continuous random variables is **false**?
+    correct: Like discrete entropy, $h(X)\ge 0$ holds for every density
+    wrong:
+      - Rescaling $X$ by a factor of 2 adds $\log 2$ to $h(X)$
+      - For a fixed variance, the Gaussian has the largest $h(X)$
+      - $I(X;Y)\ge 0$ holds even though each $h$ can be negative
+    explanation: |
+      Densities can exceed 1, so $h$ can be negative: $U(0,\tfrac18)$ has $h=-3$ bits. The other three are true. $h(aX)=h(X)+\log|a|$ follows from the change of variables. The Gaussian max-entropy result follows from Jensen. MI is a KL divergence, and the scale terms cancel inside its ratio.
+    source: Murphy PML1 §6.1.6, §6.3.1; Bishop PRML §1.6
+
+  - id: q5
+    prompt: |
+      In a binary task, each true label is a deterministic function of $x$, but every label (train and test) is flipped independently with probability 0.2. What is the lowest expected test cross-entropy any model can achieve?
+    correct: About 0.500 nats per example
+    wrong:
+      - 0 nats, given enough capacity
+      - About 0.2 nats per example
+      - About 0.693 nats per example
+    explanation: |
+      For every $x$, the observed label has conditional distribution $(0.8,0.2)$, so $H(p,q)\ge H(p)=H(0.2)=0.500$ nats, reached when $q=(0.8,0.2)$. Zero is achievable only on the *training* set, by memorizing the flips. 0.2 is the error rate, which is a different quantity, and 0.693 nats is a constant 50/50 guess.
+    source: Murphy PML1 §6.2.2; Goodfellow DL §3.13
+
+  - id: q6
+    prompt: |
+      In this information diagram, the left circle is $H(X)$ and the right circle is $H(Y)$.
+
+      ![Two overlapping circles with regions A, B and C.](fund.information-theory/venn-quiz)
+
+      What is the total area of regions A and C?
+    correct: $H(X,Y)-I(X;Y)$
+    wrong:
+      - $H(X)+H(Y)-H(X,Y)$
+      - $H(X\mid Y)+H(Y)$
+      - $H(X,Y)-H(X)$
+    explanation: |
+      A is $H(X\mid Y)$ and C is $H(Y\mid X)$, so A + C is the union $H(X,Y)$ minus the overlap $I(X;Y)$. The first distractor is the overlap B itself, which is $I(X;Y)$. $H(X\mid Y)+H(Y)$ is the whole union, A + B + C. $H(X,Y)-H(X)$ is C alone.
+    source: Murphy PML1 §6.3.2 (Fig. 6.4)
+
+  - id: q7
+    prompt: |
+      $X$ is uniform on $\{-2,-1,0,1,2\}$ and $Y=X^2$. What are the Pearson correlation $\rho$ and $I(X;Y)$?
+    correct: $\rho=0$ and $I(X;Y)\approx1.522$ bits
+    wrong:
+      - $\rho=0$ and $I(X;Y)=0$
+      - $\rho=0$ and $I(X;Y)\approx2.322$ bits
+      - $\rho=1$ and $I(X;Y)\approx1.522$ bits
+    explanation: |
+      $\mathrm{Cov}(X,Y)=\mathbb{E}X^3-\mathbb{E}X\,\mathbb{E}X^2=0$ by symmetry, so $\rho=0$. $Y$ is a function of $X$, so $H(Y\mid X)=0$ and $I=H(Y)=H(\tfrac15,\tfrac25,\tfrac25)\approx1.522$ bits. Zero correlation only rules out linear dependence. 2.322 bits is $H(X)=\log_25$. $I$ would equal $H(X)$ only if $X$ were also a function of $Y$, and $Y=1$ or $Y=4$ leaves the sign of $X$ unknown.
+    source: Murphy PML1 §6.3.2, §6.3.5
+
+  - id: q8
+    prompt: |
+      For a particular observed value $y$, you compute $H(X\mid Y{=}y)>H(X)$. Does this contradict "conditioning reduces entropy"?
+    correct: No, only the average must be at most $H(X)$
+    wrong:
+      - Yes, because it would make $I(X;Y)$ negative
+      - Yes, because it breaks the chain rule for entropy
+      - No, but this can happen only for continuous variables
+    explanation: |
+      The guarantee is $H(X\mid Y)=\sum_y p(y)H(X\mid Y{=}y)\le H(X)$, an average over $y$. A rare, confusing $y$ can raise uncertainty, as long as typical values lower it. In the lesson's example, $H(X)=0.469$ bits, $H(X\mid Y{=}1)=1$ bit, and $H(X\mid Y)=0.2$ bits. $I(X;Y)$ is defined with the average, so it stays non-negative.
+    source: Murphy PML1 §6.1.4; MacKay ITILA §8.1
+
+  - id: q9
+    prompt: |
+      $Y$ is a label, $X$ the input, and $Z=f(X)$, where $f$ is a deterministic, **invertible** layer (say an orthogonal linear map). How does $I(Y;Z)$ compare with $I(Y;X)$?
+    correct: They are equal
+    wrong:
+      - Strictly smaller, since processing loses information
+      - Larger once $f$ has been trained on labels
+      - Equal only if $f$ is linear
+    explanation: |
+      $Y\to X\to Z$ gives $I(Y;Z)\le I(Y;X)$ by the DPI. Because $f$ is invertible, $Y\to Z\to X$ is also a Markov chain, which gives the reverse inequality. The DPI says processing *cannot increase* information. It doesn't say processing always loses some. Linearity is irrelevant: any invertible map preserves MI.
+    source: Murphy PML1 §6.3.8
+
+  - id: q10
+    prompt: |
+      A distance $X$ measured in kilometres has differential entropy $h(X)=2$ nats. What is the differential entropy of the same distance measured in metres?
+    correct: About 8.91 nats
+    wrong:
+      - 2 nats, since entropy doesn't depend on units
+      - About $-4.91$ nats
+      - 2000 nats
+    explanation: |
+      $Y=1000X$, so $h(Y)=h(X)+\ln1000=2+6.91=8.91$ nats: spreading the density over a 1000-times-wider range adds $\ln 1000$. The idea that units don't matter is true of discrete entropy, KL and MI, but not of differential entropy. $-4.91$ gets the sign of the Jacobian term wrong.
+    source: Murphy PML1 §6.1.6; Bishop PRML §1.6
+
+  - id: q11
+    prompt: |
+      A source emits symbols with $p=(\tfrac34,\tfrac14)$. A model predicts $q=(\tfrac12,\tfrac12)$ and so has a cross-entropy of exactly 1 bit per symbol. How many of those bits could a better model remove?
+    correct: About 0.189 bits
+    wrong:
+      - About 0.811 bits
+      - 0.25 bits
+      - All of it, 1 bit
+    explanation: |
+      $H(p,q)=H(p)+\mathrm{KL}(p\|q)$. Here $H(p)=H(0.25)=0.811$ bits is irreducible, so only $\mathrm{KL}=1-0.811=0.189$ bits can be removed, by setting $q=p$. The 0.811 option confuses the floor with the excess. A cross-entropy of 0 would require a deterministic source.
+    source: Murphy PML1 §6.2.2; Goodfellow DL §3.13
+
+  - id: q12
+    prompt: |
+      A freshly initialized language model with a 50,000-token vocabulary outputs nearly uniform next-token distributions. What should its initial training loss (PyTorch cross-entropy) be?
+    correct: About 10.8
+    wrong:
+      - About 15.6
+      - About 4.7
+      - About 0.69
+    explanation: |
+      A uniform $q$ gives $-\log(1/V)=\ln 50{,}000\approx10.8$ nats, and PyTorch uses natural logs. 15.6 is $\log_2 50{,}000$, the same quantity in bits. 4.7 is $\log_{10}$. 0.69 is $\ln 2$, the binary-classification value. A starting loss far above 10.8 suggests overconfident initial logits.
+    source: Murphy PML1 §6.1.5
+
+  - id: q13
+    prompt: |
+      Which statement about discrete joint entropy is **false**?
+    correct: $H(X,Y)>H(X)+H(Y)$ is possible under negative correlation
+    wrong:
+      - $H(X,Y)=H(X)$ whenever $Y$ is a deterministic function of $X$
+      - $H(X,Y)\ge\max\{H(X),H(Y)\}$ for discrete $X$ and $Y$
+      - $H(X_1,\dots,X_n)=\sum_i H(X_i\mid X_1,\dots,X_{i-1})$
+    explanation: |
+      Subadditivity, $H(X,Y)\le H(X)+H(Y)$, holds for *any* dependence, positive or negative. The gap is $I(X;Y)\ge0$. The other three are true: the chain rule with $H(Y\mid X)=0$, non-negativity of discrete conditional entropy, and the general chain rule.
+    source: Murphy PML1 §6.1.3–6.1.4
+
+  - id: q14
+    prompt: |
+      $X$ and $Y$ are independent fair bits, and $Z=X\oplus Y$ (XOR). What are $I(X;Y)$ and $I(X;Y\mid Z)$?
+    correct: 0 and 1 bit
+    wrong:
+      - 0 and 0
+      - 1 bit and 0
+      - 0 and 0.5 bits
+    explanation: |
+      Independence gives $I(X;Y)=0$. Given $Z$, knowing $Y$ fixes $X=Y\oplus Z$, so $H(X\mid Z)=1$ and $H(X\mid Y,Z)=0$, which gives $I(X;Y\mid Z)=1$ bit. Unlike entropy, MI can *grow* when you condition. Assuming it can only shrink leads to the "0 and 0" answer. "0.5 bits" would need some uncertainty about $X$ to remain once $Y$ and $Z$ are known, but none does: $X=Y\oplus Z$ exactly.
+    source: Murphy PML1 §6.3.4
+
+cards:
+  - id: f1
+    front: Define information content and say why it uses a logarithm. How do you convert between bits and nats?
+    back: |
+      $h(x)=-\log p(x)$. The log is the only continuous, decreasing choice that is 0 for certain events and makes the information of independent events add: $h(p_1p_2)=h(p_1)+h(p_2)$.
+
+      Bits use $\log_2$ and nats use $\ln$. 1 nat $=1/\ln2\approx1.443$ bits, and 1 bit $=\ln2\approx0.693$ nats.
+    source: Goodfellow DL §3.13; Murphy PML2 §5.1.3.1
+
+  - id: f2
+    front: Define the entropy of a discrete $X$ over $K$ outcomes and state its bounds, with the cases of equality.
+    back: |
+      $$H(X)=-\sum_x p(x)\log p(x),\quad 0\log0:=0$$
+
+      $0\le H(X)\le\log K$. The lower bound is reached iff $X$ is deterministic, and the upper bound iff $p$ is uniform. $H$ is concave in $p$.
+    source: MacKay ITILA §2.4; Murphy PML1 §6.1.1
+
+  - id: f3
+    front: Give the differential entropy of $\mathcal N(\mu,\sigma^2)$ and of $\mathcal N(\mu,\Sigma)$, and how $h$ changes under $Y=aX$.
+    back: |
+      $$h=\tfrac12\log(2\pi e\sigma^2),\qquad h=\tfrac12\log\det(2\pi e\Sigma)$$
+
+      $h(aX)=h(X)+\log|a|$. It is negative when $\sigma<1/\sqrt{2\pi e}\approx0.242$, and the Gaussian is the maximum-entropy density for a given variance.
+    source: Murphy PML1 §6.1.6; Bishop PRML §1.6
+
+  - id: f4
+    front: State the chain rule for entropy and the upper and lower bounds on discrete $H(X,Y)$.
+    back: |
+      $$H(X,Y)=H(X)+H(Y\mid X)=H(Y)+H(X\mid Y)$$
+
+      $\max\{H(X),H(Y)\}\le H(X,Y)\le H(X)+H(Y)$. The upper bound is reached iff $X$ and $Y$ are independent, and $H(X,Y)=H(X)$ iff $Y$ is a function of $X$. In general, $H(X_{1:n})=\sum_iH(X_i\mid X_{<i})$.
+    source: MacKay ITILA §8.1; Murphy PML1 §6.1.3–6.1.4
+
+  - id: f5
+    front: Decompose cross-entropy $H(p,q)$, and give its value for a one-hot target.
+    back: |
+      $$H(p,q)=-\textstyle\sum p\log q=H(p)+\mathrm{KL}(p\|q)$$
+
+      So $H(p,q)\ge H(p)$, with equality iff $q=p$, and minimizing it over $q$ is the same as minimizing forward KL, i.e. MLE. With a one-hot target on class $y$: $-\log q_y$.
+    source: Murphy PML1 §6.2.2, §6.2.5
+
+  - id: f6
+    front: Define perplexity. What is it for a uniform model over $V$ tokens, and how do you convert a per-token loss to bits per character?
+    back: |
+      $\mathrm{PPL}=\exp(\text{CE in nats})=2^{\text{CE in bits}}$, the geometric mean of $1/q(x_n)$. A uniform model over $V$ tokens has $\mathrm{PPL}=V$ (loss $\ln V$).
+
+      Bits per character $=(\text{nats per token}/\ln2)\times(\text{tokens}/\text{characters})$.
+    source: Murphy PML1 §6.1.5
+
+  - id: f7
+    front: Give three equivalent expressions for $I(X;Y)$, its key properties, and its value for a bivariate Gaussian with correlation $\rho$.
+    back: |
+      $$\begin{aligned} I(X;Y) &= H(X)-H(X\mid Y) \\ &= H(X)+H(Y)-H(X,Y) \\ &= \mathrm{KL}(p(x,y)\|p(x)p(y)) \end{aligned}$$
+
+      It is symmetric, $\ge0$, and $=0$ iff $X$ and $Y$ are independent. For a bivariate Gaussian, $I=-\tfrac12\log(1-\rho^2)$.
+    source: Murphy PML1 §6.3.1–6.3.2, §6.3.5
+
+  - id: f8
+    type: open
+    front: Prove that the uniform distribution maximizes discrete entropy, and that the Gaussian maximizes differential entropy for a fixed variance.
+    back: |
+      **Tool:** Jensen for the concave log, $\mathbb{E}\log Y\le\log\mathbb{E}Y$, with equality iff $Y$ is constant.
+
+      **Uniform.** Over the support $S$:
+
+      $$\begin{aligned} H &= \mathbb{E}\log\tfrac1{p(X)} \\ &\le \log\mathbb{E}\tfrac1{p(X)} \\ &= \log|S|\le\log K \end{aligned}$$
+
+      Equality needs $1/p$ constant and $S$ to be everything, so $p$ is uniform.
+
+      **Gaussian.** Let $\varphi$ be the Gaussian with the same mean and variance as $p$. $\log\varphi$ is quadratic, so $\mathbb{E}_p[-\log\varphi]=\mathbb{E}_\varphi[-\log\varphi]=h(\varphi)$, because both depend only on the first two moments. Then
+
+      $$\begin{aligned} h(p)-h(\varphi) &= \mathbb{E}_p\log\tfrac{\varphi}{p} \\ &\le \log\textstyle\int_{p>0}\varphi\le0. \end{aligned}$$
+
+      Equality holds iff $p=\varphi$. Both proofs are $\mathrm{KL}(p\|\text{reference})\ge0$ in disguise.
+    source: MacKay ITILA §2.7; Murphy PML1 §6.2.4; Bishop PRML §1.6
+
+  - id: f9
+    type: open
+    front: Explain to an interviewer why cross-entropy is the standard classification loss, and what its minimum achievable value is.
+    back: |
+      - **It is the likelihood.** For a categorical model $q_\theta(y\mid x)$, the average negative log-likelihood of the data is $\frac1N\sum_n-\log q_\theta(y_n\mid x_n)$. That is the cross-entropy between the empirical label distribution and the model, so minimizing it is MLE.
+      - **It is forward KL.** $H(p,q)=H(p)+\mathrm{KL}(p\|q)$, and $H(p)$ is fixed by the data, so we minimize $\mathrm{KL}(p_{\text{data}}\|q)$. This penalizes heavily any true class given low probability.
+      - **It trains well.** It is a proper scoring rule, so it is minimized by the true conditional probabilities. Combined with softmax, its gradient with respect to the logits is $q-y$.
+      - **Its floor is $H(p)$, not 0.** With label noise or genuinely ambiguous inputs, the best expected loss is $\mathbb{E}_x H(p(\cdot\mid x))$. For a 10% flip rate that is 0.325 nats. A training loss below that indicates memorization.
+    source: Murphy PML1 §6.2.5; Goodfellow DL §3.13
+
+  - id: f10
+    type: open
+    front: Compare mutual information with correlation, give an example where they disagree, and say how you would estimate MI from data.
+    back: |
+      - **Correlation** measures linear association, and $\rho=0$ does not imply independence.
+      - **MI** is $\mathrm{KL}(p(x,y)\|p(x)p(y))$. It is 0 iff the variables are independent, captures any kind of dependence, is invariant to invertible transforms of each variable, and works for categorical data.
+      - **Example:** $X$ uniform on $\{-1,0,1\}$, $Y=X^2$. Then $\rho=0$ but $I=H(Y)\approx0.918$ bits.
+      - **Link:** for Gaussians, $I=-\tfrac12\log(1-\rho^2)$, so the two agree in that case.
+      - **Estimation:** the plug-in estimate on a histogram depends on how you choose the bins. $k$-NN estimators such as KSG work in low dimensions. In high dimensions, use variational lower bounds such as InfoNCE, which is capped at $\log K$ for batch size $K$ (it equals $\log K$ minus a non-negative $K$-way cross-entropy), so a large MI needs a large batch.
+    source: Murphy PML1 §6.3.5; Murphy PML2 §5.3.6.4
+
+  - id: f11
+    type: open
+    front: State and prove the data processing inequality. What does it imply for the layers of a neural network?
+    back: |
+      **Statement.** If $X\to Y\to Z$ is a Markov chain (so $I(X;Z\mid Y)=0$), then $I(X;Z)\le I(X;Y)$.
+
+      **Proof.** Expand with the chain rule for MI in two orders:
+
+      $$\begin{aligned} I(X;Y,Z) &= I(X;Z)+I(X;Y\mid Z) \\ &= I(X;Y)+I(X;Z\mid Y). \end{aligned}$$
+
+      The last term is 0 and $I(X;Y\mid Z)\ge0$.
+
+      **Implications.**
+      - With label $Y$ and layers $h_k$, $I(Y;h_k)\le I(Y;X)$. Depth can't create label information. It can only make information easier to read out, or throw it away.
+      - Invertible layers preserve MI exactly, because the chain also runs backwards.
+      - Treating $\theta$ as random (the Bayesian view), a statistic is sufficient exactly when the DPI is tight: $I(\theta;s(D))=I(\theta;D)$.
+    source: Murphy PML1 §6.3.8–6.3.9
+
+reading:
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, ch. 6 (§6.1 entropy, §6.3 mutual information)"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: The closest match to this lesson. It includes the even/prime joint-entropy example, perplexity, the Gaussian MI derivation and the DPI proof.
+  - title: "MacKay, Information Theory, Inference, and Learning Algorithms, §2.4–2.7, ch. 5 and §8.1"
+    url: https://www.inference.org.uk/itprnn/book.html
+    kind: book
+    note: The coding view of entropy, the source coding theorem for symbol codes, and clear definitions of conditional entropy and MI.
+  - title: "Bishop, Pattern Recognition and Machine Learning, §1.6"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: Derives differential entropy as the limit of binned entropy, and the Gaussian maximum-entropy result via Lagrange multipliers.
+  - title: "Goodfellow, Bengio & Courville, Deep Learning, §3.13"
+    url: https://www.deeplearningbook.org/contents/prob.html
+    kind: book
+    note: A short, ML-oriented summary of self-information, entropy, KL and cross-entropy.
+  - title: "Dive into Deep Learning, §22.11 Information Theory"
+    url: https://d2l.ai/chapter_appendix-mathematics-for-deep-learning/information-theory.html
+    kind: course
+    note: Code alongside the formulas. Its cross-entropy section ties the loss to the categorical likelihood.

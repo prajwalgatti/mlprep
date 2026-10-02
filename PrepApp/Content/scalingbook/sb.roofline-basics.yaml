@@ -1,0 +1,407 @@
+id: sb.roofline-basics
+area: scalingbook
+title: "Rooflines I: Compute, Bandwidth and Arithmetic Intensity"
+summary: Why an operation takes the time it does. Compute time, communication time, how they overlap, and arithmetic intensity as the one number that says which of them wins.
+order: 10
+level: core
+tags: [scaling-book, systems, roofline, hardware]
+prereqs: []
+
+explainer:
+  - title: The question this series answers
+    source: Scaling Book Part 0 §"Why should you care?"; Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    body: |
+      Suppose a forward pass takes 50 ms. Why 50 ms, and not 5 ms or 5 s? The Scaling Book's answer is that, to a first approximation, the time is set by three hardware limits:
+
+      - **Compute:** how many floating-point operations per second the chip can do.
+      - **Bandwidth:** how many bytes per second can be moved, either between a chip's memory and its compute units or between chips.
+      - **Memory capacity:** how many bytes fit on the chip at all.
+
+      The book counts operations as **FLOPs** (a number of floating-point adds and multiplies) and writes rates as **FLOPs/s**. We follow that convention. The default number format is **bfloat16 (bf16)**, a 16-bit float, so 2 bytes per number.
+
+      Why this matters for scaling: the goal of "model scaling" is **strong scaling**, meaning that doubling the number of chips doubles throughput. Adding chips splits the arithmetic, so each chip has less to compute. But the chips must now exchange data, and that communication does not shrink as fast. Once communication takes longer than computation, extra chips stop helping. We are then **communication-bound**.
+
+      The same tension exists inside one chip. A chip rated for hundreds of trillions of FLOPs/s can deliver a tenth of that if it spends its time waiting for data to arrive from memory. This lesson builds the tool for reasoning about both cases: the **roofline**.
+  - title: Time to compute
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"; Scaling Book ch. 2 §"TPU specs"
+    body: |
+      If an algorithm needs a known number of FLOPs and the chip can do at most $C$ FLOPs/s, the fastest it can possibly run is
+
+      $$T_\text{math} = \frac{\text{FLOPs}}{C}.$$
+
+      Some peak bf16 rates the book uses throughout:
+
+      - NVIDIA H100: $C \approx 9.89\times 10^{14}$ FLOPs/s. NVIDIA's spec sheet lists twice this, but that figure assumes 2:4 structured sparsity (two of every four weights are zero and skipped), so halve it for dense work.
+      - TPU v5e: $C = 1.97\times 10^{14}$ FLOPs/s.
+      - TPU v6e (Trillium): $C \approx 9.2\times 10^{14}$ FLOPs/s.
+
+      **Worked example.** $10^{12}$ FLOPs on an H100 takes at least $10^{12}/9.89\times10^{14} \approx 1.01$ ms. On a v6e it takes about $1.09$ ms.
+
+      Two caveats. First, peak is an upper bound: the book reports that H100s and B200s usually reach about 80–85% of their claimed peak, while TPUs get closer to 95%. Second, these chips cost different amounts, so a raw FLOPs comparison says nothing about cost.
+
+      For a matrix multiply, each multiply-add counts as 2 FLOPs. Multiplying a $[B, D]$ matrix by a $[D, F]$ matrix therefore costs about $2BDF$ FLOPs. The next lesson uses this constantly.
+  - title: Time to move bytes
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    body: |
+      Before a chip can compute on a tensor, the tensor has to reach the compute units. Two kinds of data movement matter.
+
+      **Within a chip.** Tensors live in **HBM** (high-bandwidth memory, the chip's main memory, tens of GB) and must be streamed to the compute cores. The rate is the **HBM bandwidth**: about 3.35 TB/s on an H100, $8.2\times10^{11}$ B/s on a TPU v5e and $1.6\times10^{12}$ B/s on a v6e.
+
+      **Between chips.** When a model is split across accelerators, tensors travel over links between chips. On TPUs these are ICI (chip-to-chip links), PCIe (chip to host CPU) and DCN (data-centre network between hosts). Lesson 4 gives their speeds.
+
+      Either way the time has the same form, bytes divided by bytes per second:
+
+      $$T_\text{comms} = \frac{\text{bytes moved}}{W},$$
+
+      where $W$ is the relevant bandwidth. The book uses "communication-bound", "memory-bound" and "bandwidth-bound" interchangeably.
+
+      **Worked example.** A 1-billion-parameter weight matrix in bf16 is $2\times10^9$ bytes. Just reading it once from HBM on a v5e takes $2\times10^9 / 8.2\times10^{11} \approx 2.4$ ms, whatever we then do with it.
+  - title: "Overlap: a lower and an upper bound"
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    body: |
+      Accelerators usually move data and compute at the same time: while the compute units work on one chunk, the next chunk is being loaded. This gives two bounds on the total time $T$.
+
+      - **Perfect overlap.** The two activities run fully in parallel, so the slower one sets the pace: $T_\text{lower} = \max(T_\text{math}, T_\text{comms})$.
+      - **No overlap.** One waits for the other: $T_\text{upper} = T_\text{math} + T_\text{comms}$.
+
+      The two bounds are never more than a factor of 2 apart. Write $a = \max(T_\text{math}, T_\text{comms})$ and $b = \min(T_\text{math}, T_\text{comms})$. Since $b \le a$,
+
+      $$\begin{aligned} T_\text{upper} &= a + b \\ &\le 2a = 2\,T_\text{lower}. \end{aligned}$$
+
+      So we can reason with the max, which keeps the algebra simple and which good implementations get close to. Profiling then tells us how much overlap we really achieved.
+
+      ![With 3 ms of math and 2 ms of communication, the real time lies between max = 3 ms (full overlap) and sum = 5 ms (none)](sb.roofline-basics/overlap)
+
+      Two names for the two regimes:
+
+      - **Compute-bound:** $T_\text{math} \ge T_\text{comms}$. With perfect overlap the compute units never wait, so we get the chip's full FLOPs/s.
+      - **Communication-bound:** $T_\text{comms} > T_\text{math}$. The compute units idle part of the time, and only a fraction $T_\text{math}/T_\text{comms}$ of peak is used.
+  - title: Arithmetic intensity decides the regime
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"; Scaling Book ch. 2 §"TPU specs"
+    body: |
+      Which regime are we in? Compare the two times and rearrange so that the algorithm is on one side and the hardware on the other:
+
+      $$\begin{aligned} T_\text{math} &> T_\text{comms} \\ \iff \frac{\text{FLOPs}}{C} &> \frac{\text{bytes}}{W} \\ \iff \frac{\text{FLOPs}}{\text{bytes}} &> \frac{C}{W}. \end{aligned}$$
+
+      The second step multiplies both sides by the positive number $C/\text{bytes}$.
+
+      The left side is the algorithm's **arithmetic intensity** $I$: FLOPs performed per byte moved. The right side is the hardware's **critical (peak) intensity** $C/W$: how many FLOPs the chip can do in the time it takes to move one byte. **An algorithm is compute-bound exactly when its intensity exceeds the hardware's.**
+
+      For the TPU v5e's matrix unit reading from HBM, $C/W = 1.97\times10^{14} / 8.2\times10^{11} \approx 240$ FLOPs/byte. An algorithm doing fewer than 240 FLOPs per byte it loads leaves the matrix unit waiting.
+
+      The critical intensity is a property of the chip, and it varies. From the book's spec tables (bf16 FLOPs/s over HBM bandwidth):
+
+      - TPU v5e ≈ 240, H100 ≈ 295, TPU v5p ≈ 164, TPU v6e ≈ 575.
+
+      One caveat: the 240 compares the **MXU** (the TPU's matrix unit) against **HBM**. Elementwise work runs on a slower vector unit, and data already sitting in on-chip memory arrives much faster. Each such pair has its own critical intensity, as the next cards show.
+  - title: "Worked example: the dot product"
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"; Scaling Book ch. 2 App. A §"VPU"; Scaling Book ch. 9 §"How to read an XLA op"
+    body: |
+      Take two bf16 vectors of length $N$ and compute $x \cdot y$.
+
+      - **Bytes:** read $x$ and $y$, $2N$ bytes each, and write one 2-byte result: $4N + 2$ bytes.
+      - **FLOPs:** $N$ multiplies and $N - 1$ adds: $2N - 1$.
+
+      $$I = \frac{2N - 1}{4N + 2} \;\longrightarrow\; \frac{1}{2} \quad (N \to \infty).$$
+
+      Even at $N = 1000$ the intensity is 0.4995. Every element is used exactly once, so no amount of size helps: the intensity is a constant.
+
+      Against the v5e's 240 the dot product falls short by about 480×. In fact a dot product does not run on the matrix unit at all but on the **VPU**, the TPU's vector unit, whose peak is much lower (about $7\times10^{12}$ FLOPs/s per TPU v5p core). Its critical intensity is around 3, so we are still bandwidth-bound, just less dramatically.
+
+      **The general lesson.** Elementwise operations, reductions and dot products all touch each byte a constant number of times, so their intensity is a small constant. They are bandwidth-bound on essentially every modern accelerator. The practical remedy is to avoid paying for their memory traffic separately: compilers like XLA **fuse** such ops into an adjacent matmul, so the data is read from HBM once and the cheap elementwise work rides along.
+  - title: The roofline plot
+    source: Scaling Book ch. 1 (Rooflines) §"Visualizing rooflines"
+    body: |
+      What throughput can an algorithm of intensity $I$ reach? If it is compute-bound, the answer is $C$. If it is communication-bound, the time is $T_\text{comms} = \text{bytes}/W$, so
+
+      $$\begin{aligned} \text{throughput} &= \frac{\text{FLOPs}}{\text{bytes}/W} \\ &= I \cdot W. \end{aligned}$$
+
+      Combining the two cases:
+
+      $$P(I) = \min(C,\; I \cdot W).$$
+
+      On log-log axes this is a ramp of slope 1 that hits a flat "roof" at the **ridge point** $I^* = C/W$.
+
+      ![TPU v5e MXU roofline. Below the ridge, throughput is intensity × bandwidth; above it, the roof is peak FLOPs/s. Reading from VMEM (on-chip scratchpad) moves the ridge from about 240 to about 11. The I = 0.5 marker is a dot-product-like intensity placed on the MXU roofline for illustration; real dot products run on the slower vector unit.](sb.roofline-basics/roofline)
+
+      **Worked example.** An algorithm with $I = 60$ on a v5e reaches $60 \times 8.2\times10^{11} \approx 4.9\times10^{13}$ FLOPs/s, about 25% of peak.
+
+      The plot shows the two ways to go faster:
+
+      - **Raise intensity** (move right), for example by reusing each loaded byte for more FLOPs. Larger batches do this for matmuls, as the next lesson derives.
+      - **Raise bandwidth** (lift the ramp), for example by keeping data in fast on-chip memory. The dashed line uses the TPU's VMEM, a small on-chip scratchpad memory about 22× faster than HBM (lesson 3).
+
+      It also shows what does *not* help. Below the ridge, a chip with more FLOPs/s is no faster. Above the ridge, faster memory is no faster.
+  - title: What interviewers probe
+    source: Scaling Book ch. 1 (Rooflines); Scaling Book ch. 12 §"Quiz 1 (GPU hardware)"
+    body: |
+      - *Is this op compute- or memory-bound?* Count FLOPs and bytes, form $I$, compare with $C/W$ for the unit and memory involved.
+      - *Why use max(math, comms) rather than the sum?* Hardware overlaps the two. The max is a lower bound, the sum an upper bound, and they differ by at most 2×.
+      - *Your kernel runs at 30% of peak. Why?* Likely below the ridge (bandwidth-bound). Other reasons: imperfect overlap, peak only reachable to ~80–95%, and tiny operations dominated by fixed overheads.
+      - *Would a chip with 2× the FLOPs/s speed this up?* Only if the op is above the ridge. A memory-bound op needs more bandwidth or higher intensity.
+      - *Intensity of an fp32 elementwise add?* $N$ FLOPs over $12N$ bytes (read 8, write 4 per element) $= 1/12$. Hopeless for any accelerator.
+      - *Does the ridge depend on the algorithm?* No. It is $C/W$, a hardware property. The algorithm only decides where on the x-axis it sits.
+      - *What does "communication-bound" cost you?* With perfect overlap you get the fraction $T_\text{math}/T_\text{comms}$ of peak FLOPs/s.
+  - title: Key results
+    source: Scaling Book ch. 1 (Rooflines)
+    body: |
+      $$T_\text{math} = \frac{\text{FLOPs}}{C}, \qquad T_\text{comms} = \frac{\text{bytes}}{W}$$
+
+      $$\max(T_\text{math}, T_\text{comms}) \le T \le T_\text{math} + T_\text{comms}$$
+
+      The sum is at most twice the max.
+
+      $$\text{compute-bound} \iff \frac{\text{FLOPs}}{\text{bytes}} > \frac{C}{W}$$
+
+      $$P(I) = \min(C,\; I\cdot W)$$
+
+      - Critical intensity (bf16, HBM): TPU v5e ≈ 240, H100 ≈ 295, v5p ≈ 164, v6e ≈ 575 FLOPs/byte.
+      - Dot product (bf16): $I \to 1/2$. fp32 elementwise add: $1/12$. Both are always bandwidth-bound.
+      - Peak FLOPs/s: H100 9.89e14 (dense bf16), v5e 1.97e14. HBM: H100 3.35 TB/s, v5e 8.2e11 B/s.
+      - Strong scaling fails when per-chip communication outgrows per-chip compute.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    prompt: |
+      A computation needs $2\times10^{12}$ FLOPs and runs on one TPU v5e (peak $1.97\times10^{14}$ bf16 FLOPs/s, HBM bandwidth $8.2\times10^{11}$ B/s). What is the best possible compute time $T_\text{math}$?
+    correct: About 10 ms
+    wrong:
+      - About 1 ms
+      - About 2.4 s
+      - About 0.1 ms
+    explanation: |
+      $T_\text{math} = 2\times10^{12} / 1.97\times10^{14} \approx 1.0\times10^{-2}$ s, about 10 ms. The 2.4 s answer divides FLOPs by the HBM bandwidth, which is in bytes per second and belongs in $T_\text{comms}$, not $T_\text{math}$.
+  - id: q2
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    prompt: |
+      An operation has $T_\text{math} = 3$ ms and $T_\text{comms} = 2$ ms on hardware that can overlap the two. What are the natural lower and upper bounds on its runtime?
+    correct: 3 ms and 5 ms
+    wrong:
+      - 2 ms and 3 ms
+      - 3 ms and 6 ms
+      - 5 ms and 6 ms
+    explanation: |
+      With perfect overlap the slower activity sets the time, $\max(3, 2) = 3$ ms. With no overlap they add, $3 + 2 = 5$ ms. The 6 ms option doubles the max: $2\max$ is a valid but looser upper bound, since the sum never exceeds it.
+  - id: q3
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    prompt: |
+      Which statement about the max/sum runtime model is **false**?
+    correct: The max-based estimate can underestimate the serial (no-overlap) time by an arbitrarily large factor
+    wrong:
+      - When $T_\text{math} \gg T_\text{comms}$, the max and the sum nearly coincide
+      - With perfect overlap, a comms-bound op uses a fraction $T_\text{math}/T_\text{comms}$ of peak FLOPs/s
+      - The hardware's critical intensity is its peak FLOPs/s divided by its bandwidth
+    explanation: |
+      If $a$ is the larger time and $b \le a$ the smaller, then $a + b \le 2a$, so the sum is at most twice the max and the max-based estimate is off by at most 2×. The other statements are true. When one term dominates, adding the small one changes little; a comms-bound op computes for $T_\text{math}$ out of every $T_\text{comms}$ seconds.
+  - id: q4
+    source: Scaling Book ch. 1 (Rooflines), Question 5
+    prompt: |
+      NVIDIA's H100 SXM spec sheet lists $1.979\times10^{15}$ bf16 FLOPs/s "with sparsity" and 3.35 TB/s of HBM bandwidth. What is the critical arithmetic intensity for dense bf16 matmuls?
+    correct: About 295 FLOPs/byte
+    wrong:
+      - About 590 FLOPs/byte
+      - About 240 FLOPs/byte
+      - About 0.0034 FLOPs/byte
+    explanation: |
+      The sparsity figure assumes 2:4 structured sparsity and is twice the dense rate, so dense peak is $9.89\times10^{14}$. Then $9.89\times10^{14} / 3.35\times10^{12} \approx 295$. Forgetting to halve gives 590. 240 is the TPU v5e's value, and 0.0034 is the ratio inverted.
+  - id: q5
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    prompt: |
+      Repeat the book's dot-product calculation, but with **fp32** vectors (4 bytes per element) and a 4-byte result. What does the arithmetic intensity approach as $N \to \infty$?
+    correct: 1/4 FLOP per byte
+    wrong:
+      - 1/2 FLOP per byte
+      - 1 FLOP per byte
+      - 2 FLOPs per byte
+    explanation: |
+      FLOPs are still $2N - 1$, but the bytes double to $8N + 4$. So $I = (2N-1)/(8N+4) \to 1/4$. The 1/2 answer is the bf16 result; it forgets that each element now costs 4 bytes to load.
+  - id: q6
+    source: Scaling Book ch. 12 §"Quiz 1 (GPU hardware)" (Question 7)
+    prompt: |
+      What is the arithmetic intensity of an elementwise add $z = x + y$ of two fp32 vectors of length $N$, counting the write of $z$?
+    correct: 1/12 FLOP per byte
+    wrong:
+      - 1/8 FLOP per byte
+      - 1/4 FLOP per byte
+      - 1/3 FLOP per byte
+    explanation: |
+      There are $N$ FLOPs (one add per element). Bytes: read $4N + 4N$ and write $4N$, so $12N$. Intensity $N/12N = 1/12$. The 1/8 answer forgets the write-back of $z$.
+  - id: q7
+    source: Scaling Book ch. 1 (Rooflines) §"Visualizing rooflines"
+    prompt: |
+      An algorithm with arithmetic intensity 60 FLOPs/byte runs on a TPU v5e from HBM (peak $1.97\times10^{14}$ FLOPs/s, $8.2\times10^{11}$ B/s). What throughput can it reach at best?
+    correct: About 25% of peak (≈ 49 TFLOP/s)
+    wrong:
+      - Full peak (≈ 197 TFLOP/s)
+      - About 60% of peak (≈ 118 TFLOP/s)
+      - About 4% of peak (≈ 8 TFLOP/s)
+    explanation: |
+      Below the ridge, throughput is $I \cdot W = 60 \times 8.2\times10^{11} \approx 4.9\times10^{13}$ FLOPs/s, which is $60/240 \approx 25\%$ of peak. Full peak would need $I \ge 240$.
+  - id: q8
+    source: Scaling Book ch. 1 (Rooflines) §"Visualizing rooflines"
+    prompt: |
+      On a TPU v5e, algorithm A has intensity 60 and algorithm B has intensity 1000 (both reading from HBM). A new chip doubles HBM bandwidth but keeps the same peak FLOPs/s. What happens?
+    correct: A gets about 2× faster; B is unchanged
+    wrong:
+      - Both get about 2× faster
+      - Neither changes, since peak FLOPs/s is the same
+      - B gets about 2× faster; A is unchanged
+    explanation: |
+      A is below the ridge (240), so its throughput is $I\cdot W$ and doubles with $W$. The new ridge is 120, still below B's 1000. B was already on the flat roof, so faster memory does nothing for it.
+  - id: q9
+    source: Scaling Book ch. 2 §"TPU specs"; Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    prompt: |
+      Using bf16 peak FLOPs/s and HBM bandwidth, which chip needs the **highest** arithmetic intensity to be compute-bound? v5e: 1.97e14 and 8.2e11. v5p: 4.59e14 and 2.8e12. v6e: 9.2e14 and 1.6e12. H100: 9.89e14 and 3.35e12.
+    correct: TPU v6e
+    wrong:
+      - TPU v5e
+      - TPU v5p
+      - NVIDIA H100
+    explanation: |
+      The ridges are $C/W$: v5e ≈ 240, v5p ≈ 164, v6e ≈ 575, H100 ≈ 295. The v6e's FLOPs grew much faster than its HBM bandwidth, so it needs the largest batch to keep its matrix unit busy. The familiar "240" is specific to the v5e.
+  - id: q11
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    prompt: |
+      Your roofline estimates for an op are $T_\text{math} = 4$ ms and $T_\text{comms} = 9$ ms. The profiler measures 10 ms. What is the best reading?
+    correct: Comms-bound; the math mostly hides under comms
+    wrong:
+      - Compute-bound, with comms poorly overlapped
+      - Comms-bound, with no overlap whatsoever
+      - Compute-bound and running near peak FLOPs/s
+    explanation: |
+      Since $T_\text{comms} > T_\text{math}$, the op is comms-bound. Perfect overlap would give 9 ms and no overlap 13 ms. At 10 ms, nearly all of the math hides under the communication; only about 1 ms is exposed. The fix is to cut bytes or raise bandwidth, not to add FLOPs/s.
+  - id: q12
+    source: Scaling Book Part 0 §"Why should you care?"
+    prompt: |
+      In strong scaling (a fixed problem spread over more and more chips), why does adding chips eventually stop speeding things up?
+    correct: Per-chip compute shrinks faster than per-chip communication
+    wrong:
+      - Each chip's peak FLOPs/s drops as the cluster grows
+      - HBM capacity per chip shrinks as chips are added
+      - The hardware's critical intensity rises with the chip count
+    explanation: |
+      Splitting the work divides $T_\text{math}$ per chip, but the data that must be exchanged often stays the same size or shrinks more slowly. Once $T_\text{comms} > T_\text{math}$ we are communication-bound and more chips give little benefit. Chip specs do not change with cluster size.
+  - id: q14
+    source: Scaling Book ch. 1 (Rooflines) §"Visualizing rooflines"; Scaling Book ch. 2 §"What Is a TPU?"
+    prompt: |
+      ![TPU v5e roofline with HBM and VMEM ramps](sb.roofline-basics/roofline)
+
+      A matmul-like kernel on the v5e's MXU has intensity 5 FLOPs/byte. Its operands are moved from HBM into VMEM (about 22× the HBM bandwidth) before it runs. What throughput can it now reach?
+    correct: ≈ 90 TFLOP/s, still bandwidth-bound
+    wrong:
+      - ≈ 197 TFLOP/s, the full compute roof
+      - ≈ 4 TFLOP/s, unchanged from HBM
+      - ≈ 9 TFLOP/s, about 2× the HBM value
+    explanation: |
+      Below the ridge, throughput is $I\cdot W$. From HBM: $5 \times 8.2\times10^{11} \approx 4.1\times10^{12}$. From VMEM: $5 \times 1.8\times10^{13} \approx 9.0\times10^{13}$, about 46% of peak. Intensity 5 is still left of the VMEM ridge (≈ 11), so the roof is not reached. Faster memory lifts the ramp even when intensity is fixed, which is why "unchanged" is wrong.
+  - id: q13
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    prompt: |
+      Which of these operations, run on a TPU v5e from HBM in bf16, is most likely to be **compute-bound**?
+    correct: A $[512, 8192] \times [8192, 8192]$ matrix multiply
+    wrong:
+      - A row-wise softmax over a $[512, 8192]$ array
+      - A GELU applied elementwise to a $[512, 8192]$ array
+      - Adding a bias vector to a $[512, 8192]$ array
+    explanation: |
+      The matmul does $2BDF$ FLOPs over $2(BD + DF + BF)$ bytes, an intensity of $512\cdot8192/(512+8192+512) \approx 455$, above the ridge of 240. Softmax, GELU and bias-add do a handful of FLOPs per element loaded, so their intensity is a small constant and they are bandwidth-bound.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    front: Write the roofline estimates for compute time and communication time.
+    back: |
+      $$T_\text{math} = \frac{\text{FLOPs}}{C}, \qquad T_\text{comms} = \frac{\text{bytes}}{W}$$
+
+      $C$ is peak FLOPs/s, $W$ is the bandwidth (bytes/s) of the link or memory involved.
+  - id: f2
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    front: What are the lower and upper bounds on runtime from $T_\text{math}$ and $T_\text{comms}$, and how far apart can they be?
+    back: |
+      Lower: $\max(T_\text{math}, T_\text{comms})$ (perfect overlap). Upper: $T_\text{math} + T_\text{comms}$ (no overlap). The sum is at most $2\times$ the max.
+  - id: f3
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    front: Define arithmetic intensity and state the compute-bound condition.
+    back: |
+      $I = \text{FLOPs}/\text{bytes moved}$. Compute-bound iff $I > C/W$, the hardware's critical intensity.
+  - id: f4
+    source: Scaling Book ch. 1 (Rooflines); Scaling Book ch. 2 §"TPU specs"
+    front: Critical (bf16, HBM) intensity of a TPU v5e and an H100?
+    back: |
+      v5e: $1.97\times10^{14}/8.2\times10^{11} \approx 240$ FLOPs/byte. H100: $9.89\times10^{14}/3.35\times10^{12} \approx 295$. (v5p ≈ 164, v6e ≈ 575.)
+  - id: f5
+    source: Scaling Book ch. 1 (Rooflines) §"Visualizing rooflines"
+    front: Write the roofline formula for attainable throughput at intensity $I$.
+    back: |
+      $$P(I) = \min(C,\; I\cdot W)$$
+
+      A slope-1 ramp on log-log axes, flattening at the ridge $I^* = C/W$.
+  - id: f6
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    front: Intensity of a bf16 dot product of length $N$, and its limit?
+    back: |
+      $(2N-1)/(4N+2) \to 1/2$. Constant in $N$, so always bandwidth-bound.
+  - id: f7
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    front: Peak bf16 FLOPs/s and HBM bandwidth of a TPU v5e and an H100?
+    back: |
+      v5e: $1.97\times10^{14}$ FLOPs/s, $8.2\times10^{11}$ B/s. H100: $9.89\times10^{14}$ FLOPs/s (dense; spec sheet doubles it for sparsity), $3.35\times10^{12}$ B/s.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    front: Derive, from $T_\text{math}$ and $T_\text{comms}$, the condition under which an algorithm is compute-bound, and interpret both sides.
+    back: |
+      - $T_\text{math} > T_\text{comms} \iff \text{FLOPs}/C > \text{bytes}/W$.
+      - Multiply by $C/\text{bytes} > 0$: $\text{FLOPs}/\text{bytes} > C/W$.
+      - Left: the algorithm's arithmetic intensity, FLOPs done per byte moved.
+      - Right: the chip's critical intensity, FLOPs it can do in the time one byte arrives (≈ 240 on v5e).
+      - So the algorithm must reuse each byte for at least $C/W$ FLOPs, or the compute units wait on memory.
+      - Under perfect overlap, a comms-bound op reaches $T_\text{math}/T_\text{comms} = I/(C/W)$ of peak.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"; Scaling Book ch. 9 §"How to read an XLA op"
+    front: Explain to an interviewer why elementwise ops and reductions are memory-bound on accelerators, and what you do about it.
+    back: |
+      - Each element is loaded once and used for a constant number of FLOPs, so intensity is a small constant (bf16 dot product ½; fp32 add 1/12), independent of size.
+      - Ridges are hundreds of FLOPs/byte for matrix units and a few for vector units, so these ops always wait on memory.
+      - Remedies: fuse them into neighbouring matmuls so data is read from HBM once (XLA fusions combine one matmul with pointwise ops); keep data in on-chip memory; use lower precision to cut bytes.
+      - In a transformer this is why norms, activations and softmax cost little FLOPs but can cost real time if left unfused.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 1 (Rooflines) §"Where Does the Time Go?"
+    front: Your matmul kernel runs at 40% of the chip's peak FLOPs/s. List the possible causes, from roofline reasoning.
+    back: |
+      - **Below the ridge:** intensity under $C/W$ (e.g. small batch), so it is bandwidth-bound at $I/(C/W)$ of peak.
+      - **Imperfect overlap:** loads and compute serialize, pushing time toward the sum instead of the max.
+      - **Peak isn't fully reachable:** GPUs typically reach 80–85% and TPUs ~95% even when compute-bound.
+      - **Fixed overheads:** small ops are dominated by launch or latency costs rather than bandwidth or FLOPs.
+      - **Hidden communication:** inter-chip collectives on the critical path if the op is sharded.
+      - Diagnose by computing $T_\text{math}$, $T_\text{comms}$ and comparing with the profile.
+  - id: f11
+    type: open
+    source: Scaling Book ch. 1 (Rooflines) §"Visualizing rooflines"
+    front: Sketch a roofline plot and explain the two ways it says an algorithm can get faster, and what does not help.
+    back: |
+      - Log-log axes: intensity (FLOPs/byte) on x, attainable FLOPs/s on y. Ramp $I\cdot W$ of slope 1, then flat roof $C$, meeting at the ridge $C/W$.
+      - **Raise intensity:** move right, e.g. reuse each loaded weight across more tokens.
+      - **Raise bandwidth:** lift the ramp, e.g. keep data in VMEM (≈ 22× HBM on TPU), which moves the ridge left (240 → ≈ 11 on v5e).
+      - Below the ridge, more FLOPs/s does nothing. Above it, more bandwidth does nothing.
+
+reading:
+  - title: "Scaling Book ch. 1: All About Rooflines"
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    kind: book
+    note: The source chapter; read "Where Does the Time Go?" and "Visualizing rooflines".
+  - title: "Scaling Book, Part 0: Introduction"
+    url: https://jax-ml.github.io/scaling-book/
+    kind: book
+    note: Why strong scaling and hardware efficiency matter for research, and the map of the whole book.
+  - title: "Williams, Waterman & Patterson (2009), Roofline: An Insightful Visual Performance Model"
+    url: https://people.eecs.berkeley.edu/~kubitron/cs252/handouts/papers/RooflineVyNoYellow.pdf
+    kind: paper
+    note: The original roofline paper, with examples of ceilings beyond peak FLOPs and bandwidth.
+  - title: "Horace He, Making Deep Learning Go Brrrr From First Principles"
+    url: https://horace.io/brrr_intro.html
+    kind: blog
+    note: The same compute vs memory vs overhead split, from the GPU and PyTorch side, with operator fusion explained.

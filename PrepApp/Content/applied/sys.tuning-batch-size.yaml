@@ -1,0 +1,489 @@
+id: sys.tuning-batch-size
+area: applied
+title: "Tuning Playbook: Choosing the Batch Size"
+summary: Batch size as a speed knob. Perfect scaling up to a critical batch size, the gradient-noise-scale derivation behind it, and how the best learning rate moves with batch size.
+order: 330
+level: intermediate
+tags: [tuning, batch-size, data-parallelism, learning-rate, tuning-playbook]
+prereqs: [sys.tuning-process, fund.sgd-momentum]
+
+explainer:
+  - title: "The problem: batch size is a speed knob"
+    body: |
+      The playbook's headline: **the batch size controls training speed and should not be tuned for validation performance.** Often the best choice is the largest batch the hardware supports.
+
+      **Decomposing the cost.**
+
+      $$\text{training time} = \text{time per step}\times\text{steps}$$
+
+      Throughput is examples per second, so time per step $= B/\text{throughput}$ for batch size $B$.
+
+      **Finding feasible batch sizes.** The limit is usually accelerator memory, and it is hard to predict without at least compiling the program. The easy route is to run a few steps at increasing powers of 2 until one runs out of memory, measuring throughput at each size.
+
+      **What a healthy sweep looks like.** While the accelerators are not saturated, doubling $B$ should roughly double throughput, so time per step stays nearly constant: the extra examples ride on otherwise idle parallel hardware. If throughput stops growing:
+      - before hardware limits are reached, there is a **bottleneck** (input pipeline I/O, synchronisation between devices). Fix it first.
+      - otherwise, only consider batch sizes up to the point where throughput stops increasing. Every benefit of a bigger batch below assumes a higher throughput.
+
+      **Gradient accumulation** sums gradients over $k$ micro-batches before each update. It simulates a batch $k$ times larger than memory allows, but the micro-batches run *sequentially*, so time per step grows $k$-fold. It gives no throughput benefit, and the playbook advises avoiding it in applied work.
+
+      Changing the model or optimizer can change what fits, so redo the sweep when they change.
+    source: Tuning Playbook §"Choosing the batch size", §"Determining the feasible batch sizes and estimating training throughput"
+
+  - title: "Steps to a target vs batch size: three regimes"
+    body: |
+      ![Model curves from McCandlish et al.'s formulas, not measurements; regime boundaries are illustrative. Steps and examples needed to reach a fixed loss cross at McCandlish's $B_{\rm crit}$.](sys.tuning-batch-size/steps-vs-batch)
+
+      With time per step roughly constant, minimising training time means minimising the **steps** to reach a target. Shallue et al. (2019) measured steps-to-target against batch size for 6 model families, 3 optimizers and 7 datasets, re-tuning LR, momentum and schedule at *every* batch size. Every workload showed the same shape:
+      1. **Perfect scaling.** Doubling $B$ halves the steps.
+      2. **Diminishing returns.** Doubling $B$ saves less than half the steps.
+      3. **Maximal data parallelism.** Larger batches no longer reduce the steps, though they never *increase* them.
+
+      **Two meanings of "critical batch size".** The playbook, Shallue et al. and Zhang et al. use it for **the end of perfect scaling**. McCandlish et al. define $B_{crit}$ as the balance point where steps *and* examples are both twice their minima (derived below). In this lesson, "critical batch size" or $B_{crit}$ always means McCandlish's quantity, and the playbook's notion is called "the end of perfect scaling". In McCandlish's model the two differ by an order of magnitude: steps exceed the perfect-scaling extrapolation by a factor $1+B/B_{crit}$, i.e. by 10% at $B=0.1B_{crit}$ and 20% at $0.2B_{crit}$.
+
+      **Implication.** The time-minimising batch is the largest one that still meaningfully cuts the step count. Where that lies depends on the model, optimizer and dataset; the playbook calls predicting it an open problem. In practice, the largest batch the hardware supports is often still in or near perfect scaling, so "use the largest batch that fits" is a good default.
+
+      **How much this varies.** The maximum useful batch differs greatly between workloads, with the model and optimizer mattering more than the dataset (Shallue et al.). Why a knee exists at all is derived on the next two cards.
+    source: Tuning Playbook §"Choosing the batch size to minimize training time"; Shallue et al. 2019 §4.1, §4.4, §5
+
+  - title: "Deriving the knee: the gradient noise scale"
+    body: |
+      **Setup** (McCandlish et al. 2018). Let $L(\theta)$ be the loss, $G=\nabla L$ the true gradient, $H$ the Hessian, and $\Sigma$ the covariance of *per-example* gradients. A minibatch of $B$ i.i.d. examples gives $G_{est}$ with mean $G$ and covariance $\Sigma/B$. We step $\theta\to\theta-\epsilon G_{est}$.
+
+      **Expected loss after one step.** Expand to second order:
+
+      $$L(\theta-\epsilon V)\approx L-\epsilon G^\top V+\tfrac12\epsilon^2 V^\top HV.$$
+
+      Set $V=G_{est}$ and take expectations. For any random vector, $\mathbb{E}[v^\top Hv]=\mu^\top H\mu+\mathrm{tr}(H\,\mathrm{Cov}\,v)$. So:
+
+      $$\begin{aligned}\mathbb{E}[L]\approx L&-\epsilon|G|^2\\&+\tfrac12\epsilon^2\Big(G^\top HG+\tfrac{\mathrm{tr}(H\Sigma)}{B}\Big)\end{aligned}$$
+
+      **Best step size.** Setting the derivative in $\epsilon$ to zero gives
+
+      $$\epsilon_{opt}(B)=\frac{|G|^2}{G^\top HG+\mathrm{tr}(H\Sigma)/B}.$$
+
+      Dividing top and bottom by $G^\top HG$:
+
+      $$\epsilon_{opt}(B)=\frac{\epsilon_{max}}{1+B_{noise}/B},$$
+
+      with $\epsilon_{max}=|G|^2/G^\top HG$ (the best step with the exact gradient) and the **noise scale**
+
+      $$B_{noise}=\frac{\mathrm{tr}(H\Sigma)}{G^\top HG}.$$
+
+      **Best progress per step.** Substituting $\epsilon_{opt}$ back gives a decrease of $\Delta L_{opt}=\tfrac12\epsilon_{opt}|G|^2$, i.e.
+
+      $$\begin{aligned}\Delta L_{opt}(B)&=\frac{\Delta L_{max}}{1+B_{noise}/B},\\ \Delta L_{max}&=\frac{|G|^4}{2\,G^\top HG}.\end{aligned}$$
+
+      **Reading it.** If $B\ll B_{noise}$, the denominator is about $B_{noise}/B$, so progress per step is *proportional to* $B$. That is perfect scaling: the gradient is mostly noise, and a bigger batch averages more of it away. If $B\gg B_{noise}$, progress approaches $\Delta L_{max}$ and extra examples are wasted.
+
+      If $H$ is a multiple of $I$, this reduces to $B_{simple}=\mathrm{tr}(\Sigma)/|G|^2$: total per-example gradient variance over squared gradient norm. Indeed $\mathbb{E}|G_{est}-G|^2/|G|^2=B_{simple}/B$, so $B_{simple}$ is the batch at which the noise in the estimate is about as large as the signal. It is cheap to measure: $\mathbb{E}|G_B|^2=|G|^2+\mathrm{tr}\Sigma/B$, so gradient norms at two batch sizes give both terms (McCandlish App. A.1).
+    source: McCandlish et al. 2018 §2.2 (eqs. 2.4–2.10)
+
+  - title: "The steps–examples tradeoff and the critical batch"
+    body: |
+      ![Model curve, not measurements: each batch size is one point on the time-vs-compute hyperbola. $B_{\rm noise}$ sits at the bend.](sys.tuning-batch-size/time-compute-tradeoff)
+
+      **From one step to a whole run.** Treat $B_{noise}$ as constant along the trajectory (McCandlish App. D does the proper weighted average). Then every step makes a fraction $1/(1+B_{noise}/B)$ of the progress an exact-gradient step would, and reaching a fixed loss takes
+
+      $$S=S_{min}\Big(1+\frac{B_{noise}}{B}\Big)$$
+
+      steps, where $S_{min}$ is the step count at infinite batch. The number of examples processed is $E=BS$:
+
+      $$\begin{aligned}E&=S_{min}(B+B_{noise})\\&=E_{min}\Big(1+\frac{B}{B_{noise}}\Big),\end{aligned}$$
+
+      with $E_{min}=S_{min}B_{noise}$ (the $B\to0$ limit). Multiplying the two excess terms eliminates $B$:
+
+      $$\Big(\frac{S}{S_{min}}-1\Big)\Big(\frac{E}{E_{min}}-1\Big)=1.$$
+
+      **McCandlish's critical batch size** is $B_{crit}=E_{min}/S_{min}$, and the model predicts $B_{crit}\approx B_{noise}$. At $B=B_{crit}$ both factors equal 1, so training takes **twice the minimum steps and twice the minimum examples**: the balanced point on the hyperbola.
+
+      **Worked numbers** with $B_{noise}=1000$:
+      - $B=250$: $S=5S_{min}$, $E=1.25E_{min}$ (frugal but slow).
+      - $B=1000$: $S=2S_{min}$, $E=2E_{min}$.
+      - $B=4000$: $S=1.25S_{min}$, $E=5E_{min}$ (fast but wasteful).
+
+      **Caveats** (McCandlish §2.4): the analysis is local and greedy, assumes a tuned LR and a quadratic loss, and says nothing about generalisation. Gradients shrink as the model improves while the noise stays, so $B_{noise}$ *grows during training*: the critical batch depends on how far you train. Kaplan et al. (2020) fit $B_{crit}$ as a power of the loss. This is why LLM recipes often ramp the batch size up.
+    source: McCandlish et al. 2018 §2.3–2.4 (eqs. 2.11–2.12); Kaplan et al. 2020 §5.1
+
+  - title: "Why the best learning rate grows with batch size"
+    body: |
+      ![The optimal step grows linearly while $B\ll B_{\rm noise}$, then saturates. A linear rule anchored at small $B$ eventually overshoots into the region where the loss rises.](sys.tuning-batch-size/lr-vs-batch)
+
+      **From the noise-scale model.** For $B\ll B_{noise}$,
+
+      $$\epsilon_{opt}(B)\approx\epsilon_{max}\frac{B}{B_{noise}},$$
+
+      so the best step size is *linear* in $B$: halving the noise lets you trust the gradient twice as far. Beyond $B_{noise}$ it saturates at $\epsilon_{max}=|G|^2/G^\top HG$, the step an exact-gradient line search would take, which is limited by curvature.
+
+      **Where a linear rule breaks.** The expected loss is quadratic in $\epsilon$, so a step larger than $2\epsilon_{opt}$ makes the loss *worse* than not moving. In practice you tune at some batch $B_0$ and scale from there:
+
+      $$\eta(B)=\epsilon_{opt}(B_0)\frac{B}{B_0}=\frac{\epsilon_{max}B}{B_0+B_{noise}}.$$
+
+      Setting this equal to $2\epsilon_{opt}(B)=2\epsilon_{max}B/(B+B_{noise})$ gives
+
+      $$B=2B_0+B_{noise}.$$
+
+      So a rule anchored at a small $B_0$ fails near $B_{noise}$; anchored at $B_0=B_{noise}$, it fails at $3B_{noise}$. The figure shows the small-$B_0$ case.
+
+      **What the measurements say.** Shallue et al. tracked the *effective* LR of momentum SGD, $\eta/(1-\gamma)$. (With constant gradient $g$, the velocity $v=\gamma v+g$ settles at $g/(1-\gamma)$, so each step moves $\eta g/(1-\gamma)$.) It generally rose with $B$ but followed neither the linear nor the square-root rule consistently, and sometimes fell. Tuning momentum jointly mattered: for the Transformer, the best move was to *raise* momentum. Hence the playbook: re-tune per batch size rather than trust a rule.
+    source: McCandlish et al. 2018 §2.2; Shallue et al. 2019 §2.2, §4.7
+
+  - title: "Linear vs square-root scaling: matching drift and noise"
+    body: |
+      **Goyal et al.'s argument, part 1: the drift.** Compare $k$ SGD steps on batches of size $n$ at LR $\eta$:
+
+      $$w_{t+k}=w_t-\frac{\eta}{n}\sum_{j<k}\sum_{x\in\mathcal{B}_j}\nabla\ell(x,w_{t+j})$$
+
+      with one step on their union (size $kn$) at LR $\hat\eta$:
+
+      $$\hat w_{t+1}=w_t-\frac{\hat\eta}{kn}\sum_{j<k}\sum_{x\in\mathcal{B}_j}\nabla\ell(x,w_t).$$
+
+      If $\nabla\ell(x,w_{t+j})\approx\nabla\ell(x,w_t)$, the two match when $\hat\eta=k\eta$.
+
+      **Part 2: the noise.** Each small step adds gradient noise with covariance $\eta^2\Sigma/n$. Over $k$ steps these add to $k\eta^2\Sigma/n$. One big step at $k\eta$ on $kn$ examples adds $(k\eta)^2\Sigma/(kn)=k\eta^2\Sigma/n$, the same. So the linear rule preserves both the drift and the diffusion *per example seen*. This is Smith et al.'s statement that the SGD noise scale $\eta N/B$ ($N$ = dataset size) is what matters.
+
+      **The square-root rule** $\hat\eta=\sqrt k\,\eta$ keeps the noise of *one* step fixed ($k\eta^2\Sigma/(kn)=\eta^2\Sigma/n$), but then $k$ small steps' worth of data moves the weights only $\sqrt k\,\eta$ times the gradient instead of $k\eta$: the drift per example falls by $\sqrt k$.
+
+      **Why linear scaling breaks.**
+      - *Early in training* the weights change fast, so gradients at $w_{t+j}$ differ from those at $w_t$. Goyal et al. add gradual warmup over 5 epochs.
+      - *At large $k$*, the approximation needs the $k$ small steps to stay small relative to curvature. Once $k\eta$ approaches the curvature-limited step (divergence sets in near $2/\lambda_{max}$, with $\lambda_{max}$ the largest Hessian eigenvalue), the big step overshoots, while the $k$ sequential small steps would have "seen" the curvature and bent with it. This is the same saturation as $\epsilon_{opt}\to\epsilon_{max}$ on the previous card. On ImageNet, Goyal et al. found accuracy held up to batch ~8k.
+    source: Goyal et al. 2017 §2.1–2.2; Smith et al. 2018 §2; McCandlish et al. 2018 §2.2
+
+  - title: "Batch size is not a validation hyperparameter"
+    body: |
+      **The claim.** If the learning rate, regularization and step count are re-tuned for each batch size, the same final performance is reachable at any batch size. Shallue et al. found **no evidence that larger batches degrade the best achievable validation error.**
+
+      **Why it can look otherwise.** Change $B$ *with nothing else changed* and validation performance often moves. Published disagreements trace back to protocol:
+      - **Heuristic LR scaling.** Tuning at one batch size and extrapolating the LR by a rule systematically favours the batch size where tuning happened.
+      - **Epoch budgets** (fixed examples) only probe the perfect-scaling regime and favour *small* batches, which get more updates for the same data.
+      - **Step budgets** favour *large* batches, which see more data in the same number of updates.
+
+      Hoffer et al. (2017) made the related point that the "generalisation gap" of large batches largely reflects too few updates. Training longer closes it.
+
+      **The genuine interaction: noise as a regularizer.** Small batches inject sampling noise, which can regularize. Larger batches can therefore overfit more and need stronger or additional regularization. Shallue et al. saw exactly this with label smoothing on ResNet-50/ImageNet. It improved error by up to about 1 point at large batch sizes and had no visible effect at small ones. (On MNIST and Fashion-MNIST, which overfit at any batch size, it helped at all batch sizes.)
+
+      **So:** pick $B$ for speed and cost. Then re-tune the hyperparameters that interact most with it, namely the **optimizer hyperparameters** (LR, momentum) and the **regularization hyperparameters**, and adjust the step budget. Changing $B$ late in a project effectively restarts tuning, so choose it early and carefully.
+    source: Tuning Playbook FAQ "Why shouldn't the batch size be tuned to directly improve validation set performance?", §"Changing the batch size requires re-tuning most hyperparameters"; Shallue et al. 2019 §4.6, §4.8, §5; Hoffer et al. 2017 §1
+
+  - title: "Resource consumption and the practical choice"
+    body: |
+      **Two kinds of cost.**
+      - *Upfront*: buying hardware, or rewriting the pipeline for multi-device training. The playbook notes multi-host pipelines invite bugs (e.g. batch-norm statistics), so it may pay to defer them until the project matures, unless faster iteration is worth a lot during heavy early tuning.
+      - *Usage*: billing, electricity, team quota. With
+
+      $$\text{resource}=\text{resource per step}\times\text{steps},$$
+
+      a bigger batch cuts steps, so what happens depends on the per-step cost:
+      - **Decreases** if the bigger batch runs on the same hardware with little extra time per step.
+      - **Unchanged** if doubling $B$ halves the steps but doubles the GPUs: GPU-hours are the same, and wall-clock time halves.
+      - **Increases** if it needs upgraded hardware whose per-step cost outweighs the saved steps. Even on ideal hardware, examples per target grow with $B$ ($E/E_{min}=1+B/B_{noise}$): slowly below $B_{noise}$ (at most 2×), then linearly.
+
+      **The playbook's recipe.**
+      1. Sweep powers of 2 to find what fits, and keep only batch sizes that still raise throughput.
+      2. Default to the largest such batch. It is usually in or near the perfect-scaling regime, so it cuts training time at little extra compute.
+      3. Never use a bigger batch that increases total training time.
+      4. Re-tune the optimizer and regularization hyperparameters at the chosen size.
+
+      **Things that move the knee.** Momentum and preconditioned optimizers (Adam, K-FAC) keep perfect scaling to larger batches than plain SGD (Shallue et al.; Zhang et al. 2019). $B_{crit}$ grows as the loss falls. Batch norm computes statistics on its own batch, which should be decoupled from the gradient batch (covered in the pipeline lesson).
+    source: Tuning Playbook §"Choosing the batch size to minimize resource consumption", §"How batch norm interacts with the batch size"; Shallue et al. 2019 §4.4; Zhang et al. 2019 §1
+
+  - title: "What interviewers probe"
+    body: |
+      - *"How do you choose the batch size?"* For throughput. Use the largest size that fits and still increases examples/s, re-tune LR and regularization, and don't use it to tune validation error.
+      - *"Why do returns diminish?"* Progress per step is $\Delta L_{max}/(1+B_{noise}/B)$. Below $B_{noise}$ the gradient is noise-dominated and a bigger batch helps linearly; above it, the estimate is already accurate.
+      - *"Define the critical batch size."* Say which definition. McCandlish: $B_{crit}=E_{min}/S_{min}\approx B_{noise}$, where $S=2S_{min}$ and $E=2E_{min}$. The playbook and Shallue: where perfect scaling ends, roughly $0.1$–$0.2\,B_{noise}$ in McCandlish's model. $B_{simple}=\mathrm{tr}\Sigma/|G|^2$ is a cheap proxy for $B_{noise}$.
+      - *"Why scale the LR linearly?"* It matches both the drift and the noise of $k$ small steps; equivalently, $\epsilon_{opt}\propto B$ when $B\ll B_{noise}$. It fails early in training (hence warmup) and once the step nears the curvature limit (past $2B_0+B_{noise}$ the step exceeds $2\epsilon_{opt}$). Measured optima follow no simple rule.
+      - *"Do large batches generalise worse?"* Not once LR, regularization and steps are re-tuned (Shallue). Apparent gaps come from heuristic LR scaling, epoch budgets, or missing regularization.
+      - *"Does gradient accumulation speed training?"* No. It trades memory for time and gives no throughput gain.
+      - *"What happens to $B_{noise}$ during training?"* It grows, because gradients shrink relative to their noise. Hence batch-size ramps.
+    source: Tuning Playbook §"Choosing the batch size"; McCandlish et al. 2018 §2; Shallue et al. 2019 §5
+
+  - title: "Key results"
+    body: |
+      - Time = time/step × steps. Choose $B$ for speed, not validation error. Use the largest $B$ that fits and still raises throughput.
+      - Three regimes: perfect scaling → diminishing returns → maximal parallelism. Steps never rise with $B$ (with re-tuning).
+      - Noise scale:
+
+      $$\begin{aligned}B_{noise}&=\frac{\mathrm{tr}(H\Sigma)}{G^\top HG}\\ B_{simple}&=\frac{\mathrm{tr}\,\Sigma}{|G|^2}\end{aligned}$$
+
+      - Optimal step and progress:
+
+      $$\begin{aligned}\epsilon_{opt}&=\frac{\epsilon_{max}}{1+B_{noise}/B}\\ \Delta L_{opt}&=\frac{\Delta L_{max}}{1+B_{noise}/B}\end{aligned}$$
+
+      - Tradeoff:
+
+      $$\Big(\tfrac{S}{S_{min}}-1\Big)\Big(\tfrac{E}{E_{min}}-1\Big)=1$$
+
+      with $B_{crit}=E_{min}/S_{min}\approx B_{noise}$, giving $2\times$ steps and $2\times$ examples at $B_{crit}$.
+      - "Critical batch": McCandlish's $B_{crit}$ (2×/2× point) vs the playbook's end of perfect scaling (≈$0.1$–$0.2\,B_{noise}$ in the model). Say which.
+      - Linear LR scaling matches drift and noise per example; anchored at $B_0$ it overshoots $2\epsilon_{opt}$ past $2B_0+B_{noise}$; it needs warmup. Measured optima follow no fixed rule, so re-tune LR, momentum and regularization per batch size.
+      - Small-batch noise regularizes; large batches may need more regularization. Epoch budgets favour small batches, step budgets favour large ones.
+      - Gradient accumulation gives no throughput gain. Momentum and Adam extend perfect scaling. $B_{noise}$ grows as loss falls.
+    source: Tuning Playbook §"Choosing the batch size"; McCandlish et al. 2018 §2; Shallue et al. 2019
+
+quiz:
+  - id: q1
+    prompt: |
+      Under McCandlish et al.'s model with $B_{noise}=1000$, training at $B=250$ takes how many steps and examples, relative to the minima?
+    correct: '$5\,S_{min}$ steps and $1.25\,E_{min}$ examples'
+    wrong:
+      - '$4\,S_{min}$ steps and $1\,E_{min}$ examples'
+      - '$1.25\,S_{min}$ steps and $5\,E_{min}$ examples'
+      - '$2\,S_{min}$ steps and $2\,E_{min}$ examples'
+    explanation: |
+      $S/S_{min}=1+B_{noise}/B=1+4=5$ and $E/E_{min}=1+B/B_{noise}=1.25$. Check: $(5-1)(1.25-1)=1$. The swapped answer is what you get at $B=4000$. The $2\times/2\times$ point is $B=B_{crit}=1000$.
+    source: McCandlish et al. 2018 §2.3
+
+  - id: q2
+    prompt: |
+      At McCandlish's critical batch size $B_{crit}=E_{min}/S_{min}$, how do steps and examples compare with their minima?
+    correct: Both are twice their minimum
+    wrong:
+      - Steps are at their minimum and examples are doubled
+      - Both are at their minimum
+      - Steps are halved and examples are unchanged
+    explanation: |
+      With $B=B_{crit}=E_{min}/S_{min}$, both factors in $(S/S_{min}-1)(E/E_{min}-1)=1$ equal 1, so $S=2S_{min}$ and $E=2E_{min}$. Neither minimum is reachable at a finite, nonzero batch: $S_{min}$ needs $B\to\infty$ and $E_{min}$ needs $B\to0$.
+    source: McCandlish et al. 2018 §2.3
+
+  - id: q3
+    prompt: |
+      In the noise-scale derivation, $\mathbb{E}[G_{est}^\top H G_{est}]$ equals which expression (batch size $B$, per-example covariance $\Sigma$)?
+    correct: '$G^\top HG+\mathrm{tr}(H\Sigma)/B$'
+    wrong:
+      - '$G^\top HG$'
+      - '$G^\top HG+B\,\mathrm{tr}(H\Sigma)$'
+      - '$\mathrm{tr}(H\Sigma)/B$'
+    explanation: |
+      For a random vector with mean $\mu$ and covariance $C$, $\mathbb{E}[v^\top Hv]=\mu^\top H\mu+\mathrm{tr}(HC)$. Here $\mu=G$ and $C=\Sigma/B$. The noise term shrinks as $1/B$, and that is what makes larger batches allow larger steps.
+    source: McCandlish et al. 2018 §2.2 (eq. 2.5)
+
+  - id: q4
+    prompt: |
+      Goyal et al. train ResNet-50 at LR 0.1 with batch 256. Under the linear scaling rule, what LR do they use at batch 8192?
+    correct: '3.2'
+    wrong:
+      - '0.57'
+      - '0.1'
+      - '32'
+    explanation: |
+      $k=8192/256=32$, so $\hat\eta=32\times0.1=3.2$, ramped up by gradual warmup over the first 5 epochs. 0.57 is the square-root rule ($0.1\sqrt{32}$).
+    source: Goyal et al. 2017 §2.1–2.2
+
+  - id: q5
+    prompt: |
+      Goyal et al.'s argument for $\hat\eta=k\eta$ relies on one approximation. Which one, and when does it fail?
+    correct: Gradients barely change over $k$ steps; fails early and at huge $k$
+    wrong:
+      - Gradients are normally distributed; it fails for heavy-tailed losses only
+      - The loss is convex; it fails for any neural network
+      - Batch norm statistics are fixed; it fails whenever batch norm is used
+    explanation: |
+      If $\nabla\ell(x,w_{t+j})\approx\nabla\ell(x,w_t)$ for $j<k$, then $k$ steps at $\eta$ equal one step at $k\eta$ on the union batch. Early on the weights change quickly (fixed with warmup), and for very large $k$ the steps drift apart (accuracy held only up to about 8k on ImageNet).
+    source: Goyal et al. 2017 §2.1
+
+  - id: q6
+    prompt: |
+      In McCandlish et al.'s model, you tune the LR at a small batch $B_0$ and keep scaling it linearly as $B$ grows far beyond $B_{noise}$. What eventually happens?
+    correct: The step passes $2\epsilon_{opt}$, so the expected loss rises
+    wrong:
+      - Training speeds up linearly forever, since steps keep halving
+      - Nothing changes, because $\epsilon_{opt}$ also keeps growing linearly
+      - The loss decreases faster, but generalisation gets worse
+    explanation: |
+      $\epsilon_{opt}=\epsilon_{max}/(1+B_{noise}/B)$ saturates at $\epsilon_{max}$. The expected loss is quadratic in $\epsilon$ and equals the starting loss at $\epsilon=2\epsilon_{opt}$. The anchored rule $\epsilon_{max}B/(B_0+B_{noise})$ grows without limit and crosses $2\epsilon_{opt}$ at $B=2B_0+B_{noise}$ (≈ $B_{noise}$ for small $B_0$).
+    source: McCandlish et al. 2018 §2.2
+
+  - id: q7
+    prompt: |
+      Which statement about gradient accumulation is **false**?
+    correct: It cuts time per epoch as a truly larger batch would
+    wrong:
+      - It lets you use a batch size larger than fits in memory
+      - Its micro-batches run sequentially, so time per update grows
+      - The playbook suggests generally avoiding it in applied work
+    explanation: |
+      Accumulating $k$ micro-batches costs about $k$ times as long per update, so time per epoch is unchanged. A real larger batch is faster only because it uses idle parallel hardware. Accumulation reproduces the optimisation of a large batch but not its throughput.
+    source: Tuning Playbook §"Determining the feasible batch sizes and estimating training throughput"
+
+  - id: q8
+    prompt: |
+      A study compares batch sizes 256 and 4096 under a fixed **epoch** budget, with LR tuned for each. Batch 256 wins. What is the most likely explanation?
+    correct: At a fixed epoch budget, batch 256 gets 16× more updates
+    wrong:
+      - Large batches inherently converge to sharper, worse minima
+      - Batch 4096 always needs a smaller learning rate than batch 256
+      - The comparison is fair, so small batches generalise better
+    explanation: |
+      At a fixed number of examples, the larger batch takes $4096/256=16\times$ fewer steps. Shallue et al. show that epoch budgets favour small batches, and that with adequate step budgets and re-tuning there is no evidence that large batches degrade the best achievable error.
+    source: Tuning Playbook §"Choosing the batch size to minimize training time"; Shallue et al. 2019 §4.8, §5
+
+  - id: q9
+    prompt: |
+      In a batch-size sweep, time per step is constant from 64 to 512, then doubles with every doubling beyond 512. What should you conclude?
+    correct: Throughput saturates at 512, so larger batches buy no speed
+    wrong:
+      - Batch sizes above 512 halve the training time
+      - The sweep shows an input-pipeline bug at small batch sizes
+      - The largest batch that fits in memory is still the best choice
+    explanation: |
+      Constant time per step means doubling $B$ doubles throughput. Beyond 512, time per step doubles with $B$, so throughput is flat. A larger batch then has no speed benefit and still costs more examples per target.
+    source: Tuning Playbook §"Determining the feasible batch sizes and estimating training throughput"
+
+  - id: q10
+    prompt: |
+      Moving from 8 to 16 GPUs doubles the batch size and halves the steps to target, with time per step unchanged. What happens to GPU-hours and wall-clock time?
+    correct: GPU-hours stay the same; wall-clock time halves
+    wrong:
+      - GPU-hours double; wall-clock time is unchanged
+      - GPU-hours halve; wall-clock time halves
+      - GPU-hours stay the same; wall-clock time is unchanged
+    explanation: |
+      Resource = (GPUs × time per step) × steps = $(2\times)\times(0.5\times)=1\times$. Wall-clock = time per step × steps, which halves. This is the playbook's "unchanged" case, valid while still in the perfect-scaling regime.
+    source: Tuning Playbook §"Choosing the batch size to minimize resource consumption"
+
+  - id: q11
+    prompt: |
+      Shallue et al. found that label smoothing on ResNet-50/ImageNet improved error by up to about 1 point at large batch sizes but had no visible effect at small ones. What explains this?
+    correct: Small-batch noise regularizes; large batches lose that effect
+    wrong:
+      - Label smoothing only works when the learning rate is very large
+      - Large batches need a larger smoothing value to have any effect
+      - Small batches cannot represent smoothed labels numerically
+    explanation: |
+      Sampling noise at small batch sizes acts as a regularizer. At large batch sizes it disappears, so the model can overfit more and explicit regularizers help. This is why regularization hyperparameters must be re-tuned when the batch size changes. The pattern is workload-specific: on MNIST-scale data, label smoothing helped at every batch size.
+    source: Shallue et al. 2019 §4.6, §5; Tuning Playbook FAQ "Why shouldn't the batch size be tuned…"
+
+  - id: q12
+    prompt: |
+      You switch a workload from plain SGD to Nesterov momentum, re-tuning LR and momentum at every batch size. What does Shallue et al.'s evidence predict for the steps-to-target vs batch-size curve?
+    correct: Same at small batches, but perfect scaling extends to larger ones
+    wrong:
+      - Fewer steps at every batch size, by a constant factor
+      - Perfect scaling ends at a smaller batch than with SGD
+      - No change, since momentum doesn't affect gradient noise
+    explanation: |
+      Inside every optimizer's perfect-scaling region, momentum performed identically to SGD; its advantage appears only at larger batches, where it keeps scaling (on ResNet-8/CIFAR-10, from batch 16 to 256). Preconditioned methods like Adam extend it further (Zhang et al. 2019).
+    source: Shallue et al. 2019 §4.4, §5
+
+  - id: q13
+    prompt: |
+      Why does the gradient noise scale $B_{noise}$ (and with it the useful batch size) tend to *grow* over the course of training?
+    correct: The mean gradient shrinks relative to per-example noise
+    wrong:
+      - The learning rate schedule decays, which shrinks gradient variance
+      - Later layers stop receiving useful gradients late in training
+      - The dataset effectively gets smaller as the model memorises it
+    explanation: |
+      $B_{simple}=\mathrm{tr}\Sigma/|G|^2$. Near a minimum $|G|$ gets small while per-example gradients still disagree, so the noise-to-signal ratio, and with it the useful batch size, rises. Kaplan et al. fit $B_{crit}$ as a power law in the loss, which motivates batch-size ramps. LR decay does not explain it: in McCandlish App. C the noise scale is inversely proportional to the training "temperature" $\epsilon/B$, so decaying the LR *raises* the measured noise scale rather than shrinking variance.
+    source: McCandlish et al. 2018 §2.4–2.5; Kaplan et al. 2020 §5.1
+
+cards:
+  - id: f1
+    front: The playbook's one-line rule for choosing the batch size.
+    back: |
+      Choose it for training speed, not validation performance. Often the best choice is the largest batch the hardware supports that still increases throughput. Then re-tune the optimizer and regularization hyperparameters.
+    source: Tuning Playbook §"Choosing the batch size"
+
+  - id: f2
+    front: Name the three regimes of steps-to-target vs batch size.
+    back: |
+      1. **Perfect scaling**: doubling $B$ halves the steps.
+      2. **Diminishing returns**: less than half.
+      3. **Maximal data parallelism**: no further reduction (and never an increase, with re-tuning).
+    source: Shallue et al. 2019 §4.1
+
+  - id: f3
+    front: Write the gradient noise scale $B_{noise}$ and its simple form $B_{simple}$.
+    back: |
+      $$\begin{aligned}B_{noise}&=\frac{\mathrm{tr}(H\Sigma)}{G^\top HG}\\ B_{simple}&=\frac{\mathrm{tr}\,\Sigma}{|G|^2}\end{aligned}$$
+
+      $\Sigma$ is the per-example gradient covariance. $B_{simple}$ assumes $H\propto I$; it is noise power over signal power.
+    source: McCandlish et al. 2018 §2.2
+
+  - id: f4
+    front: Optimal step size and progress per step as functions of batch size (McCandlish).
+    back: |
+      $$\epsilon_{opt}(B)=\frac{\epsilon_{max}}{1+B_{noise}/B}$$
+
+      $$\Delta L_{opt}(B)=\frac{\Delta L_{max}}{1+B_{noise}/B}$$
+
+      with $\epsilon_{max}=|G|^2/G^\top HG$ and $\Delta L_{max}=|G|^4/(2G^\top HG)$.
+    source: McCandlish et al. 2018 §2.2
+
+  - id: f5
+    front: State the steps–examples tradeoff and the definition of the critical batch.
+    back: |
+      $$\Big(\frac{S}{S_{min}}-1\Big)\Big(\frac{E}{E_{min}}-1\Big)=1$$
+
+      McCandlish's $B_{crit}=E_{min}/S_{min}\approx B_{noise}$. At $B_{crit}$: $S=2S_{min}$, $E=2E_{min}$. (The playbook's "critical batch" means where perfect scaling ends, a smaller batch.)
+    source: McCandlish et al. 2018 §2.3
+
+  - id: f6
+    front: The linear scaling rule, its justification, and its two failure modes.
+    back: |
+      Multiply the batch by $k$, multiply the LR by $k$ (Goyal et al.). Justification: $k$ small steps ≈ one large step if per-example gradients barely change across them. It also matches the gradient-noise covariance per example seen. It fails early in training (fix: gradual warmup) and when $k\eta$ nears the curvature limit (anchored at $B_0$, past about $2B_0+B_{noise}$).
+    source: Goyal et al. 2017 §2.1–2.2
+
+  - id: f7
+    front: Which hyperparameters interact most with batch size and must be re-tuned when it changes?
+    back: |
+      Optimizer hyperparameters (learning rate, momentum) and regularization hyperparameters. The step budget may also need adjusting.
+    source: Tuning Playbook §"Changing the batch size requires re-tuning most hyperparameters"
+
+  - id: f8
+    type: open
+    front: Derive why progress per step saturates as the batch size grows.
+    back: |
+      - Minibatch gradient: mean $G$, covariance $\Sigma/B$. Step $\theta-\epsilon G_{est}$.
+      - Second-order expansion and expectation, using $\mathbb{E}[v^\top Hv]=\mu^\top H\mu+\mathrm{tr}(HC)$:
+
+      $$\begin{aligned}\mathbb{E}L\approx L&-\epsilon|G|^2\\&+\tfrac12\epsilon^2\big(G^\top HG+\mathrm{tr}(H\Sigma)/B\big)\end{aligned}$$
+
+      - Minimise over $\epsilon$:
+
+      $$\begin{aligned}\epsilon_{opt}&=\frac{|G|^2}{G^\top HG+\mathrm{tr}(H\Sigma)/B}\\&=\frac{\epsilon_{max}}{1+B_{noise}/B}\end{aligned}$$
+
+      - Plug back in: $\Delta L_{opt}=\tfrac12\epsilon_{opt}|G|^2=\Delta L_{max}/(1+B_{noise}/B)$.
+      - $B\ll B_{noise}$: progress ∝ $B$ (perfect scaling). $B\gg B_{noise}$: progress → $\Delta L_{max}$ (saturated).
+      - Summed over a run: $S=S_{min}(1+B_{noise}/B)$, $E=E_{min}(1+B/B_{noise})$.
+    source: McCandlish et al. 2018 §2.2–2.3
+
+  - id: f9
+    type: open
+    front: "Interviewer: 'Large batches generalise worse, so we train at batch 32.' Respond."
+    back: |
+      - Shallue et al. re-tuned LR, momentum and schedule at every batch size and found no evidence that larger batches degrade the best achievable validation error.
+      - Apparent gaps come from protocol: an LR extrapolated by a heuristic from one tuned batch size; epoch budgets that give small batches many more updates (Hoffer et al.: "train longer, generalise better"); missing regularization.
+      - There is a real interaction: small-batch noise regularizes, so large batches may need more regularization (label smoothing helped only at large batch on ImageNet).
+      - So choose the batch for throughput. Batch 32 likely wastes hardware and time, especially if it is far below the critical batch, where perfect scaling makes larger batches nearly free.
+    source: Shallue et al. 2019 §4.6, §4.8, §5; Hoffer et al. 2017
+
+  - id: f10
+    type: open
+    front: "You double the GPU count and the global batch. Walk through everything you would re-check."
+    back: |
+      1. **Throughput**: did examples/s nearly double? If not, find the bottleneck (input pipeline, communication).
+      2. **Regime**: are we still below the critical batch, i.e. do the steps to target roughly halve? Check by running to a fixed target.
+      3. **Re-tune**: LR (don't just double it; Shallue found no universal rule), momentum or $\beta$'s, warmup length, and regularization strength (less gradient noise may mean more overfitting).
+      4. **Steps and schedule**: shorten `max_train_steps` if fewer are needed, and re-check the decay schedule.
+      5. **Batch norm**: keep the per-device or ghost batch for statistics fixed, so the loss function doesn't change.
+      6. **Cost**: GPU-hours unchanged in perfect scaling, higher past $B_{crit}$.
+    source: Tuning Playbook §"Choosing the batch size"; Goyal et al. 2017 §2.3; Shallue et al. 2019 §4.7
+
+reading:
+  - title: "Shallue et al. 2019, Measuring the Effects of Data Parallelism on Neural Network Training (JMLR)"
+    url: https://arxiv.org/abs/1811.03600
+    kind: paper
+    note: "§4.1 (three regimes), §4.4 (momentum), §4.6 (regularization), §4.7 (LR rules fail), §5 (reconciling the literature)."
+  - title: "McCandlish et al. 2018, An Empirical Model of Large-Batch Training"
+    url: https://arxiv.org/abs/1812.06162
+    kind: paper
+    note: "§2.2–2.4 derive the noise scale, the steps–examples tradeoff and their caveats; Appendix A shows how to measure B_simple cheaply."
+  - title: "Goyal et al. 2017, Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour"
+    url: https://arxiv.org/abs/1706.02677
+    kind: paper
+    note: "§2 gives the linear scaling rule and warmup; §3 covers the distributed pitfalls (BN batch, momentum correction, loss normalisation)."
+  - title: "Deep Learning Tuning Playbook: 'Choosing the batch size'"
+    url: https://github.com/google-research/tuning_playbook#choosing-the-batch-size
+    kind: docs
+    note: Throughput sweeps, time and resource tradeoffs, and why batch size isn't a validation knob.

@@ -1,0 +1,558 @@
+id: fund.training-loop
+area: fundamentals
+title: "The Training Loop: Implementation & Debugging"
+summary: Every line of an SGD training loop and why it sits where it does, the sanity checks to run before tuning, the common silent bugs with their symptoms, and how to handle monitoring, mixed precision, gradient accumulation, checkpointing and tuning order.
+order: 480
+level: core
+tags: [training, debugging, implementation, pytorch, tuning]
+prereqs: [fund.mlp-from-scratch, fund.sgd-momentum]
+
+explainer:
+  - title: "Anatomy of one training step"
+    body: |
+      ![One iteration. The highlighted lines touch `p.grad`: cleared, filled, possibly rescaled, then consumed by the optimizer.](fund.training-loop/loop-diagram)
+
+      Neural-net training rarely crashes when it's wrong. It just trains a bit worse. Knowing why each line sits where it does is the first defence.
+
+      ```python
+      model.train()
+      for step, (x, y) in enumerate(loader):          # loader reshuffles each epoch
+          x, y = x.to(device), y.to(device)
+          logits = model(x)                            # forward: records the graph
+          loss = F.cross_entropy(logits, y)            # takes raw logits
+          opt.zero_grad(set_to_none=True)              # .grad would otherwise accumulate
+          loss.backward()                              # fills p.grad for every parameter
+          gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+          opt.step()                                   # reads p.grad, updates p and its state
+          sched.step()                                 # this scheduler is stepped per batch
+          if step % log_every == 0:
+              log(step, loss.item(), gnorm.item(), sched.get_last_lr()[0])
+      ```
+
+      **Ordering constraints:**
+      - `zero_grad` can go anywhere before `backward`, because `backward` *adds* into `.grad`.
+      - Clipping must come after `backward` and before `step`, because it edits the gradient the step will use. `clip_grad_norm_` returns the **unclipped** total norm, treating all gradients as one vector. That is the number to log.
+      - The scheduler steps after the optimizer. PyTorch warns if you reverse them, because the first LR value would be skipped.
+      - Logging calls `.item()`, which copies to the host and synchronises the GPU, so don't call it every step in a fast loop.
+
+      **What lives where.** The optimizer holds references to the parameters plus its own state (momentum buffers, Adam moments). The scheduler only rewrites `opt.param_groups[...]["lr"]`. Data, loss and parameters must be on the same device.
+    source: d2l §3.4.3–3.4.4; PyTorch clip_grad_norm_ docs; PyTorch performance tuning guide
+
+  - title: "From scratch: the loop with no framework"
+    body: |
+      Logistic regression trained with minibatch SGD in numpy. It is the whole algorithm with nothing hidden:
+
+      ```python
+      rng = np.random.default_rng(0)
+      w, b = np.zeros(d), 0.0
+      for epoch in range(epochs):
+          perm = rng.permutation(N)                 # new order every epoch
+          for i in range(0, N, B):
+              idx = perm[i:i + B]
+              Xb, yb = X[idx], y[idx]               # one index array keeps x, y aligned
+              p = 1 / (1 + np.exp(-(Xb @ w + b)))   # forward
+              g = p - yb                            # dLoss/dlogit per example
+              w -= lr * Xb.T @ g / len(idx)         # gradient of the *mean* loss
+              b -= lr * g.mean()
+      ```
+
+      The PyTorch version lets autograd produce the gradient. The update itself must not be recorded in the graph:
+
+      ```python
+      loss = F.binary_cross_entropy_with_logits(X @ w + b, y)
+      loss.backward()
+      with torch.no_grad():                         # an update is not part of the model
+          for p in (w, b):
+              p -= lr * p.grad
+              p.grad = None                         # the manual zero_grad
+      ```
+
+      **Why reshuffle every epoch?** SGD's analysis treats each minibatch as a random sample, so its gradient is an unbiased estimate of the full gradient. If the data are stored sorted (by class, source or length), consecutive batches are correlated, and the model chases whatever it saw last. Reshuffling also stops the model from seeing the same batch compositions in the same order every epoch. In multi-worker training, Goyal et al. use one consistent random permutation per epoch, split across workers.
+
+      **`drop_last=True`** discards a short final batch. A tiny batch gives a noisy step and odd BatchNorm statistics. At evaluation time you must *not* drop examples; handle the partial batch instead (next card).
+
+      Both loops were run: about 96% training accuracy on a separable toy problem.
+    source: d2l §3.4; Goyal et al. 2017 §3 (Remark 4); Bottou et al. 2018 §3.2, §4.1
+
+  - title: "Train mode, eval mode, and evaluating correctly"
+    body: |
+      PyTorch has **two independent switches**, and mixing them up is a classic bug.
+      - **`model.train()` / `model.eval()`** change layer *behaviour*. Dropout is on or off. BatchNorm normalises with batch statistics and updates its running averages, or uses the stored running averages.
+      - **`torch.no_grad()` / `torch.inference_mode()`** stop autograd recording a graph. That saves memory and time but changes no layer's behaviour.
+
+      Evaluation needs both:
+
+      ```python
+      model.eval()
+      with torch.inference_mode():
+          correct = sum((model(x).argmax(1) == y).sum().item() for x, y in val_loader)
+      acc = correct / len(val_set)
+      model.train()
+      ```
+
+      If you use `no_grad` but forget `eval()`, dropout stays active and BatchNorm normalises with the validation batch's own statistics. Worse, BatchNorm *updates its running averages from validation data*: running stats change in train mode even under `no_grad`. We checked this.
+
+      **Evaluate at fixed step intervals**, not time intervals. Step-indexed curves are comparable across runs, and periodic structure stays visible. If you shuffled the splits and the validation metric still shows periodicity, suspect train/validation overlap or a shuffling bug (Tuning Playbook).
+
+      **Partial final batches.** 1,000 validation examples at batch 64 leave a last batch of 40. If you pad it to 64 and the 24 padded rows count as wrong, a model that is really 90% accurate reports $900/1024=87.9\%$. Give padded rows zero weight, and accumulate correct-counts over examples rather than averaging per-batch accuracies, which would weight the last 40 examples as if they were 64.
+
+      The evaluation batch can be *larger* than the training batch, since no activations are kept for backward.
+    source: Tuning Playbook §"Setting up periodic evaluations"; d2l §3.4.4; Goodfellow DL §7.12
+
+  - title: "Sanity checks before any tuning"
+    body: |
+      ![Real run: one batch of 8 examples, 10 classes. The correct loss heads to 0. Applying softmax before cross_entropy stalls at a computable floor.](fund.training-loop/overfit-one-batch)
+
+      **1. Check the loss at initialisation.** If the final layer starts small, the logits are near zero and $p_k\approx1/K$ for every class, so
+
+      $$L_0\approx-\ln\tfrac1K=\ln K$$
+
+      which is $2.303$ for 10 classes. PyTorch's default `nn.Linear` on standardised inputs gave $2.45$ in our run. A much larger value means the network is confidently wrong from the start: the logit scale is too big. For imbalanced data, set the output bias to the log class prior, so the initial loss equals the label entropy instead.
+
+      **2. Overfit one tiny batch.** Take 2–8 examples, turn off augmentation and regularisation, and train until the loss is near 0. A big enough model can memorise a few examples even with random labels. So a plateau means the *optimisation path* is broken, not the data.
+
+      In the figure the plateau sits at a computable value. `cross_entropy(softmax(z), y)` treats probabilities in $[0,1]$ as logits. The best it can do is put 1 on the true class and 0 elsewhere, which gives
+
+      $$p_y=\frac{e}{e+K-1},\quad L_{min}=\ln\Big(1+\frac{K-1}{e}\Big)$$
+
+      That is $1.46$ for $K=10$.
+
+      **3. Run baselines.**
+      - Train with the inputs zeroed: an input-independent baseline. Your model must beat it.
+      - Train with shuffled labels: validation should stay at chance.
+
+      **4. Visualise just before the model.** Decode the exact tensor fed to `model(x)` back into images or text, and check that its labels match.
+
+      **5. Use backprop to chart dependencies.** Set the loss to the sum of example $i$'s outputs and backprop to the input. Only example $i$ should get a nonzero gradient. Any leak means a `view`/`transpose` mix-up across the batch, or causal masking that lets later positions influence earlier ones.
+
+      Fix the random seed while doing all of this.
+    source: Karpathy 2019 §2; Goodfellow DL §11.5
+
+  - title: "Silent bugs and their symptoms"
+    body: |
+      **Missing `zero_grad` with plain SGD.** `.grad` holds the running sum of all past gradients, so step $t$ moves by $\eta\sum_{s\le t}g_s$. That is heavy-ball momentum with $\beta=1$: velocity that never decays. On a quadratic with curvature $\lambda$, substituting $g=\lambda\theta$ gives
+
+      $$\theta_{t+1}=(2-\eta\lambda)\theta_t-\theta_{t-1}$$
+
+      Its characteristic roots have product 1, and for $0<\eta\lambda<4$ they are complex with $|r|=1$. So the parameters oscillate forever without settling, and they diverge if $\eta\lambda>4$. (Panel D on card 6.)
+
+      **Target shape $(N,1)$ vs $(N,)$.** In `((pred - y)**2).mean()`, broadcasting builds an $N\times N$ matrix, so the loss is $\frac{1}{N^2}\sum_{i,j}(p_i-y_j)^2$. Then
+
+      $$\frac{\partial L}{\partial p_i}=\frac{2}{N}(p_i-\bar y)$$
+
+      so every prediction is pulled toward the *mean target*. The model learns a constant, and nothing crashes.
+
+      **More, with their symptoms:**
+      - **Softmax before `CrossEntropyLoss`** (which expects logits). The loss is floored at $\ln(1+\frac{K-1}{e})$ and gradients are tiny.
+      - **Forgetting `model.eval()`.** Validation metrics are noisy and pessimistic, and BatchNorm stats get polluted.
+      - **Shuffling `x` and `y` separately.** Labels become random: training loss stalls near $\ln K$ and validation stays at chance.
+      - **Train/validation leakage** (duplicates, the same patient or user in both splits). Validation looks great and the test set disappoints.
+      - **Data sorted and never shuffled.** The loss jumps at every block boundary, periodic in the epoch.
+      - **Learning rate too high.** The loss falls, then explodes to `NaN`.
+      - **Gradient accumulation without dividing the loss.** The effective LR is multiplied by the number of micro-batches.
+      - **Layers kept in a Python `list`** instead of `nn.ModuleList`. They aren't registered, so `model.parameters()`, the optimizer, `.to(device)` and `state_dict` all miss them.
+      - **A per-epoch scheduler stepped per batch.** `StepLR(step_size=30, gamma=0.1)` at 500 batches per epoch decays 16 times in the first epoch, so the LR is about $10^{-16}$ of its start.
+      - **In-place ops on saved tensors.** Autograd raises an error. Or, if you bypass it with `.data`, gradients are silently wrong.
+    source: Karpathy 2019 §2; Goodfellow DL §11.5; Goyal et al. 2017 §3; Tuning Playbook §"Examining the training curves"
+
+  - title: "Monitoring, and what instability looks like"
+    body: |
+      ![Real runs on synthetic problems. A: GD with $\eta$ just above $2/\lambda_{max}$, so loss falls then explodes. B: a tiny $\eta$, a slow near-linear decline. C: least squares with 60 features and 40 examples: training loss keeps falling while validation turns up. D: `.grad` never cleared, an undamped oscillation.](fund.training-loop/symptom-curves)
+
+      **Log by default:**
+      - training loss every step,
+      - validation metrics at fixed step intervals,
+      - the **unclipped** global gradient norm,
+      - the learning rate actually used,
+      - per-layer activation statistics: the fraction of ReLUs that are always off, and how saturated tanh or sigmoid units are.
+
+      **Update-to-parameter ratio.** $\lVert\Delta\theta\rVert/\lVert\theta\rVert$ per layer and per step. Goodfellow et al., citing Bottou, suggest updates around 1% of the parameter magnitude. Others quote about $10^{-3}$. Treat either as an order of magnitude, and look for layers that are far off the rest (stalled or exploding).
+
+      **Red flags** (Tuning Playbook):
+      - *Training* loss rising usually means a pipeline bug.
+      - Periodic validation curves suggest overlap or a shuffling bug.
+      - Validation rising while training falls is overfitting (panel C). Add regularisation or stop early.
+
+      **Instability**: spikes, sudden jumps or `NaN`. First moves:
+      1. Look at the gradient-norm log just before the spike. An outlier batch shows up as an isolated norm spike; a too-high LR shows norms growing steadily.
+      2. Check the data for `inf`/`NaN` and extreme values.
+      3. Lower the learning rate or add warmup. Warmup lets the run leave early high-curvature regions where $\eta>2/\lambda_{max}$.
+      4. Clip gradients. A good threshold is about the 90th percentile of unclipped norms. If more than half the steps get clipped, you are really just lowering the LR.
+      5. In fp16, rule out overflow: use loss scaling, or switch to bf16.
+    source: Goodfellow DL §11.5; Tuning Playbook §"Examining the training curves", FAQ "Gradient clipping"; Karpathy 2019 §2
+
+  - title: "Mixed precision, clipping and gradient accumulation"
+    body: |
+      **fp16 autocast with a GradScaler.** fp16's smallest normal number is about $6\times10^{-5}$, so small gradients underflow to zero. The scaler multiplies the loss by a large factor $S$ (default $2^{16}$) before `backward`. `step` then divides it out and **skips the update** if any gradient is `inf`/`NaN`, lowering $S$ for next time.
+
+      ```python
+      scaler = torch.amp.GradScaler("cuda")
+      with torch.autocast("cuda", dtype=torch.float16):
+          loss = loss_fn(model(x), y)
+      opt.zero_grad(set_to_none=True)
+      scaler.scale(loss).backward()        # gradients are S times too big
+      scaler.unscale_(opt)                 # true scale *before* clipping
+      torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+      scaler.step(opt)                     # skips the step on inf/NaN
+      scaler.update()                      # adjusts S
+      ```
+
+      Clip *before* unscaling and the threshold applies to gradients $2^{16}\times$ too big. Nearly every step gets clipped to a vanishing true norm. **bf16** has fp32's exponent range, so it needs autocast but no scaler.
+
+      **Gradient accumulation** simulates a batch of $k\cdot b$ on memory for $b$:
+
+      ```python
+      for i, (x, y) in enumerate(loader):
+          loss = loss_fn(model(x), y) / k      # divide, or the gradient is k times too big
+          loss.backward()                      # .grad sums across micro-batches
+          if (i + 1) % k == 0:
+              opt.step(); opt.zero_grad(set_to_none=True)
+      ```
+
+      With equal-size micro-batches and a mean loss, this matches the big-batch gradient (we checked: max difference about $10^{-7}$ in fp32). It does **not** replicate BatchNorm, which still normalises over each micro-batch of $b$.
+
+      **Variable-length sequences break "divide by $k$".** Suppose micro-batch 1 has 10 non-padding tokens with summed loss 20, and micro-batch 2 has 90 tokens with summed loss 90. Averaging the per-batch means gives $(2.0+1.0)/2=1.5$. The true per-token mean is $110/100=1.1$, and each short-batch token is overweighted $9\times$. The fix, which Hugging Face shipped in 2024, is to sum token losses and divide by the total non-padding token count across the accumulation window. Goyal et al.'s rule is the same idea for data parallelism: normalise by the total batch $kn$, not the per-worker $n$.
+    source: PyTorch AMP docs; PyTorch AMP examples §"Working with Unscaled Gradients", §"Gradient accumulation"; HF blog "Fixing Gradient Accumulation" (2024); Goyal et al. 2017 §3
+
+  - title: "Reproducibility, checkpoints, and the order of tuning"
+    body: |
+      **Reproducibility.**
+      - Seed Python, numpy and torch, including the DataLoader generator and worker seeds.
+      - Turn on `torch.use_deterministic_algorithms(True)` when you need bitwise repeats; some kernels are nondeterministic otherwise.
+      - Fix the data order.
+
+      Even then, different hardware or library versions can change results. Treat seed-to-seed variance as part of any comparison.
+
+      **A checkpoint must contain the whole training state:**
+      - model `state_dict`,
+      - optimizer `state_dict` (momentum buffers, Adam's $m$, $v$ and step count),
+      - scheduler state,
+      - GradScaler state,
+      - the step or epoch counter,
+      - RNG states,
+      - the data-loader position.
+
+      **Why the optimizer state matters.** Resume Adam with fresh state and its first step has bias-corrected $\hat m=g$ and $\hat v=g^2$. So every parameter moves by $\eta\,g/|g|=\pm\eta$, a full-size sign step regardless of how small its gradient is. Expect a loss jump. Forget the scheduler state and the LR jumps back to the start of warmup or to its peak.
+
+      Keep the best few checkpoints by validation metric, not just the last one.
+
+      **The order of tuning** (Tuning Playbook):
+      1. **Simple baseline first:** a modest model, a constant learning rate, no extra features. A schedule comes later.
+      2. **Batch size** is chosen for throughput and memory, usually the largest that fits and helps throughput. It is *not* tuned against validation. Once the other hyperparameters are re-tuned, Shallue et al. found no evidence that batch size changes the best achievable validation performance.
+      3. **Re-tune for that batch size** the learning rate, momentum and Adam's $\beta$s, plus regularisation. Their optima shift with batch size, and smaller batches add regularising noise.
+      4. **Then the step budget and schedule,** then architecture changes, each judged against a re-tuned baseline.
+    source: Tuning Playbook §"Choosing the batch size", §"Choosing the initial configuration", FAQ "Why shouldn't the batch size be tuned…"; Kingma & Ba 2015 §2–3; Karpathy 2019 §2
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Walk me through a training step."** Forward, loss, `zero_grad`, backward, clip, step, schedule, log. Say why `zero_grad` exists (accumulation) and where clipping goes.
+      - **"What loss do you expect at step 0?"** $\ln K$ for $K$ balanced classes: $2.30$ for 10 and $6.91$ for 1000.
+      - **"How do you know the pipeline works before tuning?"** The initial-loss check, overfitting one batch, input-independent and shuffled-label baselines, and looking at the exact tensors fed to the model.
+      - **"The loss doesn't go down. What do you do?"** Overfit 8 examples. Check the LR, the sign of the update, `zero_grad`, and that the optimizer has every parameter. Gradient-check any custom ops.
+      - **"The loss went NaN at step 10k."** Look at the gradient-norm and loss logs before it, check the data, lower the LR or add warmup, clip, and check fp16 overflow.
+      - **"Difference between `eval()` and `no_grad()`?"** One changes layer behaviour (dropout, BatchNorm); the other turns off graph recording. Use both for evaluation.
+      - **"Implement gradient accumulation."** Divide the loss by $k$ and step every $k$ micro-batches. Normalise by tokens for variable-length data. Note the BatchNorm caveat.
+      - **"You doubled the batch size. What else changes?"** Re-tune the LR and the other optimizer and regularisation settings, and maybe the number of steps.
+      - **"Where does clipping go with AMP?"** After `scaler.unscale_` and before `scaler.step`.
+      - **"What goes in a checkpoint?"** Model, optimizer, scheduler and scaler states, the step counter, RNG states and the data position.
+    source: Karpathy 2019 §2; Goodfellow DL §11.5; Tuning Playbook; PyTorch AMP examples
+
+  - title: "Key results"
+    body: |
+      - **Step order:** forward → loss → `zero_grad` → `backward` → clip (unscale first under AMP) → `step` → `sched.step` → log the unclipped norm.
+      - **Initial loss:** $L_0\approx\ln K$. **Softmax-before-CE floor:** $\ln(1+(K-1)/e)$, which is $1.46$ for $K=10$.
+      - **Missing `zero_grad`:** momentum with $\beta=1$, giving undamped oscillation for $0<\eta\lambda<4$.
+      - **$(N,1)$ vs $(N,)$ in MSE:** $\partial L/\partial p_i=\frac2N(p_i-\bar y)$, so the model predicts the mean.
+      - **Gradient accumulation:** divide by $k$, or by total tokens for variable lengths. Without that, SGD's effective LR is $\times k$.
+      - **AMP:** `scale → backward → unscale_ → clip → step → update`. bf16 needs no scaler.
+      - **Clipping threshold:** about the 90th percentile of unclipped norms. More than 50% of steps clipped means you should lower the LR instead.
+      - **Tuning order:** batch size for throughput, then re-tune the LR and optimizer and regularisation for it. Start with a constant LR.
+    source: Karpathy 2019 §2; Tuning Playbook; PyTorch AMP examples
+
+quiz:
+  - id: q1
+    prompt: |
+      A training loop uses plain SGD (no momentum) but never calls `zero_grad()`:
+
+      ```python
+      for x, y in loader:
+          loss = loss_fn(model(x), y)
+          loss.backward()
+          opt.step()
+      ```
+
+      On a well-conditioned problem with a small learning rate, what do you expect?
+    correct: "It oscillates without settling, like momentum with β = 1"
+    wrong:
+      - "Nothing changes, because opt.step() clears the gradients after using them"
+      - "It behaves like a larger batch, since gradients get averaged over steps"
+      - "Training slows down smoothly as the summed gradients cancel out"
+    explanation: |
+      `.grad` becomes $\sum_{s\le t}g_s$, a velocity with no decay. On a quadratic this gives $\theta_{t+1}=(2-\eta\lambda)\theta_t-\theta_{t-1}$, whose roots lie on the unit circle for $0<\eta\lambda<4$: undamped oscillation. `step()` never clears `.grad`. And the gradients are *summed*, not averaged, so the "larger batch" reading is wrong: past gradients are never divided out, and they were taken at stale parameters.
+    source: Goodfellow DL §8.3.2; PyTorch AMP examples §"Gradient accumulation"
+
+  - id: q2
+    prompt: |
+      A freshly initialised 100-class classifier reports a cross-entropy of 46 at step 0, before any update. What is the most likely cause?
+    correct: "Its logits start far too large: confidently wrong"
+    wrong:
+      - "The learning rate is set far too high for this model"
+      - "Labels were shuffled relative to the inputs"
+      - "The 100 classes are heavily imbalanced"
+    explanation: |
+      With near-zero logits every class gets $p\approx1/100$, so the loss should be $\ln100=4.6$. A value 10× larger needs large-magnitude logits that put most of the mass on wrong classes: the output layer's init scale is too big, or inputs aren't normalised. No update has happened yet, so the LR can't be the cause. Shuffled labels still give about $\ln K$ at init. Imbalance doesn't push the step-0 loss far above $\ln K$.
+    source: Karpathy 2019 §2
+
+  - id: q3
+    prompt: |
+      Someone writes `loss = F.cross_entropy(F.softmax(logits, -1), y)` for a 100-class problem. What is the lowest training loss this can ever reach?
+    correct: '$\ln(1+99/e)\approx 3.62$'
+    wrong:
+      - '$0$, just reached more slowly'
+      - '$\ln 100\approx 4.61$'
+      - '$\ln(1+9/e)\approx 1.46$'
+    explanation: |
+      `cross_entropy` re-applies softmax to its inputs, which are probabilities in $[0,1]$. Its best case is 1 on the true class and 0 elsewhere, giving $p_y=e/(e+99)$ and loss $\ln(1+99/e)=3.62$. That is below chance ($4.61$, since the model can still learn something) but nowhere near 0. $1.46$ is the floor for $K=10$.
+    source: Karpathy 2019 §2
+
+  - id: q4
+    prompt: |
+      ![Per-step minibatch loss over four epochs of a 3-class model on synthetic data. Dotted lines mark epoch boundaries.](fund.training-loop/mystery-curve)
+
+      Learning rate and batch size are fixed and there is no schedule. Which bug best explains this curve?
+    correct: "Data are sorted by class and never shuffled"
+    wrong:
+      - "A cyclic LR schedule restarts at every epoch"
+      - "optimizer.zero_grad() is never called in the loop"
+      - "Validation examples leaked into the training data"
+    explanation: |
+      There are *three* spikes per epoch, one for each class block, repeating every epoch. At each class boundary the model is biased toward the class it has just seen, so the new class's first batches have high loss, which then falls within the block. A restarting schedule would make one jump per epoch, and the stem rules out schedules anyway. Missing `zero_grad` gives oscillations unrelated to data order. Leakage doesn't change the training curve's shape.
+    source: Goyal et al. 2017 §3; Tuning Playbook §"Setting up periodic evaluations"
+
+  - id: q5
+    prompt: |
+      You switch from batch 256 to gradient accumulation over 4 micro-batches of 64 with plain SGD, but forget to divide each micro-batch loss by 4. Everything else is unchanged. What is the effective learning rate relative to the batch-256 run?
+    correct: "4× larger"
+    wrong:
+      - "Unchanged, since the four gradients are averaged"
+      - "4× smaller"
+      - "16× larger"
+    explanation: |
+      Each micro-batch's mean-loss gradient approximates the full-batch gradient, and `backward()` sums four of them. So the update is 4× the batch-256 step, which under SGD is the same as a 4× learning rate. Nothing averages them unless you divide. Adam would barely notice, because it divides by the gradient's RMS and the factor cancels. SGD does notice.
+    source: PyTorch AMP examples §"Gradient accumulation"; Kingma & Ba 2015 §2.1
+
+  - id: q6
+    prompt: |
+      Gradient accumulation over two micro-batches of padded sequences. Micro-batch 1 has 10 real tokens with summed loss 20. Micro-batch 2 has 90 real tokens with summed loss 90. What is the correct per-token loss for this accumulated step?
+    correct: "1.1"
+    wrong:
+      - "1.5"
+      - "2.0"
+      - "1.0"
+    explanation: |
+      Per-token normalisation means total loss over total real tokens: $(20+90)/(10+90)=1.1$. Averaging the two per-batch means, $(2.0+1.0)/2=1.5$, is what a "divide by $k$" loop computes. It overweights every token in the short micro-batch $9\times$. This is the bug Hugging Face fixed in 2024. 2.0 and 1.0 are the individual micro-batch means.
+    source: HF blog "Fixing Gradient Accumulation" (2024)
+
+  - id: q7
+    prompt: |
+      Validation code wraps the forward pass in `torch.no_grad()` but never calls `model.eval()`. The model has dropout and BatchNorm. What goes wrong?
+    correct: "Dropout stays on; BatchNorm uses batch stats and updates its running stats"
+    wrong:
+      - "Nothing: no_grad already puts dropout and BatchNorm into inference behaviour"
+      - "Only memory use: gradients are tracked, but the outputs are identical"
+      - "Only dropout stays on; BatchNorm's running statistics are frozen under no_grad"
+    explanation: |
+      `no_grad` controls graph recording only. Layer behaviour is set by `train()`/`eval()`. In train mode, BatchNorm normalises with the current batch's statistics and updates its running averages in the forward pass even under `no_grad` (verified). So validation numbers get noisier, and the model's inference statistics drift toward the validation set.
+    source: d2l §3.4.4; Ioffe & Szegedy 2015 §3.1
+
+  - id: q8
+    prompt: |
+      You double the batch size to improve throughput. Following the Tuning Playbook, what else should you do?
+    correct: "Re-tune the LR and other optimizer and regularisation settings"
+    wrong:
+      - "Nothing, because batch size doesn't affect the best achievable validation performance"
+      - "Keep the LR fixed and pick whichever batch size gives the best validation accuracy"
+      - "Halve the number of epochs and keep every other hyperparameter unchanged"
+    explanation: |
+      The optimal LR, momentum and regularisation all shift with batch size, so they must be re-tuned. The playbook's claim that batch size doesn't limit the best validation performance holds only *after* that re-tuning. That's why the first distractor is a trap. Batch size itself is chosen for throughput, never tuned against validation.
+    source: Tuning Playbook §"Changing the batch size requires re-tuning most hyperparameters", FAQ "Why shouldn't the batch size be tuned…"
+
+  - id: q9
+    prompt: |
+      A regression model outputs `pred` of shape (N, 1). The targets `y` have shape (N,). Training uses `loss = ((pred - y) ** 2).mean()`. What does the model learn?
+    correct: "To output roughly the mean target for every input"
+    wrong:
+      - "The correct regression function, because broadcasting matches each row to its own target"
+      - "Nothing at all: PyTorch raises a shape-mismatch error"
+      - "The correct function, but with every prediction scaled by a factor of N"
+    explanation: |
+      `pred - y` broadcasts to $N\times N$, so the loss averages $(p_i-y_j)^2$ over all pairs. Its gradient is $\frac2N(p_i-\bar y)$, which drives every prediction to the batch mean of the targets. Broadcasting is legal, so there's no error. This is a classic silent bug; the cure is to make the shapes agree, for example with `pred.squeeze(-1)`.
+    source: Karpathy 2019 §2
+
+  - id: q10
+    prompt: |
+      `StepLR(opt, step_size=30, gamma=0.1)` was meant to decay the LR every 30 *epochs*, but `sched.step()` is called after every batch. There are 500 batches per epoch. By the end of epoch 1, what is the LR relative to its starting value?
+    correct: '$10^{-16}$ of it'
+    wrong:
+      - '$10^{-1}$ of it'
+      - 'unchanged'
+      - '$10^{-30}$ of it'
+    explanation: |
+      Stepped per batch, `StepLR` counts batches. 500 steps contain $\lfloor500/30\rfloor=16$ decays of $0.1$, giving $10^{-16}$, and training effectively stops after the first epoch. $10^{-1}$ would be one decay. $10^{-30}$ mistakes `step_size` for the number of decays. The fix is to step a per-epoch scheduler once per epoch, or to give per-batch schedulers their length in steps.
+    source: Tuning Playbook §"Determining the number of steps for each training run"
+
+  - id: q11
+    prompt: |
+      A run with Adam is resumed from a checkpoint containing only `model.state_dict()`. The loss jumps up right after resuming. Why?
+    correct: "Fresh Adam moments make the first step ±lr on every parameter"
+    wrong:
+      - "The weights load in a different order, scrambling the layers"
+      - "Adam's bias correction is skipped on the first resumed step"
+      - "The model is still in eval mode, which disables the gradient updates"
+    explanation: |
+      With fresh state, $m_1=(1-\beta_1)g$ and $v_1=(1-\beta_2)g^2$. Bias correction gives $\hat m=g$ and $\hat v=g^2$, so the step is $\eta\,g/|g|$: a full $\eta$-sized sign step for *every* parameter, even those whose gradients are tiny. Late in training that is a large perturbation. A missing scheduler state can also reset the LR. A `state_dict` is keyed by name, so nothing gets scrambled.
+    source: Kingma & Ba 2015 §2–3
+
+  - id: q12
+    prompt: |
+      Which of these bugs would the "overfit a single batch of 8 examples" test **not** catch?
+    correct: "Validation examples duplicated in the training set"
+    wrong:
+      - "The update written as p += lr * grad"
+      - "Logits passed through .detach() before computing the loss"
+      - "Softmax applied before CrossEntropyLoss"
+    explanation: |
+      Overfitting one batch tests the optimisation path: forward, loss, backward and update. A sign-flipped update makes the loss rise. Detached logits give no gradient, so the loss stays flat. Double softmax plateaus at $\ln(1+(K-1)/e)$. Leakage between splits leaves training on a single batch untouched. It only inflates validation scores, so you find it by deduplicating and checking how the splits were made.
+    source: Karpathy 2019 §2; Goodfellow DL §11.5
+
+  - id: q13
+    prompt: |
+      fp16 training with `GradScaler` (scale $S=65536$). The code calls `clip_grad_norm_(params, 1.0)` right after `scaler.scale(loss).backward()`, with no `scaler.unscale_`. The true gradient norm is 2. What norm does the gradient applied by `scaler.step` have?
+    correct: 'About $1.5\times10^{-5}$'
+    wrong:
+      - "1.0, as intended"
+      - "2.0, since clipping has no effect here"
+      - "65536"
+    explanation: |
+      The stored gradient norm is $2S=131{,}072$, so clipping rescales it to 1. Then `scaler.step` unscales by $S$, leaving $1/65536\approx1.5\times10^{-5}$. Updates shrink by about $10^5$ and training crawls. "1.0" assumes clipping saw true-scale gradients. Calling `scaler.unscale_(opt)` before clipping is the documented fix.
+    source: PyTorch AMP examples §"Working with Unscaled Gradients"
+
+cards:
+  - id: f1
+    front: The order of operations in one PyTorch training step, and the two ordering constraints that matter.
+    back: |
+      `x,y` → `model(x)` → `loss` → `zero_grad` → `backward` → (clip) → `opt.step` → `sched.step` → log.
+
+      `zero_grad` must precede `backward`, because gradients accumulate. Clipping must sit between `backward` and `step`, after `unscale_` under fp16 AMP. Log the unclipped norm that `clip_grad_norm_` returns.
+    source: d2l §3.4; PyTorch AMP examples
+
+  - id: f2
+    front: Expected cross-entropy at initialisation for $K$ balanced classes, and what a much larger value means.
+    back: |
+      $L_0\approx\ln K$ ($2.30$ for $K=10$, $4.61$ for $K=100$), because near-zero logits give $p\approx1/K$. Much larger means overconfident wrong logits: the output-layer scale is too big or inputs aren't normalised. For imbalanced data, initialise the output bias to the log class prior.
+    source: Karpathy 2019 §2
+
+  - id: f3
+    front: "`model.eval()` vs `torch.no_grad()` — what does each control?"
+    back: |
+      `eval()`/`train()` set layer behaviour: dropout off or on, and BatchNorm running stats vs batch stats plus updates. `no_grad`/`inference_mode` turn off graph recording (memory and speed). Evaluation needs both. BatchNorm in train mode updates its running stats even under `no_grad`.
+    source: d2l §3.4.4
+
+  - id: f4
+    front: Correct gradient accumulation over $k$ micro-batches, and its two caveats.
+    back: |
+      Use `(loss / k).backward()` on each micro-batch and `step()` plus `zero_grad()` every $k$. For equal-size batches with a mean loss this equals the big-batch gradient.
+
+      **Caveats:** (1) variable-length tokens need sum-of-losses divided by total real tokens across the window; (2) BatchNorm still sees only micro-batch statistics.
+    source: PyTorch AMP examples §"Gradient accumulation"; HF blog "Fixing Gradient Accumulation" (2024)
+
+  - id: f5
+    front: The fp16 AMP sequence with clipping, and why bf16 differs.
+    back: |
+      `autocast` forward → `scaler.scale(loss).backward()` → `scaler.unscale_(opt)` → `clip_grad_norm_` → `scaler.step(opt)` (skipped on inf/NaN) → `scaler.update()`.
+
+      fp16 underflows small gradients (smallest normal about $6\times10^{-5}$). bf16 has fp32's exponent range, so it needs no scaler.
+    source: PyTorch AMP docs; PyTorch AMP examples
+
+  - id: f6
+    front: What must a training checkpoint contain to resume exactly?
+    back: |
+      Model `state_dict`, optimizer state (momentum, Adam $m$, $v$ and step count), scheduler state, GradScaler state, step or epoch counter, RNG states (python, numpy, torch, cuda), and the data-loader position. Without the optimizer state, Adam's first resumed step is a $\pm\eta$ sign step on every parameter.
+    source: Kingma & Ba 2015 §2; Karpathy 2019 §2
+
+  - id: f7
+    front: How to set a gradient-clipping threshold, and when clipping signals a different problem.
+    back: |
+      Log the unclipped global norm, then set the threshold near its 90th percentile, just above typical values. If more than 50% of updates are clipped, it is effectively a smaller learning rate, so lower the LR instead. Sometimes a longer warmup fixes what clipping doesn't.
+    source: Tuning Playbook FAQ "Gradient clipping"
+
+  - id: f8
+    type: open
+    front: Your training loss doesn't decrease. Walk an interviewer through how you'd debug it.
+    back: |
+      1. **Check step 0.** Is the loss about $\ln K$? If not, look at the output init, input normalisation and the loss inputs (logits vs probabilities).
+      2. **Overfit 2–8 examples** with augmentation and regularisation off. If that fails, the optimisation path is broken. Check the update sign, that `zero_grad` is present, that the optimizer has *all* parameters (not a plain `list` of layers), that nothing is detached, and that there's no double softmax.
+      3. **Try LRs over a few orders of magnitude.** Watch the unclipped gradient norm and the update-to-parameter ratio per layer to find layers that are dead or exploding.
+      4. **Gradient-check any custom op** in float64, and use backprop to chart dependencies (gradients from example $i$ should touch only input $i$).
+      5. **Data:** visualise the exact tensor fed to the model with its labels, check alignment after shuffling, and confirm that shuffled labels give chance.
+      6. **Only then** suspect the model's capacity or the hyperparameters.
+    source: Karpathy 2019 §2; Goodfellow DL §11.5
+
+  - id: f9
+    type: open
+    front: Write a minimal SGD training loop from scratch (no autograd) for logistic regression and explain each line.
+    back: |
+      - **Init:** `w = 0`, `b = 0`. The problem is convex, so the starting point is not critical.
+      - **Each epoch:** draw a fresh permutation. Random minibatches make each gradient an unbiased estimate, and sorted data would bias consecutive steps.
+      - **Slice one index array** for both `X` and `y`, so labels stay aligned.
+      - **Forward:** `p = sigmoid(Xb @ w + b)`, computed stably for large $|z|$.
+      - **Gradient of the mean BCE:** `g = p - yb`, giving `dw = Xb.T @ g / B` and `db = g.mean()`. The $p-y$ form comes from the matching (canonical) link.
+      - **Update:** `w -= lr * dw` and `b -= lr * db`. Under autograd, do this inside `torch.no_grad()` and clear `.grad`.
+      - **Monitor:** evaluate held-out loss at fixed step intervals. Check that the step-0 loss is $\ln2$.
+    source: d2l §3.4; CS229 notes ch. 2
+
+  - id: f10
+    type: open
+    front: Loss suddenly spikes and goes NaN at step 10k of a long run. What do you check, in what order?
+    back: |
+      1. **Logs before the spike.** A single isolated gradient-norm outlier suggests a bad batch or data issue. A steadily rising norm suggests the LR is too high, or the run has reached curvature where $\eta>2/\lambda_{max}$.
+      2. **That step's data:** `inf`/`NaN`, extreme values, corrupt examples.
+      3. **Numerics:** fp16 overflow (check the GradScaler's skipped steps and the scale history), any `log(0)` or `exp` overflow outside fused ops. Switch to bf16 or fused stable ops.
+      4. **Mitigations:** lower the peak LR, lengthen warmup, add clipping at about the 90th percentile of unclipped norms, and consider normalisation changes.
+      5. **Resume** from the last good checkpoint with full optimizer and scheduler state, and confirm the fix holds past the same step.
+    source: Tuning Playbook FAQ "How can optimization failures be debugged and mitigated?"; PyTorch AMP docs
+
+  - id: f11
+    type: open
+    front: Starting a new project, in what order do you set up and tune the training configuration?
+    back: |
+      1. **Simple pipeline and baseline:** a modest model, Adam or SGD with momentum, a *constant* LR, and sanity checks passed.
+      2. **Batch size:** the largest that improves throughput and fits in memory. It is not tuned on validation.
+      3. **For that batch size, tune the LR first,** then momentum or the $\beta$s and regularisation. All of them interact with batch size.
+      4. **Step budget,** then an LR schedule (warmup plus decay).
+      5. **Then scientific changes** (architecture, data), each compared against a re-tuned baseline over several seeds.
+
+      Change one thing at a time, and look at the training curves, not just the final number.
+    source: Tuning Playbook §"Guide for starting a new project", §"Choosing the batch size"
+
+reading:
+  - title: "Karpathy, A Recipe for Training Neural Networks (2019)"
+    url: https://karpathy.github.io/2019/04/25/recipe/
+    kind: blog
+    note: The canonical checklist. Verify the loss at init, overfit one batch, input-independent baselines, visualise just before the net, use backprop to chart dependencies.
+  - title: "Goodfellow, Bengio & Courville, Deep Learning §11.5 Debugging Strategies"
+    url: https://www.deeplearningbook.org/contents/guidelines.html
+    kind: book
+    note: Why ML bugs are hard to see, fitting a tiny dataset, finite-difference checks, and monitoring activations and update magnitudes.
+  - title: "Google Research, Deep Learning Tuning Playbook"
+    url: https://github.com/google-research/tuning_playbook
+    kind: docs
+    note: Batch-size choice, the tuning order, periodic evaluation, reading training curves, and gradient clipping and warmup recipes.
+  - title: "PyTorch, Automatic Mixed Precision examples"
+    url: https://docs.pytorch.org/docs/stable/notes/amp_examples.html
+    kind: docs
+    note: Exact code for GradScaler with clipping (unscale_ first), gradient accumulation, and multiple optimizers.
+  - title: "d2l.ai §3.4 Linear Regression Implementation from Scratch"
+    url: https://d2l.ai/chapter_linear-regression/linear-regression-scratch.html
+    kind: course
+    note: A complete minimal loop (model, loss, SGD with zero_grad, fit_epoch, eval under no_grad) to type out once by hand.

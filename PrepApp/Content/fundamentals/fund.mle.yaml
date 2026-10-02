@@ -1,0 +1,511 @@
+id: fund.mle
+area: fundamentals
+title: Maximum Likelihood Estimation
+summary: The likelihood function, worked MLEs from coin flips to the multivariate Gaussian, why standard losses are negative log-likelihoods, MLE as forward-KL minimization, exponential families, and where maximum likelihood breaks.
+order: 70
+level: core
+tags: [probability, estimation, statistics, loss-functions, exponential-family]
+prereqs: [fund.estimation]
+
+explainer:
+  - title: "The problem: picking parameters from data"
+    body: |
+      We have a parametric family $p(x\mid\theta)$, such as a coin with unknown bias or a Gaussian with unknown mean, and i.i.d. data $D=\{x_1,\dots,x_N\}$. We want one number (or vector) $\hat\theta$. The maximum-likelihood principle chooses the $\theta$ under which the observed data would have been most probable.
+
+      **The likelihood** is the probability of the data, viewed as a function of $\theta$ with the data held fixed:
+
+      $$L(\theta)=p(D\mid\theta)=\prod_{i=1}^N p(x_i\mid\theta)$$
+
+      The product form uses independence. $L$ is **not a density over $\theta$**: nothing makes $\int L(\theta)\,d\theta$ equal 1. This matters for invariance later.
+
+      **Why take logs.** The log is increasing, so $\arg\max L=\arg\max\ell$ with $\ell=\log L$. It turns the product into a sum $\ell(\theta)=\sum_i\log p(x_i\mid\theta)$, which differentiates term by term and gives per-example gradients for SGD. It also avoids underflow: a product of thousands of numbers below 1 rounds to 0. Dividing by $N$ (the average negative log-likelihood, NLL) leaves the argmax unchanged but makes gradient sizes independent of $N$.
+
+      **Warm-up: a coin.** With $h$ heads in $n$ flips, $\ell(p)=h\log p+(n-h)\log(1-p)$. Setting the derivative to zero:
+
+      $$\ell'(p)=\frac hp-\frac{n-h}{1-p}=0\;\Rightarrow\;\hat p=\frac hn$$
+
+      The second derivative, $-h/p^2-(n-h)/(1-p)^2$, is negative, so this is a maximum. At $\hat p$ it equals $-n/(\hat p(1-\hat p))$: the peak gets sharper in proportion to $n$.
+
+      ![Relative log-likelihood for 3/10 and 30/100 heads: same MLE 0.3, but ten times the curvature with ten times the data. Points above the dashed line (within 1.92 of the peak) form an approximate 95% likelihood interval: about [0.08, 0.61] vs [0.22, 0.39].](fund.mle/likelihood-curve)
+    source: Murphy PML1 §4.2.1, §4.2.3; Goodfellow DL §5.5; d2l §22.7.1–22.7.2
+
+  - title: "Worked MLEs: categorical, Gaussian, Poisson"
+    body: |
+      **Categorical** (a $K$-sided die, counts $N_k$). Maximize $\sum_k N_k\log\theta_k$ subject to $\sum_k\theta_k=1$.
+
+      *Refresher on Lagrange multipliers:* to maximize $f(\theta)$ subject to $g(\theta)=0$, look for stationary points of $f+\lambda g$. At the constrained optimum $\nabla f$ is parallel to $\nabla g$.
+
+      Here, setting $\partial_{\theta_k}\big[\sum_j N_j\log\theta_j+\lambda(1-\sum_j\theta_j)\big]=0$ gives $N_k/\theta_k=\lambda$, so $\theta_k=N_k/\lambda$. The constraint forces $\lambda=N$:
+
+      $$\hat\theta_k=\frac{N_k}{N}$$
+
+      Positivity comes for free, because $\log\theta_k\to-\infty$ at 0.
+
+      **Univariate Gaussian.** Up to a constant:
+
+      $$\ell(\mu,\sigma^2)=-\frac N2\log\sigma^2-\frac{1}{2\sigma^2}\sum_i(x_i-\mu)^2$$
+
+      The $\mu$-derivative $\frac1{\sigma^2}\sum_i(x_i-\mu)=0$ gives $\hat\mu=\bar x$. The $\sigma^2$-derivative gives
+
+      $$\begin{aligned}&-\frac{N}{2\sigma^2}+\frac{1}{2\sigma^4}\sum_i(x_i-\mu)^2=0\\ &\Rightarrow\;\hat\sigma^2=\frac1N\sum_i(x_i-\bar x)^2\end{aligned}$$
+
+      This divides by $N$, not $N-1$, so $\mathbb E[\hat\sigma^2]=\frac{N-1}{N}\sigma^2$. Fitting $\bar x$ to the same data uses up one degree of freedom (fund.estimation).
+
+      **Poisson** with $p(x\mid\lambda)=\lambda^xe^{-\lambda}/x!$. Then $\ell=\sum_ix_i\log\lambda-N\lambda+\text{const}$, and $\ell'=\sum_ix_i/\lambda-N=0$ gives $\hat\lambda=\bar x$.
+
+      Notice the pattern: each MLE matches a sample average to its model counterpart. The exponential-family card explains why.
+    source: Murphy PML1 §4.2.4–4.2.5; Bishop PRML §1.2.4
+
+  - title: "Worked MLEs: multivariate Gaussian and a boundary maximum"
+    body: |
+      **Multivariate Gaussian** in $D$ dimensions. Up to a constant:
+
+      $$\ell=-\frac N2\log|\Sigma|-\frac12\sum_i(x_i-\mu)^\top\Sigma^{-1}(x_i-\mu)$$
+
+      The gradient in $\mu$ is $\Sigma^{-1}\sum_i(x_i-\mu)$, so $\hat\mu=\bar x$. For $\Sigma$, work with the precision $\Lambda=\Sigma^{-1}$ and two tools.
+      - *Trace trick:* a scalar equals its trace, so $a^\top\Lambda a=\mathrm{tr}(\Lambda aa^\top)$. Summing gives $\mathrm{tr}(S\Lambda)$ with scatter matrix $S=\sum_i(x_i-\bar x)(x_i-\bar x)^\top$.
+      - *Matrix derivatives:* $\nabla_A\log|A|=A^{-\top}$ and $\nabla_A\mathrm{tr}(BA)=B^\top$.
+
+      With $\ell=\frac N2\log|\Lambda|-\frac12\mathrm{tr}(S\Lambda)$, the gradient is $\frac N2\Lambda^{-1}-\frac12S=0$, so
+
+      $$\hat\Sigma=\frac1N\sum_i(x_i-\bar x)(x_i-\bar x)^\top.$$
+
+      $S$ has rank at most $N-1$, so $\hat\Sigma$ is **singular whenever $N\le D$**, and badly conditioned when $N$ is not much larger than $D$.
+
+      **Uniform $U(0,\theta)$**, the classic case where calculus fails. Each $x_i$ has density $1/\theta$ if $x_i\le\theta$ and 0 otherwise. So
+
+      $$L(\theta)=\begin{cases}\theta^{-n}&\theta\ge\max_ix_i\\0&\text{otherwise.}\end{cases}$$
+
+      $\theta^{-n}$ decreases in $\theta$, so the maximum is at the smallest allowed value, $\hat\theta=\max_ix_i$. There $L$ jumps from 0 to its peak; $L'(\theta)=-n\theta^{-n-1}$ is never zero, so setting a derivative to zero finds nothing.
+
+      **It is biased low.** The maximum never exceeds $\theta$. $P(\hat\theta\le t)=(t/\theta)^n$, so $\hat\theta$ has density $nt^{n-1}/\theta^n$ and
+
+      $$\mathbb E[\hat\theta]=\int_0^\theta t\,\frac{nt^{n-1}}{\theta^n}\,dt=\frac{n}{n+1}\theta.$$
+
+      Multiplying by $\frac{n+1}{n}$ removes the bias. The error shrinks like $1/n$, faster than the usual $1/\sqrt n$, because this likelihood is not smooth at its peak.
+    source: Murphy PML1 §4.2.6; Murphy PML1 §4.2.1
+
+  - title: "Conditional MLE: where the standard losses come from"
+    body: |
+      In supervised learning we model $p(y\mid x,\theta)$ and maximize $\sum_i\log p(y_i\mid x_i,\theta)$. Each noise model gives a familiar loss. Write $f=f_\theta(x)$ for the network output.
+      - **Gaussian** $y\sim\mathcal N(f,\sigma^2)$: $-\log p=\frac{(y-f)^2}{2\sigma^2}+\frac12\log(2\pi\sigma^2)$. With $\sigma$ fixed, this is **squared error**. Fitting $\sigma$ as well gives $\hat\sigma^2=\mathrm{RSS}/N$, the mean squared residual. Plain MSE assumes the same noise variance everywhere; predicting $\sigma(x)$ too gives a heteroscedastic Gaussian NLL.
+      - **Laplace** $p\propto e^{-|y-f|/b}$: **absolute error**. The best constant prediction under absolute error is the median, not the mean, which is why it is robust to outliers.
+      - **Bernoulli** with $\mu=\sigma(f)$: $-[y\log\mu+(1-y)\log(1-\mu)]$, which is **binary cross-entropy**.
+      - **Categorical** with softmax outputs: $-\log\mathrm{softmax}(f)_y$, which is **cross-entropy**. Next-token prediction, $\sum_t-\log p(x_t\mid x_{<t})$, is conditional MLE of a categorical distribution over tokens.
+      - **Poisson** counts with $\lambda=e^{f}$: $\lambda-y\log\lambda+\log y!$, the **Poisson NLL**.
+
+      So choosing a loss is choosing a noise model. Every NLL is a cross-entropy between the empirical distribution and the model, so "cross-entropy" is not special to classifiers; MSE is the cross-entropy against a Gaussian model.
+
+      Averaging instead of summing leaves the minimizer unchanged but rescales the gradient by $1/N$. Learning rates and weight-decay coefficients are therefore tied to which convention you use.
+    source: Goodfellow DL §5.5.1; Murphy PML1 §4.2.7, §11.6.1, §12.4; CS229 notes §1.3
+
+  - title: "MLE minimizes forward KL"
+    body: |
+      Put mass $1/N$ on each training point to get the empirical distribution $\hat p$. The average NLL is an expectation under $\hat p$:
+
+      $$-\frac1N\sum_i\log p_\theta(x_i)=\mathbb E_{\hat p}[-\log p_\theta(x)]$$
+
+      Now expand the KL divergence from $\hat p$ to the model:
+
+      $$\begin{aligned}\mathrm{KL}(\hat p\,\|\,p_\theta)&=\mathbb E_{\hat p}[\log\hat p(x)-\log p_\theta(x)]\\&=-H(\hat p)+\mathbb E_{\hat p}[-\log p_\theta(x)]\end{aligned}$$
+
+      $H(\hat p)$ does not depend on $\theta$. So **minimizing the NLL is minimizing $\mathrm{KL}(\hat p\,\|\,p_\theta)$**, the *forward* KL from data to model. For continuous data the entropy of a sum of spikes is not finite, so read the statement through its large-$N$ limit: the average NLL tends to $H(p_{\text{data}})+\mathrm{KL}(p_{\text{data}}\,\|\,p_\theta)$.
+
+      **Consequence 1: mass covering.** Forward KL weights $\log\frac{p_{\text{data}}}{p_\theta}$ by $p_{\text{data}}$. Wherever data exist and $p_\theta\approx0$, the penalty explodes. An MLE fit that is too simple therefore spreads mass over every region with data, even at the cost of putting mass where there is none.
+
+      ![Synthetic two-cluster data. The MLE Gaussian (moment matching) covers both clusters and the empty gap between them. Minimizing the reverse KL instead would lock onto one cluster (see fund.kl-divergence).](fund.mle/mle-kl)
+
+      **Consequence 2: misspecification.** If no $\theta$ reproduces $p_{\text{data}}$, the MLE converges to the member of the family closest to it in this KL. It finds the best approximation, not "the truth".
+
+      **Consequence 3: NLL values are relative.** For continuous densities the NLL can be negative (densities can exceed 1), while KL is never negative. Compare NLLs only between models evaluated on the same data.
+    source: Murphy PML1 §4.2.2, §5.3.2; Goodfellow DL §5.5
+
+  - title: "Exponential families: convexity and moment matching"
+    body: |
+      Many standard distributions share one form:
+
+      $$p(x\mid\eta)=h(x)\exp\big(\eta^\top T(x)-A(\eta)\big)$$
+
+      Here $\eta$ is the *natural parameter* and $T(x)$ the *sufficient statistic*. The log-partition function $A(\eta)=\log\int h(x)e^{\eta^\top T(x)}dx$ normalizes the density.
+
+      **Derivatives of $A$.** Differentiate under the integral:
+
+      $$\nabla A=\frac{\int h\,T\,e^{\eta^\top T}dx}{\int h\,e^{\eta^\top T}dx}=\mathbb E_\eta[T(x)]$$
+
+      Differentiating $\int T\,h\,e^{\eta^\top T-A}dx$ once more gives
+
+      $$\begin{aligned}\nabla^2A&=\mathbb E[T\,(T-\nabla A)^\top]\\&=\mathrm{Cov}_\eta[T(x)]\succeq0.\end{aligned}$$
+
+      **So the NLL is convex in $\eta$.** For i.i.d. data it is $-\eta^\top\sum_iT(x_i)+N A(\eta)+\text{const}$: a linear term plus a convex one. Setting the gradient to zero gives **moment matching**:
+
+      $$\mathbb E_{\hat\eta}[T(x)]=\frac1N\sum_iT(x_i)$$
+
+      Examples:
+      - Bernoulli: $T=x$, $\eta=\log\frac p{1-p}$, $A=\log(1+e^\eta)$, $A'=\sigma(\eta)=p$, so $\hat p=\bar x$.
+      - Poisson: $\eta=\log\lambda$, $A=e^\eta$, so $\hat\lambda=\bar x$.
+      - Gaussian: $T=(x,x^2)$, so the fit matches the mean and second moment.
+
+      **The convexity is specific to $\eta$.** In terms of $\sigma$, the Gaussian NLL $N\log\sigma+S/(2\sigma^2)$ (with $S=\sum_i(x_i-\mu)^2$) has second derivative $(3S-N\sigma^2)/\sigma^4$. That is negative for $\sigma^2>3S/N$, so the NLL is not convex in $\sigma$.
+
+      **GLMs.** Set $\eta_i=w^\top x_i$ (the *canonical link*). The NLL gradient becomes $\sum_i(A'(\eta_i)-y_i)\,x_i=\sum_i(\mu_i-y_i)\,x_i$: prediction minus target, shared by linear, logistic and Poisson regression (fund.logistic-regression). When the moment equations cannot be inverted in closed form, use gradient methods or Newton's method. Latent-variable models such as mixtures are not exponential families in their parameters and have local optima (fund.gmm-em).
+    source: Murphy PML1 §3.4.1–3.4.3, §12.4; Bishop PRML §2.4; CS229 notes ch.3
+
+  - title: "Properties: consistency, efficiency, invariance, bias"
+    body: |
+      **Consistency.** $\hat\theta\to\theta^*$ in probability as $N\to\infty$, provided the true distribution is in the model family, a single $\theta^*$ produces it (*identifiability*), and the usual regularity conditions hold.
+
+      **Asymptotic normality and efficiency** (stated here, derived in fund.fisher-information). For large $N$,
+
+      $$\hat\theta\approx\mathcal N\big(\theta^*,\,(N\,F(\theta^*))^{-1}\big),$$
+
+      where $F$ is the Fisher information, the expected curvature of the per-example log-likelihood. For a coin $F=1/(p(1-p))$, so the standard error is $\sqrt{\hat p(1-\hat p)/N}$, matching the curvature in the warm-up. Asymptotically no consistent estimator has lower mean squared error (the Cramér–Rao bound).
+
+      **Invariance.** For a bijection $\phi=g(\theta)$, the likelihood in terms of $\phi$ is $L(g^{-1}(\phi))$. It takes the same values at relabelled inputs, so its maximum sits at $\hat\phi=g(\hat\theta)$. No Jacobian appears because $L$ is a function of $\theta$, not a density over it. With 3 heads in 10, the MLE of $p^2$ is $0.09$ and of the log-odds is $\log(3/7)$. MAP estimates lack this property (fund.mle-map).
+
+      **Bias.** The MLE can be biased at finite $N$: the Gaussian $\hat\sigma^2$ by a factor $(N-1)/N$, and the uniform $\max_ix_i$ by $n/(n+1)$. Invariance itself forces bias. If $\hat p$ is unbiased, $\hat p^2$ is not: $\mathbb E[\hat p^2]=p^2+p(1-p)/n$. These estimators are biased yet consistent, because the bias vanishes as $N$ grows.
+
+      All of this is large-sample theory for a correctly specified, identifiable model. Deep networks violate most of the assumptions, which is why the MLE's guarantees are a starting point rather than a promise.
+    source: Goodfellow DL §5.5.2; Murphy PML1 §4.7.2, §5.3.2; Murphy PML2 §7.4.1.3
+
+  - title: "When maximum likelihood breaks"
+    body: |
+      - **Zero counts.** An n-gram or categorical model that never saw a token gives it probability 0. One such token at test time makes the test NLL (and perplexity) infinite. Fix with smoothing, a prior in disguise (fund.mle-map).
+      - **Separable logistic regression.** If a hyperplane separates the classes, scaling $w$ up always raises the likelihood. $\|w\|\to\infty$, predicted probabilities go to 0 and 1, and no finite MLE exists. Which separator you end up near depends on the optimizer and initialization. This happens even with $N\gg d$, whenever the data are separable.
+      - **Mixture singularities.** In a two-component Gaussian mixture, centre one component on a data point $x_1$ and shrink its $\sigma$. That point's density contains a term $\frac{1}{2\sqrt{2\pi}\,\sigma}\to\infty$, while the other component keeps every other point's density finite. The log-likelihood goes to $+\infty$. A single Gaussian cannot do this: every other point's density goes to 0 exponentially fast.
+
+      ![20 synthetic points. Shrinking one mixture component onto $x_1$ sends the log-likelihood to $+\infty$ (it grows like $-\log\sigma$). The same move with a single Gaussian sends it to $-\infty$.](fund.mle/gmm-singularity)
+
+      - **Too many parameters.** A full covariance in $D\ge N$ dimensions is singular; a degree-$(N-1)$ polynomial interpolates noise. The MLE fits the sample, not the distribution.
+      - **Non-identifiability.** A $K$-component mixture has $K!$ relabellings with equal likelihood. In a ReLU network, scaling a hidden unit's incoming weights by $c>0$ and its outgoing weights by $1/c$ leaves the function unchanged. The fitted *distribution* can still converge, but "$\hat\theta\to\theta^*$" has no meaning.
+
+      Remedies are priors and regularization, smoothing, constraints such as a variance floor, and early stopping. The next lessons cover them.
+    source: Bishop PRML §9.2.1, §4.3.2; Murphy PML1 §4.2.6, §4.5; Goodfellow DL §5.5.2
+
+  - title: "What interviewers probe"
+    body: |
+      - *Is the likelihood a probability distribution over $\theta$?* No. It is $p(D\mid\theta)$ as a function of $\theta$, and need not integrate to 1. That is why the MLE is invariant to reparameterization.
+      - *Why maximize the log-likelihood?* Same argmax, sums instead of products, per-example gradients, no underflow.
+      - *Derive the Gaussian MLE. Is $\hat\sigma^2$ unbiased?* $\hat\mu=\bar x$ and $\hat\sigma^2=\frac1N\sum(x_i-\bar x)^2$, with expectation $\frac{N-1}N\sigma^2$. Biased, but consistent.
+      - *Why is MSE "Gaussian" and cross-entropy "Bernoulli/categorical"?* They are the NLLs of those noise models. MAE is Laplace.
+      - *Connect MLE to KL.* Average NLL $=H(\hat p)+\mathrm{KL}(\hat p\|p_\theta)$, so MLE minimizes forward KL and is mass-covering.
+      - *MLE of $U(0,\theta)$?* $\max_ix_i$, a boundary maximum where the derivative is never zero. $\mathbb E=\frac n{n+1}\theta$.
+      - *When is the NLL convex?* For exponential families in the natural parameter, because $\nabla^2A=\mathrm{Cov}[T]$. GLMs with canonical links inherit this, and the MLE matches moments.
+      - *Name failure modes.* Zero counts, separable logistic regression, mixture singularities, too many parameters, non-identifiability.
+      - *Is the MLE always best?* It is asymptotically efficient under correct specification. With small $N$, a biased estimator (MAP, shrinkage) can have lower error.
+    source: Murphy PML1 §4.2; Goodfellow DL §5.5; Bishop PRML §9.2.1
+
+  - title: "Key results"
+    body: |
+      - Definition: $\hat\theta=\arg\max_\theta\sum_i\log p(x_i\mid\theta)$, with the likelihood a function of $\theta$ only.
+      - Worked MLEs: Bernoulli $h/n$; categorical $N_k/N$ (Lagrange); Gaussian $\bar x$ and $\frac1N\sum(x_i-\bar x)^2$; Poisson $\bar x$; MVN $\hat\Sigma=\frac1N S$ (singular if $N\le D$); $U(0,\theta)$: $\max_ix_i$ with mean $\frac n{n+1}\theta$.
+      - Losses as NLLs: Gaussian → MSE ($\hat\sigma^2=\mathrm{RSS}/N$), Laplace → MAE, Bernoulli/categorical → cross-entropy, Poisson → Poisson NLL.
+      - Forward KL:
+
+      $$-\tfrac1N\textstyle\sum_i\log p_\theta(x_i)=H(\hat p)+\mathrm{KL}(\hat p\,\|\,p_\theta)$$
+
+      - Exponential family:
+
+      $$\begin{aligned}\nabla A(\eta)&=\mathbb E[T(x)]\\ \nabla^2A(\eta)&=\mathrm{Cov}[T(x)]\succeq0\end{aligned}$$
+
+      So the NLL is convex in $\eta$ and the MLE matches moments. The GLM gradient is $\sum_i(\mu_i-y_i)x_i$.
+      - Properties: consistent (if the model is correct and identifiable), $\hat\theta\approx\mathcal N(\theta^*,(NF)^{-1})$, invariant ($\widehat{g(\theta)}=g(\hat\theta)$), possibly biased.
+      - Failure modes: zero counts, separability, mixture singularities, overparameterization, non-identifiability.
+    source: Murphy PML1 §3.4, §4.2; Goodfellow DL §5.5
+
+quiz:
+  - id: q1
+    prompt: |
+      Data $\{1,2,3\}$ are modelled as i.i.d. exponential with density $\lambda e^{-\lambda x}$. What is the MLE of the rate $\lambda$?
+    correct: '$1/2$'
+    wrong:
+      - '$2$'
+      - '$1/6$'
+      - '$0.35$'
+    explanation: |
+      $\ell(\lambda)=N\log\lambda-\lambda\sum_ix_i=3\log\lambda-6\lambda$, so $\ell'=3/\lambda-6=0$ and $\hat\lambda=N/\sum_ix_i=1/\bar x=1/2$. 2 is the mean $\bar x$, which estimates the *scale* $1/\lambda$, not the rate. 1/6 forgets the factor $N$. 0.35 is $\ln2/\text{median}$, from matching the median instead of maximizing the likelihood.
+    source: Murphy PML1 §4.2.1
+
+  - id: q2
+    prompt: |
+      A coin shows 3 heads in 10 flips. What is the MLE of $p^2$, the probability of two heads in a row?
+    correct: '$0.09$'
+    wrong:
+      - '$0.30$'
+      - '$0.067$'
+      - '$0.21$'
+    explanation: |
+      By invariance, $\widehat{p^2}=\hat p^2=0.3^2=0.09$. The likelihood is a function of $p$, so reparameterizing just relabels its inputs. 0.067 is $h(h-1)/(n(n-1))=6/90$, the *unbiased* estimator of $p^2$; it is a valid estimator but not the MLE. 0.21 is $\hat p(1-\hat p)$, the Bernoulli variance.
+    source: Murphy PML2 §7.4.1.3; Goodfellow DL §5.5
+
+  - id: q3
+    prompt: |
+      Data $\{0.2,\,0.9,\,0.5\}$ are modelled as i.i.d. $U(0,\theta)$. Which statement is correct?
+    correct: $\hat\theta=0.9$, and $\mathbb E[\hat\theta]=\tfrac34\theta$ for $n=3$
+    wrong:
+      - $\hat\theta\approx1.07$ (twice the mean), and it is unbiased
+      - $\hat\theta=0.9$, and it is unbiased
+      - No MLE exists, because $L'(\theta)$ is never zero
+    explanation: |
+      $L(\theta)=\theta^{-3}$ for $\theta\ge0.9$ and 0 below, so it peaks at the boundary $\hat\theta=\max x_i=0.9$. Since $P(\hat\theta\le t)=(t/\theta)^n$, $\mathbb E[\hat\theta]=\frac n{n+1}\theta=\frac34\theta$. $2\bar x\approx1.07$ is the unbiased method-of-moments estimator, not the MLE. A maximum can exist without a zero derivative when it sits on the edge of the feasible region.
+    source: Murphy PML1 §4.2.1
+
+  - id: q4
+    prompt: |
+      For an exponential family $p(x\mid\eta)=h(x)\exp(\eta^\top T(x)-A(\eta))$, why is the NLL of i.i.d. data convex in $\eta$?
+    correct: Because $\nabla^2A(\eta)=\mathrm{Cov}[T(x)]\succeq0$
+    wrong:
+      - Because $T(x)$ is a convex function of the data $x$
+      - Because the base measure $h(x)$ is always log-concave
+      - Because $\log p$ is linear in the mean parameter $\mathbb E[T]$
+    explanation: |
+      The NLL is $-\eta^\top\sum_iT(x_i)+NA(\eta)+\text{const}$. The first term is linear in $\eta$; the second has Hessian $N\,\mathrm{Cov}[T]\succeq0$. Neither $T$ nor $h$ needs any convexity, since they do not depend on $\eta$. $\log p$ is linear in $\eta$, not in the mean parameter.
+    source: Murphy PML1 §3.4.3
+
+  - id: q5
+    prompt: |
+      You fit a two-component 1-D Gaussian mixture by maximum likelihood. Component 2's mean is placed exactly on a data point, and its standard deviation $\sigma_2$ is shrunk towards 0 while component 1 stays broad. What happens to the log-likelihood?
+    correct: It grows without bound, so no global maximum exists
+    wrong:
+      - It goes to $-\infty$, as it would for a single Gaussian
+      - It stays bounded, because the other points cap it
+      - It peaks at a finite $\sigma_2$ near the data's spread
+    explanation: |
+      The pinned point's density includes $\frac{0.5}{\sqrt{2\pi}\sigma_2}\to\infty$, and component 1 keeps every other point's density finite, so the log-likelihood $\to+\infty$. For a single Gaussian the other points' densities decay like $e^{-c/\sigma^2}$, which overwhelms the $1/\sigma$ gain and sends the likelihood to 0 (log-likelihood to $-\infty$).
+    source: Bishop PRML §9.2.1
+
+  - id: q6
+    prompt: |
+      Which statement about maximum likelihood is **false**?
+    correct: One Gaussian's likelihood blows up as $\sigma\to0$ at a data point ($N\ge2$)
+    wrong:
+      - The MLE can be biased at every finite $N$ yet still be consistent
+      - The MLE of $g(\theta)$ is $g(\hat\theta)$ for any bijection $g$
+      - With linearly separable data, no finite logistic-regression MLE exists
+    explanation: |
+      Centring a single Gaussian on one point and shrinking $\sigma$ sends the *other* points' densities to 0 exponentially fast, so the likelihood goes to 0. The divergence needs a second component to cover the rest of the data. The other statements are true: the Gaussian $\hat\sigma^2$ is biased but consistent, the MLE is invariant, and separable data push $\|w\|\to\infty$.
+    source: Bishop PRML §9.2.1, §4.3.2; Murphy PML2 §7.4.1.3
+
+  - id: q7
+    prompt: |
+      You model regression noise as Laplace, $p(y\mid x)\propto e^{-|y-f(x)|/b}$, with $b$ fixed. Which loss does conditional MLE minimize, and which constant prediction minimizes that loss on a sample of targets?
+    correct: Mean absolute error; the sample median
+    wrong:
+      - Mean squared error; the sample mean
+      - Mean absolute error; the sample mean
+      - Huber loss; the trimmed mean
+    explanation: |
+      $-\log p=|y-f|/b+\text{const}$, so the MLE minimizes absolute error. The derivative of $\sum_i|y_i-c|$ in $c$ is (number below $c$) minus (number above $c$), which is zero at the median. The mean minimizes squared error (the Gaussian case). Huber loss interpolates between the two but is not the Laplace NLL.
+    source: Murphy PML1 §11.6.1
+
+  - id: q8
+    prompt: |
+      A linear model with Gaussian noise has residuals $(1,-2,1,0)$ at its fitted weights. What is the MLE of the noise variance $\sigma^2$?
+    correct: '$1.5$'
+    wrong:
+      - '$2.0$'
+      - '$6.0$'
+      - '$1.22$'
+    explanation: |
+      $\hat\sigma^2=\mathrm{RSS}/N=(1+4+1+0)/4=1.5$, obtained from the $\sigma^2$-derivative of the Gaussian NLL exactly as for the univariate case. 2.0 divides by $N-1$, the unbiased-style correction, which is not the MLE. 6.0 is the RSS itself. 1.22 is $\hat\sigma=\sqrt{1.5}$, a standard deviation rather than a variance.
+    source: Murphy PML1 §4.2.7; Goodfellow DL §5.5.1
+
+  - id: q9
+    prompt: |
+      You fit a single Gaussian by maximum likelihood to data from two equal, tight clusters centred at $-3$ and $+3$ (each with spread 0.1). What do you get?
+    correct: Mean near 0, std near 3, covering both clusters and the gap
+    wrong:
+      - Mean near $+3$ or $-3$ with a small std, fitting one cluster
+      - Mean near 0 with a small std, sitting in the empty gap
+      - No MLE exists, because the data come from two clusters
+    explanation: |
+      The Gaussian MLE matches moments: mean $\approx0$, variance $\approx9+0.01$, so standard deviation $\approx3$. This is forward-KL behaviour: putting near-zero density on either cluster is penalized without limit, so the fit covers both and wastes mass in the gap. Locking onto one cluster is the mode-seeking behaviour of reverse KL. A unique MLE exists because the Gaussian is an exponential family.
+    source: Murphy PML1 §4.2.2, §4.2.5
+
+  - id: q10
+    prompt: |
+      Which statement is **false**?
+    correct: The Gaussian NLL is jointly convex in $(\mu,\sigma)$
+    wrong:
+      - The Bernoulli NLL is convex in the log-odds $\eta=\log\frac{p}{1-p}$
+      - The logistic-regression NLL is convex in its weight vector $w$
+      - An exponential-family MLE matches $\mathbb E[T]$ to the sample mean of $T$
+    explanation: |
+      In $\sigma$ alone, $N\log\sigma+S/(2\sigma^2)$ has second derivative $(3S-N\sigma^2)/\sigma^4<0$ for $\sigma^2>3S/N$, so it is not convex in $\sigma$. Convexity is guaranteed in the natural parameters $(\mu/\sigma^2,\,-1/(2\sigma^2))$. The Bernoulli log-odds is its natural parameter, and logistic regression composes it with a linear map, which preserves convexity.
+    source: Murphy PML1 §3.4.3, §12.4
+
+  - id: q11
+    prompt: |
+      In a ReLU network, multiplying a hidden unit's incoming weights by $c>0$ and its outgoing weights by $1/c$ leaves the function unchanged. What does this imply for maximum-likelihood training?
+    correct: Maximizers are not unique, so $\hat\theta\to\theta^*$ is undefined
+    wrong:
+      - The likelihood has no maximum, so training must diverge
+      - The MLE is pulled towards small weights by the symmetry
+      - The fitted predictive distribution is no longer unique
+    explanation: |
+      Every rescaling gives the same likelihood, so maximizers form a continuum. Parameter consistency needs identifiability, which fails here. All maximizers in such a family represent the same function, so the predictive distribution is unaffected. A flat direction does not make the likelihood unbounded. Plain MLE has no preference for small weights; that requires a prior or weight decay.
+    source: Goodfellow DL §5.5.2; Murphy PML1 §5.3.2
+
+  - id: q12
+    prompt: |
+      A coin gives 30 heads in 100 flips. Using the curvature of the log-likelihood at the MLE, what is the approximate standard error of $\hat p$?
+    correct: '$0.046$'
+    wrong:
+      - '$0.0021$'
+      - '$0.145$'
+      - '$0.21$'
+    explanation: |
+      The curvature at $\hat p$ is $n/(\hat p(1-\hat p))=476$, so the asymptotic variance is $1/476=0.0021$ and the standard error is $\sqrt{0.0021}\approx0.046$. 0.0021 is the variance, not its square root. 0.145 is the standard error for 3/10 heads, a tenth of the data. 0.21 is $\hat p(1-\hat p)$, the per-flip variance.
+    source: Murphy PML1 §4.7.2, §4.6.2
+
+  - id: q13
+    prompt: |
+      Unregularized logistic regression is trained by gradient descent on linearly separable data. What happens as training continues?
+    correct: $\|w\|$ grows without bound while the training NLL tends to 0
+    wrong:
+      - GD converges to a unique finite $w$, because the NLL is convex
+      - The NLL plateaus at $\log2$ per example, since classes are balanced
+      - $w$ shrinks towards 0, because the classes are already separated
+    explanation: |
+      On separable data, scaling any separating $w$ up makes every $\sigma(y_i w^\top x_i)$ closer to 1, so the likelihood keeps rising without reaching a maximum. Convexity guarantees that any minimizer is global, not that one exists. $\log 2$ per example is the loss at $w=0$, where training starts, not where it ends.
+    source: Bishop PRML §4.3.2
+
+cards:
+  - id: f1
+    front: Define the likelihood. Why do we maximize its log, and why often its average?
+    back: |
+      $L(\theta)=p(D\mid\theta)=\prod_ip(x_i\mid\theta)$, a function of $\theta$ with the data fixed (not a density over $\theta$).
+
+      The log is monotone, so the argmax is the same. It turns products into sums, gives per-example gradients and avoids underflow. Averaging by $1/N$ keeps the argmax but makes gradient sizes independent of $N$.
+    source: Murphy PML1 §4.2.1; Goodfellow DL §5.5
+
+  - id: f2
+    front: Gaussian MLE for $\mu$ and $\sigma^2$, and the bias of $\hat\sigma^2$.
+    back: |
+      $$\hat\mu=\bar x,\qquad\hat\sigma^2=\frac1N\sum_i(x_i-\bar x)^2$$
+
+      $\mathbb E[\hat\sigma^2]=\frac{N-1}N\sigma^2$: biased low because $\bar x$ is fitted to the same data. Dividing by $N-1$ removes the bias. The MLE is still consistent.
+    source: Murphy PML1 §4.2.5
+
+  - id: f3
+    front: Which loss is the NLL of each noise model? Gaussian, Laplace, Bernoulli, categorical, Poisson.
+    back: |
+      - Gaussian (fixed $\sigma$): squared error. Its noise MLE is $\hat\sigma^2=\mathrm{RSS}/N$.
+      - Laplace: absolute error (the median is the best constant).
+      - Bernoulli: binary cross-entropy.
+      - Categorical: softmax cross-entropy; next-token prediction is this.
+      - Poisson with $\lambda=e^f$: $\lambda-y\log\lambda$, the Poisson NLL.
+    source: Goodfellow DL §5.5.1; Murphy PML1 §11.6.1, §12.4
+
+  - id: f4
+    type: open
+    front: Show that maximum likelihood minimizes a KL divergence. Which direction, and what follows from it?
+    back: |
+      Let $\hat p$ be the empirical distribution. Average NLL $=\mathbb E_{\hat p}[-\log p_\theta]$. Expanding the divergence:
+
+      $$\mathrm{KL}(\hat p\|p_\theta)=-H(\hat p)+\mathbb E_{\hat p}[-\log p_\theta]$$
+
+      $H(\hat p)$ is constant in $\theta$, so argmin NLL $=$ argmin forward KL. For continuous data, use the large-$N$ version with $p_{\text{data}}$.
+
+      Consequences:
+      1. **Mass-covering**: $p_\theta\approx0$ where data exist is penalized without limit.
+      2. **Misspecification**: the MLE converges to the KL-closest member of the family.
+      3. NLL values can be negative for continuous densities; only differences on the same data mean anything.
+      4. Contrast reverse KL $\mathrm{KL}(p_\theta\|p)$, which is mode-seeking (variational inference).
+    source: Murphy PML1 §4.2.2; Goodfellow DL §5.5
+
+  - id: f5
+    type: open
+    front: Derive $\nabla A(\eta)=\mathbb E[T]$ and $\nabla^2A(\eta)=\mathrm{Cov}[T]$ for an exponential family, and state the consequences for maximum likelihood.
+    back: |
+      Start from $A(\eta)=\log\int h(x)e^{\eta^\top T(x)}dx$. Differentiate under the integral:
+
+      $$\nabla A=\frac{\int hTe^{\eta^\top T}}{\int he^{\eta^\top T}}=\mathbb E_\eta[T]$$
+
+      Differentiate $\mathbb E_\eta[T]=\int T\,h\,e^{\eta^\top T-A}dx$ again: the derivative of the exponent is $T-\nabla A$, so $\nabla^2A=\mathbb E[T(T-\mathbb E T)^\top]=\mathrm{Cov}[T]\succeq0$.
+
+      Consequences:
+      - The NLL $-\eta^\top\sum T(x_i)+NA(\eta)$ is convex in $\eta$.
+      - The stationarity condition is moment matching: $\mathbb E_{\hat\eta}[T]=\frac1N\sum_iT(x_i)$.
+      - With a canonical-link GLM ($\eta=w^\top x$), the gradient is $\sum_i(\mu_i-y_i)x_i$.
+      - Convexity holds in $\eta$ only; the Gaussian NLL is not convex in $\sigma$.
+    source: Murphy PML1 §3.4.3, §12.4
+
+  - id: f6
+    front: Why is the MLE invariant to reparameterization? Give an example.
+    back: |
+      For a bijection $\phi=g(\theta)$, the likelihood in $\phi$ is $L(g^{-1}(\phi))$: the same values at relabelled inputs, with no Jacobian because $L$ is not a density over $\theta$. So $\hat\phi=g(\hat\theta)$.
+
+      Example: 3/10 heads gives MLE of $p^2$ equal to $0.09$, and of the log-odds equal to $\log(3/7)$. MAP, a density mode, is not invariant.
+    source: Murphy PML2 §7.4.1.3
+
+  - id: f7
+    type: open
+    front: Derive the MLE of $\theta$ for $U(0,\theta)$, explain why calculus fails, and compute its bias.
+    back: |
+      $L(\theta)=\theta^{-n}$ if $\theta\ge\max_ix_i$, else 0, since a point beyond $\theta$ has density 0. $\theta^{-n}$ decreases, so $\hat\theta=\max_ix_i$.
+
+      $L'(\theta)=-n\theta^{-n-1}$ is never zero. The maximum sits on the boundary of the feasible set, where $L$ jumps.
+
+      Bias: $P(\hat\theta\le t)=(t/\theta)^n$, so $\hat\theta$ has density $nt^{n-1}/\theta^n$ and $\mathbb E[\hat\theta]=\frac n{n+1}\theta$. That is biased low, since the maximum never exceeds $\theta$. $\frac{n+1}n\max_ix_i$ is unbiased. The estimator is consistent, and its error shrinks like $1/n$.
+    source: Murphy PML1 §4.2.1
+
+  - id: f8
+    front: List five ways maximum likelihood fails, with a one-line reason each.
+    back: |
+      1. Zero counts: an unseen event gets probability 0, so the test NLL is infinite.
+      2. Separable logistic regression: $\|w\|\to\infty$, and no finite MLE exists.
+      3. Mixture singularities: a component collapses onto one point, so the likelihood goes to $+\infty$.
+      4. Too many parameters: $\hat\Sigma$ is singular for $N\le D$, and models interpolate noise.
+      5. Non-identifiability: label switching or weight-rescaling symmetries mean $\hat\theta$ is not unique.
+    source: Bishop PRML §9.2.1, §4.3.2; Murphy PML1 §4.2.6
+
+  - id: f9
+    front: MLE of a multivariate Gaussian's mean and covariance. When is $\hat\Sigma$ singular?
+    back: |
+      $$\hat\mu=\bar x,\qquad\hat\Sigma=\frac1N\sum_i(x_i-\bar x)(x_i-\bar x)^\top$$
+
+      Derived with the trace trick and $\nabla_\Lambda\log|\Lambda|=\Lambda^{-\top}$ on the precision $\Lambda$. The scatter matrix has rank at most $N-1$, so $\hat\Sigma$ is singular whenever $N\le D$.
+    source: Murphy PML1 §4.2.6
+
+  - id: f10
+    type: open
+    front: Derive the MLE of a categorical distribution with counts $N_1,\dots,N_K$.
+    back: |
+      Maximize $\sum_kN_k\log\theta_k$ subject to $\sum_k\theta_k=1$. Lagrangian:
+
+      $$\mathcal L=\sum_kN_k\log\theta_k+\lambda\Big(1-\sum_k\theta_k\Big)$$
+
+      $\partial\mathcal L/\partial\theta_k=N_k/\theta_k-\lambda=0$ gives $\theta_k=N_k/\lambda$. Summing and using the constraint gives $\lambda=\sum_kN_k=N$, so $\hat\theta_k=N_k/N$.
+
+      Positivity is automatic, because $\log\theta_k\to-\infty$ at 0. If $N_k=0$ then $\hat\theta_k=0$, which is the zero-count problem that smoothing fixes.
+    source: Murphy PML1 §4.2.4
+
+  - id: f11
+    front: Under what conditions is the MLE consistent, and what is its large-sample distribution?
+    back: |
+      Consistent if the true distribution is in the model family, $\theta^*$ is identifiable, and regularity conditions hold.
+
+      Asymptotically $\hat\theta\approx\mathcal N(\theta^*,(NF(\theta^*))^{-1})$ with Fisher information $F$. It is efficient: it attains the Cramér–Rao bound in the limit. For a coin, the standard error is $\sqrt{\hat p(1-\hat p)/N}$.
+    source: Goodfellow DL §5.5.2; Murphy PML1 §4.7.2
+
+reading:
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, §4.2 and §3.4"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: The worked MLEs (Bernoulli, categorical, Gaussian, MVN, linear regression), the KL justification, and the exponential family's cumulant property.
+  - title: "Goodfellow, Bengio & Courville, Deep Learning, §5.5"
+    url: https://www.deeplearningbook.org/contents/ml.html
+    kind: book
+    note: MLE as KL minimization, why any NLL is a cross-entropy, conditional likelihood and MSE, and the consistency conditions.
+  - title: "Bishop, Pattern Recognition and Machine Learning, §9.2.1 and §4.3.2"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: The two classic MLE pathologies, mixture singularities and separable logistic regression, with figures.
+  - title: "CS229 Lecture Notes, ch. 1 §1.3 and ch. 3 (GLMs)"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: Least squares as Gaussian MLE, and the exponential family and canonical-link GLMs.
+  - title: "Dive into Deep Learning, §22.7 Maximum Likelihood"
+    url: https://d2l.ai/chapter_appendix-mathematics-for-deep-learning/maximum-likelihood.html
+    kind: book
+    note: A gentle numerical walk-through, including optimizing the NLL by gradient descent and the continuous-variable subtlety.

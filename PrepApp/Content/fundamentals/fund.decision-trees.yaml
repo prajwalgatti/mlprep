@@ -1,0 +1,453 @@
+id: fund.decision-trees
+area: fundamentals
+title: Decision Trees
+summary: How CART grows a tree greedily, why it splits on Gini or entropy rather than error rate, how cost-complexity pruning picks the size, and what axis-aligned partitions can and cannot represent.
+order: 290
+level: core
+tags: [classical-ml, trees, cart, impurity, pruning]
+prereqs: [fund.bias-variance]
+
+explainer:
+  - title: "The problem: a predictor you can read as rules"
+    body: |
+      We want a model for tabular data that mixes numeric and categorical columns, needs no feature scaling, picks up interactions on its own, and can be read as a list of if–then rules. A linear model misses interactions unless you engineer them. k-NN needs a distance across mixed units and explains nothing.
+
+      **The model.** Split the input space into $M$ disjoint regions $R_1,\dots,R_M$ and predict a constant $c_m$ in each:
+
+      $$f(x)=\sum_{m=1}^{M}c_m\,\mathbb{1}\{x\in R_m\}$$
+
+      Arbitrary partitions are hard to search and to describe, so we restrict to **recursive binary splits on one feature at a time**. Each internal node asks "is $x_j\le s$?" and sends the point left if yes, right if no. Each leaf is one region. The path from root to leaf is a conjunction of conditions, i.e. a rule.
+
+      ![A 5-leaf tree fitted by CART (top) and its partition (bottom). Each leaf is an axis-aligned rectangle; the tree's paths are the rectangles' descriptions.](fund.decision-trees/tree-and-partition)
+
+      **The leaf value.** For regression with squared error, leaf $m$ minimises $\sum_{x_i\in R_m}(y_i-c)^2$ over $c$. Setting the derivative $-2\sum(y_i-c)$ to zero gives $c_m=\bar y_m$, the mean of the leaf's targets. For classification, a leaf stores its class proportions
+
+      $$\hat p_{mk}=\frac{1}{N_m}\sum_{x_i\in R_m}\mathbb{1}\{y_i=k\},$$
+
+      where $N_m$ is the number of training points in the leaf. It predicts the majority class $\arg\max_k\hat p_{mk}$, or reports $\hat p_{mk}$ as probabilities.
+    source: ESL §9.2.1–9.2.2 (eqs. 9.9–9.11); Murphy PML1 §18.1.1
+
+  - title: "Growing greedily: choosing one split"
+    body: |
+      Finding the best tree of a given size is NP-complete, so CART (classification and regression trees) grows the tree **greedily from the top**. At a node, try every feature $j$ and threshold $s$, define $R_1=\{x_j\le s\}$ and $R_2=\{x_j>s\}$, and pick the pair that minimises the children's total squared error:
+
+      $$\min_{j,s}\Big[\sum_{R_1}(y_i-\bar y_1)^2+\sum_{R_2}(y_i-\bar y_2)^2\Big]$$
+
+      The inner minimisation over the two constants is already solved: they are the child means $\bar y_1,\bar y_2$. Then recurse on each child until a stopping rule fires.
+
+      **Which thresholds?** Sort the node's values of $x_j$. Any $s$ strictly between two consecutive distinct values gives the same partition, so only those gaps (midpoints, say) are candidates.
+
+      **Scanning them fast.** The SSE of a set of $n$ targets needs only running sums:
+
+      $$\begin{aligned}\textstyle\sum(y-\bar y)^2&=\textstyle\sum y^2-2\bar y\sum y+n\bar y^2\\&=\textstyle\sum y^2-(\sum y)^2/n\end{aligned}$$
+
+      Sweep the threshold left to right, moving one point at a time from the right child to the left and updating $n$, $\sum y$ and $\sum y^2$ in $O(1)$. The sort dominates, so a node costs $O(pN\log N)$ for $p$ features and $N$ points.
+
+      **Worked example.** $x=1,\dots,6$ with $y=(2,4,3,9,11,7)$. The root has mean 6 and SSE 64. Splitting between $x=3$ and $x=4$ gives children $(2,4,3)$ with mean 3 and SSE $29-81/3=2$, and $(9,11,7)$ with mean 9 and SSE $251-729/3=8$. The total is 10, a reduction of 54. The next-best thresholds (between 2 and 3, or between 4 and 5) leave 37.
+    source: ESL §9.2.2 (eqs. 9.12–9.14); Murphy PML1 §18.1.2; SSBD §18.2.3
+
+  - title: "Impurity measures for classification"
+    body: |
+      For classes, replace the SSE by an **impurity** $Q$ of the node's class proportions $p_k$ (writing $p_k$ for $\hat p_{mk}$):
+      - misclassification error $1-\max_k p_k$
+      - Gini index $\sum_k p_k(1-p_k)=1-\sum_k p_k^2$
+      - entropy $-\sum_k p_k\log p_k$
+
+      With two classes and $p$ the share of class 1 these are $\min(p,1-p)$, $2p(1-p)$ and $-p\log p-(1-p)\log(1-p)$. All three are 0 for a pure node and largest at $p=\tfrac12$.
+
+      A split is scored by the **impurity decrease**, weighting each child by its share of the points, just as the SSE sums did:
+
+      $$\Delta=Q(\text{par})-\tfrac{N_L}{N}Q(L)-\tfrac{N_R}{N}Q(R)$$
+
+      With entropy, $\Delta$ is called the **information gain**. It equals the empirical mutual information between the split indicator and the label (see fund.information-theory).
+
+      **Two readings of Gini.**
+      1. *Random labelling.* Label each point in the node by drawing a class from $(p_k)$. The true label is $k$ with probability $p_k$, and the guess then misses with probability $1-p_k$. The expected error rate is $\sum_k p_k(1-p_k)$.
+      2. *Variance of one-hot targets.* The indicator $\mathbb{1}\{y=k\}$ is Bernoulli($p_k$) with variance $p_k(1-p_k)$. Summing over $k$ gives Gini. So $N\cdot\text{Gini}$ is the SSE of the node's one-hot label vectors around their mean $(p_k)$: a Gini tree is a regression tree on one-hot labels.
+
+      **Worked example.** A node with 8 positives and 2 negatives has misclassification $0.2$, Gini $1-0.8^2-0.2^2=0.32$, and entropy $-0.8\log_2 0.8-0.2\log_2 0.2\approx0.722$ bits.
+    source: ESL §9.2.3 (eq. 9.17 and the two Gini interpretations); SSBD §18.2.1; Murphy PML1 §18.1.2
+
+  - title: "Why grow with Gini or entropy, not error rate"
+    body: |
+      **ESL's example.** A parent has 400 of each class. Split A makes $(300,100)$ and $(100,300)$. Split B makes $(200,400)$ and $(200,0)$.
+      - Misclassification: both splits have weighted error $0.25$, a tie.
+      - Gini: A gives $0.375$. B gives $\tfrac{600}{800}\cdot\tfrac49+0=0.333$, so B wins.
+      - Entropy: A gives $0.811$ bits, B gives $0.75\times0.918=0.689$ bits, so B wins.
+
+      B creates a pure node, which is real progress, and only the smooth criteria see it.
+
+      **Why: the gain is a Jensen gap.** Let the children have class-1 shares $p_L,p_R$ and weights $w_L=N_L/N$, $w_R=N_R/N$. Counting class-1 points in both children shows the parent's share is their weighted average, $\bar p=w_Lp_L+w_Rp_R$. So
+
+      $$\Delta=Q(\bar p)-\big[w_LQ(p_L)+w_RQ(p_R)\big],$$
+
+      the height of the impurity curve at $\bar p$ minus the chord between the children. For any concave $Q$, Jensen's inequality gives $\Delta\ge0$, so no split raises impurity. Gini and entropy are **strictly** concave, so $\Delta>0$ whenever $p_L\ne p_R$. Misclassification is linear on each side of $\tfrac12$: if both children keep the parent's majority class, the chord lies on the curve and $\Delta=0$.
+
+      ![Top: the three impurities (entropy halved so all peak at 0.5). Bottom: one split's gain is the gap between curve and chord at $\bar p$; it vanishes for misclassification when both children stay on one side of $\tfrac12$.](fund.decision-trees/impurity-curves)
+
+      Example: $(8,2)\to(5,0)+(3,2)$ carves out a pure leaf, yet the error count stays at 2, so the misclassification gain is 0. The Gini gain is $0.32-0.5\times0.48=0.08$ and the entropy gain is $0.236$ bits. Grow with Gini or entropy. ESL notes that pruning often uses misclassification, since that is the loss we report.
+    source: ESL §9.2.3 (the (400,400) example, Fig. 9.3); SSBD §18.2.1
+
+  - title: "When to stop: cost-complexity pruning"
+    body: |
+      Grown until its leaves are pure, a tree fits the training set exactly (unless identical inputs carry different labels). A tree with $k$ leaves can shatter $k$ points, so unbounded trees have infinite VC dimension and very high variance.
+
+      **Pre-pruning** stops early: maximum depth, minimum samples per leaf, minimum impurity decrease. It is short-sighted, because a weak split can enable strong ones below it. On XOR data every single split has zero gain, so a "gain > 0" rule never splits, yet two levels classify perfectly.
+
+      **Post-pruning (CART).** Grow a large tree $T_0$ (say to a minimum node size of 5), then trade fit against size with
+
+      $$C_\alpha(T)=\sum_{m=1}^{|T|}N_mQ_m(T)+\alpha|T|$$
+
+      where $N_mQ_m$ is leaf $m$'s training loss (its SSE for regression), $|T|$ counts leaves, and $\alpha\ge0$ is the price of one leaf. $\alpha=0$ keeps $T_0$; large $\alpha$ leaves only the root.
+
+      **Weakest-link pruning.** For an internal node $t$, let $R(t)$ be its loss if collapsed into a leaf, and $R(T_t)$ the loss of the subtree below it, with $|T_t|$ leaves. Keeping the subtree costs $R(T_t)+\alpha|T_t|$; collapsing costs $R(t)+\alpha$. Collapsing wins once
+
+      $$\alpha\ge g(t)=\frac{R(t)-R(T_t)}{|T_t|-1},$$
+
+      the loss saved per extra leaf. Repeatedly collapse the node with the smallest $g(t)$. This gives a nested sequence of subtrees from $T_0$ down to the root, and ESL notes it contains the minimiser $T_\alpha$ for every $\alpha$.
+
+      **Choosing $\alpha$.** Use K-fold cross-validation over the $\alpha$ sequence. The **1-SE rule** takes the smallest tree whose CV error is within one standard error of the minimum.
+
+      ![10-fold CV error along a real pruning path (synthetic data, 15% label noise). The 1-SE rule picks a smaller tree than the minimum, at no visible cost.](fund.decision-trees/pruning-cv)
+
+      Convention: sklearn's `ccp_alpha` weights each leaf's impurity by $N_m/N$, so it equals ESL's $\alpha$ divided by $N$.
+    source: ESL §9.2.2 (eqs. 9.15–9.16), §9.2.5 (Fig. 9.4); SSBD §18.1, §18.2.2; Murphy PML1 §18.1.3
+
+  - title: "Categorical features, missing values, other splits"
+    body: |
+      **Categorical features.** With $q$ unordered levels, a binary split sends a subset of levels left. There are $2^q$ subsets, but a subset and its complement give the same split ($2^{q-1}$), and putting every level on one side is not a split. That leaves
+
+      $$2^{q-1}-1\ \text{candidate splits}$$
+
+      which is 511 for $q=10$ and about $5\times10^8$ for $q=30$.
+
+      **The sorting shortcut.** With a binary target, order the levels by their share of class 1 and treat the feature as ordered. Only $q-1$ splits remain, and the best of them is optimal among all $2^{q-1}-1$ for Gini or entropy. The same holds for regression with squared error, ordering by mean response. The proofs are not short (Breiman et al. 1984; Fisher 1958). No such shortcut exists for more than two classes.
+
+      **Many levels overfit.** The more partitions a feature offers, the likelier one of them fits noise, so greedy search favours such features. ESL advises avoiding them. C4.5 counters this with the gain ratio, which divides the information gain by the entropy of the split itself.
+
+      **Missing values.**
+      - Categorical feature: add "missing" as its own level. This also reveals whether missingness is informative.
+      - CART **surrogate splits**: after choosing the primary split using rows where that feature is present, rank splits on other features by how well they reproduce it. A point missing the primary feature follows the best available surrogate. This works through correlations between features.
+      - XGBoost learns a **default direction** for missing values at each node (fund.gradient-boosting).
+
+      **Other split shapes.** Multiway splits fragment the data quickly, and any multiway split can be built from binary ones, so binary is the default. Linear-combination splits $\sum_ja_jx_j\le s$ can follow a diagonal boundary, but they are hard to optimise and harder to read.
+    source: ESL §9.2.4; Murphy PML1 §18.1.4; Chen & Guestrin 2016 §3.4
+
+  - title: "What trees are good and bad at"
+    body: |
+      **Invariant to monotone feature transforms.** For strictly increasing $g$, $x_j\le s\iff g(x_j)\le g(s)$. The sort order is unchanged, so the candidate partitions, their impurities and hence the tree are the same, with thresholds mapped by $g$. So no standardisation is needed, a log transform changes nothing, and outliers in the *inputs* barely matter, since only ranks are used.
+
+      **Not rotation invariant.** A boundary that is diagonal in feature space must be approximated by a staircase of axis-aligned cuts:
+
+      ![CART on the boundary $x_2=x_1$ (dashed), trained on 400 noiseless points. More leaves give a finer staircase, but the boundary is never matched exactly.](fund.decision-trees/axis-aligned)
+
+      **Interactions yes, additivity no.** A leaf is a conjunction of conditions, so interactions come for free. Additive structure is awkward. For $Y=c_1\mathbb{1}\{X_1<t_1\}+c_2\mathbb{1}\{X_2<t_2\}+\varepsilon$, after a root split on $X_1$ the tree must split on $X_2$ at $t_2$ in **both** branches: 4 leaves for a function with 2 additive terms. With ten such terms it needs many lucky splits.
+
+      **Piecewise constant.** Predictions jump at thresholds, which costs accuracy when the true regression function is smooth. A regression tree cannot extrapolate: beyond the training range it predicts the mean of the boundary leaf.
+
+      **High variance.** A small change in the data can change the root split, and that change propagates through everything below it. Dropping a single point can visibly change the decision surface (PML1 Fig. 18.3). Averaging many trees fixes this (fund.bagging-random-forests).
+
+      **Mixed types and missing values** are handled natively (previous card), and prediction costs one root-to-leaf walk.
+    source: Murphy PML1 §18.1.5; ESL §9.2.4 (instability, lack of smoothness, additive structure)
+
+  - title: "Pitfalls and common wrong answers"
+    body: |
+      - *"Trees need standardised features."* False: splits depend only on the order of each feature's values.
+      - *"Information gain can be negative."* False for any concave impurity, misclassification included: $\Delta$ is a Jensen gap. It can be zero, which is why growth by error rate stalls.
+      - *"Gini and entropy give very different trees."* They are both strictly concave with similar shapes (see the impurity figure) and usually choose the same or similar splits. The criterion to avoid for growing is misclassification.
+      - *"Prune by training error."* Training error falls every time you add a leaf. Choose the size by cross-validation or a held-out set.
+      - *Leaf probabilities.* Leaves of a fully grown tree are pure, so their "probabilities" are 0 or 1, which is badly calibrated. A minimum leaf size or averaging over trees gives softer estimates.
+      - *Impurity-based feature importance* (MDI: the total weighted impurity decrease from all splits on a feature) is computed on training data. It favours features offering many thresholds, such as continuous or high-cardinality ones, even when they are noise. Prefer permutation importance on held-out data (fund.bagging-random-forests).
+      - *Names.* CART uses binary splits, Gini, cost-complexity pruning and surrogate splits. ID3 and C4.5 split categoricals multiway, use entropy or gain ratio, and can simplify the tree into rule sets. ESL writes Gini as $\sum_{k\ne k'}p_kp_{k'}$. This is the same quantity, because $\sum_{k'\ne k}p_{k'}=1-p_k$.
+    source: ESL §9.2.3–9.2.4; Murphy PML1 §18.1.5, §18.6.1
+
+  - title: "What interviewers probe"
+    body: |
+      - *How is a split chosen, and at what cost?* Exhaustive search over features and sorted thresholds, scoring the weighted child SSE or impurity. Running sums make the scan linear after an $O(N\log N)$ sort per feature.
+      - *Why not split on error rate?* Draw the chord. Gain is $Q(\bar p)$ minus the chord value, and it is zero for misclassification when both children keep the majority. Quote ESL's (400,400) example.
+      - *What is Gini, really?* The expected error of random labelling, and the variance of one-hot labels.
+      - *How do you stop overfitting?* Grow large, then do cost-complexity pruning. Derive $g(t)$, pick $\alpha$ by CV, and mention the 1-SE rule. Pre-pruning fails on XOR-like structure.
+      - *A categorical feature with 10,000 levels?* $2^{q-1}-1$ splits, sorting by target mean for binary targets, overfitting risk. Remedies: group rare levels, target-encode with out-of-fold means, or use gain ratio.
+      - *Why no scaling?* Invariance to monotone transforms.
+      - *Why are trees unstable, and what follows?* Top-split errors propagate down, which leads to bagging and random forests.
+      - *When would you not use a tree?* For smooth or additive targets, oblique boundaries, extrapolation, or when you need calibrated probabilities from a single model.
+    source: ESL §9.2; Murphy PML1 §18.1
+
+  - title: "Key results"
+    body: |
+      - Model $f(x)=\sum_mc_m\mathbb{1}\{x\in R_m\}$. Leaf value is the mean (regression) or class proportions (classification).
+      - Regression split: $\min_{j,s}\big[\mathrm{SSE}(R_1)+\mathrm{SSE}(R_2)\big]$, with $\mathrm{SSE}=\sum y^2-(\sum y)^2/n$.
+      - Impurities: $1-\max_kp_k$, $\ \sum_kp_k(1-p_k)$, $\ -\sum_kp_k\log p_k$.
+      - Gain $\Delta=Q(\bar p)-\sum_cw_cQ(p_c)\ge0$ by concavity, and $>0$ for strictly concave $Q$ when the children differ.
+      - Pruning $C_\alpha(T)=\sum_mN_mQ_m+\alpha|T|$. Weakest link $g(t)=\dfrac{R(t)-R(T_t)}{|T_t|-1}$.
+      - Categorical: $2^{q-1}-1$ splits, or $q-1$ after sorting for binary or squared-error targets.
+      - Invariant to monotone transforms of each feature; not to rotations.
+      - Node (8+, 2−): Gini 0.32, entropy 0.722 bits.
+    source: ESL §9.2.2–9.2.4; SSBD §18.2
+
+quiz:
+  - id: q1
+    prompt: |
+      A parent node has 5 positives and 5 negatives. A split produces children with (4+, 1−) and (1+, 4−). What is the decrease in Gini impurity?
+    correct: '$0.18$'
+    wrong:
+      - '$0.32$'
+      - '$0.30$'
+      - '$0.28$'
+    explanation: |
+      Parent Gini is $2\cdot0.5\cdot0.5=0.5$. Each child has $2\cdot0.8\cdot0.2=0.32$, and with equal weights the children average $0.32$, so the decrease is $0.5-0.32=0.18$. $0.32$ is the child impurity, not the decrease. $0.30$ is the drop in misclassification error ($0.5\to0.2$), and $0.28$ is the entropy gain in bits.
+    source: ESL §9.2.3 (eq. 9.17)
+
+  - id: q2
+    prompt: |
+      A node holds (8+, 2−). A candidate split produces (5+, 0−) and (3+, 2−). Which criterion assigns this split **zero** gain?
+    correct: Misclassification error
+    wrong:
+      - Gini index
+      - Entropy (information gain)
+      - Weighted squared error on one-hot labels
+    explanation: |
+      Before the split the majority rule makes 2 errors, and afterwards it still makes $0+2=2$, so the misclassification gain is 0. That happens because both children keep the parent's majority, so the chord lies on the piecewise-linear curve. Gini gains $0.32-0.5\cdot0.48=0.08$ and entropy gains about $0.236$ bits. The squared error on one-hot labels is $N\times$Gini, so its gain is positive too.
+    source: ESL §9.2.3; SSBD §18.2.1
+
+  - id: q3
+    prompt: |
+      Which step in the argument "the Gini decrease of any split is $\ge 0$" is the key one?
+    correct: The parent's share is the children's weighted mean, and Gini is concave
+    wrong:
+      - Each child has fewer points than the parent, so its impurity is smaller
+      - Gini is convex, so the average of the children lies above the parent
+      - Gini is bounded by $1/2$ for two classes, so the gain is bounded below
+    explanation: |
+      $\bar p=w_Lp_L+w_Rp_R$ (count class-1 points in both children), so $\Delta=Q(\bar p)-[w_LQ(p_L)+w_RQ(p_R)]$, which is $\ge0$ by Jensen for concave $Q$. Gini is concave, not convex. With a convex $Q$ the inequality would flip. Node size alone says nothing about impurity: a small child can be perfectly mixed.
+    source: ESL §9.2.3; SSBD §18.2.1
+
+  - id: q4
+    prompt: |
+      Regression tree, one feature: $x=1,\dots,6$ with $y=(2,4,3,9,11,7)$. Which split minimises the children's total SSE, and what is that SSE?
+    correct: Between $x=3$ and $x=4$; total SSE 10
+    wrong:
+      - Between $x=3$ and $x=4$; total SSE 54
+      - Between $x=4$ and $x=5$; total SSE 37
+      - Between $x=5$ and $x=6$; total SSE 2
+    explanation: |
+      Left $(2,4,3)$ has mean 3 and SSE 2. Right $(9,11,7)$ has mean 9 and SSE 8. The total is 10, down from the root's 64. 54 is the *reduction*, not the remaining SSE. The split between 4 and 5 leaves 37. Splitting off the last point leaves 62.8, since the left child of five points is far from pure.
+    source: ESL §9.2.2 (eqs. 9.13–9.14)
+
+  - id: q5
+    prompt: |
+      ![](fund.decision-trees/which-leaf)
+
+      In this tree, a point with $x_1=4$ and $x_2=1$ lands in which leaf?
+    correct: C
+    wrong:
+      - A
+      - D
+      - E
+    explanation: |
+      At the root, $x_1=4>3$, so go right. Then $x_2=1\le5$, so go left to the $x_1\le6$ node. $4\le6$, so the point lands in C. A is the trap of answering the $x_2\le2$ test, which only applies on the root's left branch.
+    source: ESL §9.2.1; Murphy PML1 §18.1.1
+
+  - id: q6
+    prompt: |
+      Which transformation of the inputs can change the partition of the training set that a CART tree learns?
+    correct: Rotating the feature space by 45°
+    wrong:
+      - Replacing $x_1$ by $\log x_1$ (all values positive)
+      - Standardising every feature to zero mean and unit variance
+      - Replacing $x_2$ by $x_2^3$
+    explanation: |
+      Splits test one feature at a time and depend only on the order of its values. A strictly increasing map of one feature (log, standardisation, cubing) keeps every order, so the same partitions are available with the same impurities. A rotation mixes features, so an axis-aligned boundary becomes diagonal and vice versa, which changes which axis-aligned cuts are best.
+    source: Murphy PML1 §18.1.5
+
+  - id: q7
+    prompt: |
+      Cost-complexity pruning. Internal node $t_1$ has $R(t_1)=20$ and its subtree has 4 leaves with total loss 8. Internal node $t_2$ has $R(t_2)=10$ and its subtree has 2 leaves with total loss 7. Which node does weakest-link pruning collapse first, and at what $\alpha$?
+    correct: '$t_2$, at $\alpha=3$'
+    wrong:
+      - '$t_1$, at $\alpha=4$'
+      - '$t_1$, at $\alpha=12$'
+      - '$t_2$, at $\alpha=1.5$'
+    explanation: |
+      $g(t)=\frac{R(t)-R(T_t)}{|T_t|-1}$. For $t_1$ this is $12/3=4$, and for $t_2$ it is $3/1=3$. The smallest $g$ is collapsed first, so $t_2$ goes at $\alpha=3$. $12$ forgets to divide by the number of leaves saved. $1.5$ divides by $|T_t|$ instead of $|T_t|-1$; collapsing two leaves into one saves only one leaf.
+    source: ESL §9.2.2 (eq. 9.16)
+
+  - id: q8
+    prompt: |
+      A binary-target dataset has a categorical feature with $q=5$ unordered levels. How many distinct binary splits on it exist, and how many must CART actually evaluate after sorting the levels by their share of positives?
+    correct: 15 exist; 4 need evaluating
+    wrong:
+      - 31 exist; 4 need evaluating
+      - 15 exist; 5 need evaluating
+      - 30 exist; 15 need evaluating
+    explanation: |
+      $2^{q-1}-1=15$: count the $2^5$ subsets, halve for complement symmetry, and drop the empty split. After ordering the levels by positive share, only the $q-1=4$ "cut points" between consecutive levels need checking, and one of them is optimal for Gini or entropy. 31 forgets the complement symmetry ($2^5-1$). 5 counts the levels rather than the gaps between them.
+    source: ESL §9.2.4
+
+  - id: q9
+    prompt: |
+      Data: $x\in[0,1]^2$ with label $y=\mathbb{1}\{x_1>0.5\}\oplus\mathbb{1}\{x_2>0.5\}$ (XOR), many points. You pre-prune with the rule "split only if the impurity decrease is positive". What tree do you get?
+    correct: 'A single leaf: no first split reduces impurity'
+    wrong:
+      - The 4-leaf tree that classifies perfectly
+      - A 2-leaf tree split at $x_1=0.5$ or $x_2=0.5$
+      - A deep tree that keeps splitting on noise
+    explanation: |
+      Any single axis-aligned split leaves both children about 50/50, because each feature alone carries no information about XOR, so the gain is about 0 and the rule refuses to split. Two levels of splits would classify perfectly. That is why CART grows a large tree and prunes back rather than stopping on local gain.
+    source: Murphy PML1 §18.1.3; ESL §9.2.2
+
+  - id: q10
+    prompt: |
+      The target is $Y=c_1\mathbb{1}\{X_1<t_1\}+c_2\mathbb{1}\{X_2<t_2\}$ with $c_1,c_2\ne0$, no noise, and enough data. What is the fewest leaves a tree needs to represent it exactly?
+    correct: '4'
+    wrong:
+      - '2'
+      - '3'
+      - '8'
+    explanation: |
+      $Y$ takes up to four distinct values, one per combination of the two indicators, so at least 4 leaves are needed. After a root split on $X_1$, both branches need their own split on $X_2$ at $t_2$, and that gives exactly 4. An additive model needs only 2 terms. 3 leaves would split $X_2$ in only one branch, missing the $c_2$ effect on the other side.
+    source: ESL §9.2.4 ("Difficulty in capturing additive structure")
+
+  - id: q11
+    prompt: |
+      A fully grown regression tree is trained on $x\in[0,10]$ with $y=2x$ (no noise, dense data). What does it predict at $x=20$?
+    correct: About 20, the value at the training edge
+    wrong:
+      - About 40, continuing the linear trend
+      - About 10, the mean of all training targets
+      - 'No prediction: $x=20$ lies in no leaf'
+    explanation: |
+      The region beyond the largest threshold is the rightmost leaf, which extends to $+\infty$ and predicts its mean, about $2\times10=20$ for a fully grown tree. Trees are piecewise constant and cannot extrapolate a trend. Every input falls in exactly one leaf, because the partition covers the whole space.
+    source: ESL §9.2.1–9.2.2; Murphy PML1 §18.1.1
+
+  - id: q12
+    prompt: |
+      Which statement about growing classification trees is **false**?
+    correct: Gini and entropy usually yield very different trees, so the choice matters a lot
+    wrong:
+      - Misclassification error is often used to prune trees grown with Gini
+      - Weighted impurity decrease is never negative for Gini, entropy or misclassification
+      - A Gini tree equals a regression tree fitted to one-hot label vectors
+    explanation: |
+      Gini and entropy are both strictly concave with similar shapes and usually agree on splits. The real distinction is with misclassification error, which is fine for pruning but poor for growing. The three distractors are true: concavity gives $\Delta\ge0$ for all three criteria, and $N\cdot$Gini is the SSE of one-hot labels around their mean.
+    source: ESL §9.2.3
+
+  - id: q13
+    prompt: |
+      You add a column of random unique row IDs (continuous, no relation to $y$) to a dataset and fit a deep tree. Its impurity-decrease (MDI) importance comes out well above zero. Why?
+    correct: Its $N-1$ thresholds let some split fit training labels by chance, and MDI is measured in-sample
+    wrong:
+      - Trees standardise every feature internally, which turns the random IDs into a usable signal
+      - MDI is computed on held-out data, where the ID values leak information about row order
+      - The ID column must correlate with $y$, since MDI only rewards features carrying real signal
+    explanation: |
+      A feature with many distinct values offers many candidate partitions, and deep in the tree some of them reduce training impurity purely by chance. MDI sums those in-sample decreases. Permutation importance on held-out data would give about zero. Trees do no internal scaling. MDI is computed during training, not on held-out data. And MDI does reward chance fits: the IDs were random, so their gain is pure noise.
+    source: ESL §9.2.4; Murphy PML1 §18.6.1
+
+cards:
+  - id: f1
+    front: Write the three node-impurity measures for class proportions $p_k$, and their two-class forms.
+    back: |
+      - Misclassification $1-\max_kp_k$, i.e. $\min(p,1-p)$
+      - Gini $\sum_kp_k(1-p_k)$, i.e. $2p(1-p)$
+      - Entropy $-\sum_kp_k\log p_k$, i.e. $-p\log p-(1-p)\log(1-p)$
+
+      A split is scored by the decrease $Q(\text{parent})-\sum_c\frac{N_c}{N}Q(c)$.
+    source: ESL §9.2.3 (eq. 9.17)
+
+  - id: f2
+    front: Give the two interpretations of the Gini index.
+    back: |
+      1. The expected error rate if each point is labelled randomly from the node's class distribution: $\sum_kp_k(1-p_k)$.
+      2. The sum over classes of the variance of the one-hot indicator $\mathbb{1}\{y=k\}$, which is Bernoulli($p_k$). So $N\cdot$Gini is the SSE of one-hot labels in the node.
+    source: ESL §9.2.3
+
+  - id: f3
+    front: State the cost-complexity criterion and the weakest-link value $g(t)$.
+    back: |
+      $$C_\alpha(T)=\sum_{m=1}^{|T|}N_mQ_m(T)+\alpha|T|$$
+
+      $$g(t)=\frac{R(t)-R(T_t)}{|T_t|-1}$$
+
+      Collapse the internal node with the smallest $g$ and repeat. This gives a nested sequence of subtrees. Choose $\alpha$ by CV, often with the 1-SE rule.
+    source: ESL §9.2.2 (eqs. 9.15–9.16)
+
+  - id: f4
+    front: How many binary splits does a categorical feature with $q$ levels have, and when can CART avoid searching them all?
+    back: |
+      $2^{q-1}-1$. For a binary target (Gini or entropy) or a squared-error regression target, sort the levels by positive share or mean response. Then the best of the $q-1$ ordered splits is optimal. There is no such shortcut for $K>2$ classes.
+    source: ESL §9.2.4
+
+  - id: f5
+    front: Why is a decision tree invariant to monotone transforms of a feature but not to rotations?
+    back: |
+      A split $x_j\le s$ depends only on the order of the values of $x_j$, and a strictly increasing $g$ preserves it: $x_j\le s\iff g(x_j)\le g(s)$. So the candidate partitions and their scores are unchanged. A rotation mixes features, which turns axis-aligned structure into oblique structure that needs a staircase of cuts.
+    source: Murphy PML1 §18.1.5
+
+  - id: f6
+    front: How does CART find the best threshold on one numeric feature in a node of $N$ points, and at what cost?
+    back: |
+      Sort the node's values ($O(N\log N)$). Sweep the threshold through the gaps, moving one point at a time between children while updating $n$, $\sum y$ and $\sum y^2$. Each child's $\mathrm{SSE}=\sum y^2-(\sum y)^2/n$ is then $O(1)$ per candidate. Over $p$ features a node costs $O(pN\log N)$.
+    source: ESL §9.2.2; SSBD §18.2.3
+
+  - id: f7
+    type: open
+    front: Explain to an interviewer why trees are grown with Gini or entropy rather than misclassification error.
+    back: |
+      1. **Setup:** children with class-1 shares $p_L,p_R$ and weights $w_L,w_R$. The parent's share is $\bar p=w_Lp_L+w_Rp_R$.
+      2. **Gain as a Jensen gap:** $\Delta=Q(\bar p)-w_LQ(p_L)-w_RQ(p_R)$, the curve minus the chord at $\bar p$.
+      3. **Concavity:** for any concave $Q$, $\Delta\ge0$. Gini and entropy are strictly concave, so any split that changes the class mix scores $>0$.
+      4. **Misclassification** $\min(p,1-p)$ is linear on each side of $\tfrac12$. If both children keep the majority class, $\Delta=0$ even when one child is pure.
+      5. **Example (ESL):** (400,400) into (300,100)+(100,300) vs (200,400)+(200,0). Both have error 0.25, but Gini (0.375 vs 0.333) and entropy (0.811 vs 0.689 bits) prefer the second, which has a pure node.
+      6. **Practice:** grow with Gini or entropy (they rarely disagree). Prune with whatever loss you report, often error rate.
+    source: ESL §9.2.3; SSBD §18.2.1
+
+  - id: f8
+    type: open
+    front: Walk through how CART builds a tree end to end, including how its size is chosen.
+    back: |
+      1. **Greedy growth:** at each node, for every feature, sort the values and scan the thresholds, scoring the weighted child SSE (regression) or Gini/entropy (classification). Take the best $(j,s)$ and recurse. Cost: $O(pN\log N)$ per node.
+      2. **Grow large:** stop only at a small minimum node size, because early stopping is myopic (XOR).
+      3. **Prune:** $C_\alpha(T)=\sum_mN_mQ_m+\alpha|T|$. Weakest-link pruning collapses the node with the smallest $g(t)=\frac{R(t)-R(T_t)}{|T_t|-1}$, which gives a nested sequence of subtrees.
+      4. **Select $\alpha$:** K-fold CV over the sequence, plus the 1-SE rule for a smaller tree.
+      5. **Leaves:** the mean, or the class proportions.
+      6. **Extras:** surrogate splits for missing values, and sorting categorical levels by target mean.
+    source: ESL §9.2.2–9.2.4
+
+  - id: f9
+    type: open
+    front: Why do decision trees have high variance, and what are the standard remedies?
+    back: |
+      - **Mechanism:** splits are chosen greedily and hierarchically. A small perturbation can flip which feature wins at the root, and every split below is conditioned on that choice, so the error propagates. Fully grown trees also fit noise: they have low bias and high variance.
+      - **Evidence:** dropping a single point can visibly change the decision surface (PML1 Fig. 18.3).
+      - **Remedies within one tree:** cost-complexity pruning with CV, a minimum leaf size, a maximum depth. These trade variance for bias.
+      - **Remedies across trees:** bagging averages trees grown on bootstrap samples, so variance falls and bias stays roughly the same. Random forests also subsample features per split to decorrelate the trees. Boosting instead builds shallow trees sequentially to reduce bias.
+      - **Cost:** the ensemble loses the single tree's readable rules.
+    source: ESL §9.2.4 (instability); Murphy PML1 §18.1.5
+
+  - id: f10
+    type: open
+    front: "Interview: a categorical feature has 10,000 levels (e.g. ZIP code). How do trees handle it, and what can go wrong?"
+    back: |
+      - **Search space:** $2^{q-1}-1$ binary partitions, which is infeasible to enumerate. For a binary or squared-error target, sorting the levels by target mean reduces this to $q-1$ ordered cut points, and one of them is optimal.
+      - **What goes wrong:** so many candidate partitions means one fits noise, so the feature gets chosen too often and overfits (ESL). It also inflates MDI importance. Rare levels have tiny counts, so their means are noisy.
+      - **Fixes:** merge rare levels, encode with *out-of-fold* target means (in-fold means leak the label), use hashing or embeddings, add a minimum leaf size, or penalise many-way splits (C4.5's gain ratio). Validate with held-out data, not training gain.
+    source: ESL §9.2.4
+
+reading:
+  - title: "The Elements of Statistical Learning, §9.2 Tree-Based Methods"
+    url: https://hastie.su.domains/ElemStatLearn/
+    kind: book
+    note: The CART reference. Regression and classification trees, cost-complexity pruning, the (400,400) example, categorical predictors, surrogate splits, instability.
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, §18.1 CART"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: Concise modern treatment with the pros and cons list and a demo of single-point instability.
+  - title: "Shalev-Shwartz & Ben-David, Understanding Machine Learning, ch. 18"
+    url: https://www.cs.huji.ac.il/~shais/UnderstandingMachineLearning/
+    kind: book
+    note: The learning-theory view. Why unbounded trees overfit (infinite VC dimension), an MDL bound, ID3 and gain measures as concave upper bounds on error.
+  - title: "scikit-learn User Guide: Decision Trees"
+    url: https://scikit-learn.org/stable/modules/tree.html
+    kind: docs
+    note: Practical details of the CART implementation, including the exact impurity formulas and minimal cost-complexity pruning (`ccp_alpha`).

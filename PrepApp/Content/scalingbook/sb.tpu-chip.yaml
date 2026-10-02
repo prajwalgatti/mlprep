@@ -1,0 +1,419 @@
+id: sb.tpu-chip
+area: scalingbook
+title: "TPUs I: Inside the Chip"
+summary: What a TPU is made of (MXU systolic arrays, the VPU, VMEM and HBM), where its 2e14 FLOPs/s come from, why shapes must be multiples of 128, how VMEM lowers the roofline ridge, and the latency floor for sampling.
+order: 30
+level: core
+tags: [scaling-book, tpu, hardware, systolic-array, roofline]
+prereqs: [sb.roofline-matmul]
+
+explainer:
+  - title: What a TPU is
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    body: |
+      The previous lessons treated a chip as two numbers, peak FLOPs/s and HBM bandwidth. This lesson opens the box, because the internals explain several rules we will keep using.
+
+      A TPU chip is, at heart, a compute core specialized for matrix multiplication, called the **TensorCore**, attached to a stack of fast memory, **HBM**.
+
+      ![One TPU chip: a TensorCore with matrix units (MXUs), a vector unit (VPU), a scalar control unit and VMEM scratchpad, next to HBM](sb.tpu-chip/chip-diagram)
+
+      Inside the TensorCore:
+
+      - **MXU** (matrix multiply unit): a systolic array that does nearly all the FLOPs. Most TensorCores have 2 or 4 of them.
+      - **VPU** (vector processing unit): elementwise work such as ReLU, additions, and reductions (sums).
+      - **VMEM** (vector memory): an on-chip scratchpad, 128 MiB on a v5e. It is far smaller than HBM but much faster to reach from the compute units. Unlike a CPU cache it is managed explicitly by the compiler or programmer.
+      - A **scalar unit** with its own small memory (SMEM) that issues instructions and memory copies.
+
+      **HBM** holds the model's tensors: 16 GiB on a v5e, 96 GB on a v5p, with 0.8–2.8 TB/s of bandwidth to the TensorCore.
+
+      Nothing computes directly on HBM. Data is copied from HBM into VMEM, from VMEM into vector registers (VREGs), then into the MXU or VPU, and results travel back the same way.
+  - title: The systolic array
+    source: Scaling Book ch. 2 (TPUs) App. B §"How does a systolic array work?"; Scaling Book ch. 2 §"What Is a TPU?"; Jouppi et al. 2017 §2
+    body: |
+      The MXU is a $128 \times 128$ grid of multiply-accumulate (MAC) cells ($256\times256$ on TPU v6e). It works **weight-stationary**:
+
+      1. A $128\times128$ block of weights is loaded into the grid, one weight per cell.
+      2. Activations stream in from the left, skewed so each row starts one step after the previous.
+      3. Each cycle, each cell multiplies the activation passing through by its weight, adds the partial sum arriving from above, passes the sum down and the activation right.
+      4. Finished dot products leave the bottom edge.
+
+      ![Weight-stationary systolic array. Weights stay put; each cycle activations step one cell right and partial sums one cell down. Inputs are skewed: $x^{(k)}_r$ (feature $r$ of token $k$) enters row $r$ $r$ cycles after row 0 starts.](sb.tpu-chip/systolic)
+
+      **Throughput.** When full, every cell does one MAC (2 FLOPs) per cycle: $2 \times 128^2 = 32768$ FLOPs/cycle. The book states it as one $\text{bf16}[8,128] \cdot \text{bf16}[128,128] \to \text{f32}[8,128]$ product every 8 cycles, which is the same $2\cdot8\cdot128\cdot128/8$. At a 1.5 GHz clock:
+
+      $$32768 \times 1.5\times10^9 \approx 4.9\times10^{13} \ \text{FLOPs/s per MXU}.$$
+
+      A v5e TensorCore has 4 MXUs, giving $\approx 1.97\times10^{14}$ FLOPs/s, the peak from lesson 1.
+
+      **Why it is efficient.** Each weight is fetched once and reused by every activation row that streams past. Values only ever move to a neighbouring cell, so there is little data movement per operation; Jouppi et al. (2017) describe this as avoiding repeated register reads and writes. Matmul does $O(n^3)$ work on $O(n^2)$ data, and the array is built to exploit exactly that reuse.
+  - title: "Filling the array: shapes and precision"
+    source: Scaling Book ch. 2 (TPUs) §"Key Takeaways"; Scaling Book ch. 2 App. B
+    body: |
+      A systolic array only reaches peak when it is full and kept full.
+
+      **Pipeline bubble.** At the start, weights and activations enter diagonally, so for a while only part of the grid has work. After that, new weight and activation blocks can be fed in without further bubbles, so long matmuls amortize the startup.
+
+      **Pad to 128.** A dimension smaller than the array's side leaves cells idle. Weight matrices should be at least 128 in both dimensions (256 on v6e); smaller axes are padded to 128. With several MXUs, tiled dimensions should be at least 128 × the number of MXUs.
+
+      **Worked example.** A matmul whose contracted dimension is 64 fills only 64 of the 128 rows of each MXU, so it can reach at most 50% of peak, however large the batch.
+
+      **v6e's larger array.** Going from $128\times128$ to $256\times256$ quadruples MACs per cycle. The price is that matrices need dimensions of 256 or more to use it fully.
+
+      **Lower precision is faster.** Generations that support it run int8 at about 2× and int4 at about 4× the bf16 rate (v5e: $3.94\times10^{14}$ int8 OPs/s). The VPU, however, computes in fp32.
+  - title: "Pipelining: HBM → VMEM → MXU"
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    body: |
+      To compute $X \cdot A \to Y$, the TPU never loads all of $X$ and $A$ before starting. Instead:
+
+      1. Copy a chunk of $A$ and a chunk of $X$ from HBM into VMEM.
+      2. Feed them through the MXU in $8\times128$ (activation) and $128\times128$ (weight) pieces.
+      3. Copy finished pieces of $Y$ back to HBM.
+
+      These stages are **pipelined**: while the MXU works on one chunk, the next chunk is already being copied in and the previous result copied out. For a matmul, the order is arranged so each weight chunk is used against many activation chunks before being replaced.
+
+      Elementwise ops work the same way, but stream through the VPU instead of the MXU.
+
+      This pipelining is why the roofline uses $\max(T_\text{math}, T_\text{comms})$ rather than the sum: copies and compute genuinely run at the same time. It also shows what "bandwidth-bound" means physically. If the HBM → VMEM copy of the next chunk takes longer than the MXU's work on the current one, the MXU sits idle waiting. We are **starving** the MXU.
+
+      So a TPU's performance comes down to a short chain: the HBM → VMEM link, the VMEM → MXU link, and MXUs worth about $2\times10^{14}$ FLOPs/s on a v5e. Whichever stage of that chain is slowest for a given op sets its speed.
+  - title: "VMEM: a faster memory with a lower ridge"
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?", Question 4
+    body: |
+      VMEM's bandwidth to the MXU is about 22× the HBM bandwidth. By the roofline argument, the ridge drops by the same factor: on a v5e, $240/22 \approx 11$ FLOPs/byte, or 10–20 in practice. A matmul whose weights already sit in VMEM can be compute-bound at a batch of 10–20 tokens instead of 240.
+
+      **Worked example** (book Q4). int8 weights $[4096, 16384]$ times int8 activations $[B, 4096]$ on a v5e ($3.94\times10^{14}$ int8 OPs/s):
+
+      $$\begin{aligned} T_\text{math} &= \frac{2\cdot4096\cdot16384\,B}{3.94\times10^{14}} \\ T_\text{comms} &= \frac{6.7\times10^{7} + 20480\,B}{W}. \end{aligned}$$
+
+      The $6.7\times10^7$ bytes are the weights; each token adds $4096$ input and $16384$ output bytes. Setting the two equal:
+
+      - From HBM ($W = 8.2\times10^{11}$): $B \approx 260$. The book quotes 267 after rounding $2DF$ down to $1.3\times10^8$.
+      - From VMEM ($W \approx 1.8\times10^{13}$): $B \approx 11$; nearer 20 in practice, since not all VMEM bandwidth can go to one weight matrix.
+
+      ![Time of the int8 matmul vs batch: compute time crosses HBM-load time near B ≈ 260 but VMEM-load time near B ≈ 11](sb.tpu-chip/vmem-vs-hbm)
+
+      The catch is size: 128 MiB holds little of a large model. A common trick is **prefetching**: load the next feed-forward block's weights into VMEM while attention is running, hiding that load if a layer's weights fit.
+  - title: Cores per chip, and the spec sheet
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?", §"TPU specs"
+    body: |
+      **Cores.** Training chips from TPU v4 onwards (v4, v5p) have two TensorCores that share HBM and act as one larger device with twice the FLOPs, the **megacore** configuration. A v5p's $4.59\times10^{14}$ FLOPs/s is two cores of about $2.3\times10^{14}$. TPU v3 and older chips had separate memories per core and counted as two devices. Inference chips such as the v5e have a single core per chip. TPU7x drops megacore in favour of a fast link between its two cores.
+
+      **Chip specs** from the book (HBM capacity; HBM bandwidth; bf16 and int8 peak; bf16 ridge $C/W$):
+
+      - v3: 32 GB; 9.0e11 B/s; 1.4e14 / 1.4e14; ridge ≈ 156
+      - v4p: 32 GB; 1.2e12; 2.75e14 / 2.75e14; ≈ 229
+      - v5p: 96 GB; 2.8e12; 4.59e14 / 9.18e14; ≈ 164
+      - v5e: 16 GiB; 8.2e11; 1.97e14 / 3.94e14; ≈ 240
+      - v6e: 32 GB; 1.6e12; 9.2e14 / 1.84e15; ≈ 575
+      - TPU7x: 192 GB; 7.4e12; 2.3e15 / 4.61e15; ≈ 311
+
+      Two patterns are worth noticing. The v5e is the cheap inference chip: little HBM, modest FLOPs. And the ridge is not fixed across generations; it climbs whenever FLOPs grow faster than memory bandwidth, so newer chips often need larger batches to stay compute-bound.
+  - title: "Worked example: the latency floor for sampling"
+    source: Scaling Book ch. 2 (TPUs), Question 1
+    body: |
+      When generating text, each new token requires a full forward pass, and that pass must read every parameter from HBM into the MXU at least once. At small batch the matmuls are bandwidth-bound (lesson 2), so the time to stream the weights is a hard floor on per-token latency.
+
+      **Book example.** A 200B-parameter model in bf16 is $400\times10^9$ bytes. Split evenly over 32 TPU v4p chips, each holds $12.5\times10^9$ bytes. At $1.2\times10^{12}$ B/s per chip:
+
+      $$T \ge \frac{12.5\times10^{9}}{1.2\times10^{12}} \approx 10 \ \text{ms per step}.$$
+
+      **Same idea, different setup.** A 70B model with int8 weights (70 GB) on 8 TPU v5e: $8.75\times10^9$ bytes per chip, $8.75\times10^9 / 8.2\times10^{11} \approx 11$ ms per step. Note it would not fit at all in bf16: $17.5\times10^9$ bytes per chip exceeds the v5e's 16 GiB ($1.72\times10^{10}$ bytes).
+
+      Why this is a good estimate and not just a bound: at small batch sizes real systems get close to it. The two ways to beat it are fewer bytes (quantization) or more chips sharing the load, so each streams a smaller slice. Chapter 7 adds the KV cache to this picture.
+  - title: The VPU and the scalar core
+    source: Scaling Book ch. 2 (TPUs) App. A §"VPU", §"Scalar Core"
+    body: |
+      **VPU.** A 2D SIMD (single instruction, multiple data) unit of shape $(8, 128)$: 128 **lanes** by 8 **sublanes**. Each (lane, sublane) position has 4 independent ALUs on a v5p, and most instructions take one cycle per ALU. Operands live in **VREGs**: 64 registers per v5p core, each $8\times128$ 32-bit values (4 KiB), so 256 KiB per core.
+
+      **Worked example.** VPU throughput on a v5p at 1.75 GHz:
+
+      $$8 \times 128 \times 4 \times 1.75\times10^9 \approx 7.2\times10^{12} \ \text{FLOPs/s}.$$
+
+      That is about 32× less than the $\approx 2.3\times10^{14}$ of the same core's MXUs. Anything that cannot be phrased as a matmul runs about 30× slower.
+
+      **Reductions.** Summing along the sublane axis (size 8) is cheap: a shuffle rolls values by 4, 2 and 1, with an add after each. Reducing across lanes needs a separate, slow unit, the **XLU** (cross-lane unit). Layouts that put the reduced axis on lanes are expensive.
+
+      **Scalar core.** It fetches and dispatches all instructions and issues the DMA (direct memory access) copies from HBM into VMEM. It is single-threaded, so each core can start only one DMA per cycle. One scalar core controls a VPU of 4096 ALUs ($8\times128\times4$), 4 MXUs, 2 XLUs and several DMA engines. Very little control per unit of compute is part of why TPUs are cheap and efficient, and also why data-dependent, irregular computation is awkward on them.
+  - title: What interviewers probe
+    source: Scaling Book ch. 2 (TPUs)
+    body: |
+      - *Where do a TPU's FLOPs come from?* MXUs: $128\times128$ systolic arrays doing one MAC per cell per cycle. $2\cdot128^2\cdot1.5$ GHz ≈ $4.9\times10^{13}$ per MXU; 4 per v5e core → $1.97\times10^{14}$.
+      - *How does a systolic array work, and why is it efficient?* Weights stay in cells; activations flow right, partial sums flow down; each operand is fetched once and reused across the array, moving only between neighbours.
+      - *Why pad to 128?* Smaller dimensions leave rows or columns of the array idle; a 64-wide contraction caps you at 50%.
+      - *What is VMEM for?* A programmer-managed scratchpad about 22× faster than HBM, which drops the ridge to ≈ 10–20. Useful for prefetching weights and for low-intensity kernels, if the data fits.
+      - *What's a lower bound on decode latency?* Parameter bytes per chip divided by HBM bandwidth: ≈ 10 ms for 200B bf16 on 32 v4p.
+      - *What runs on the VPU, and how fast?* Elementwise ops and reductions, at ≈ 30× below MXU throughput; cross-lane reductions are especially slow.
+      - *What is megacore?* Two TensorCores sharing HBM, treated as one device (v4, v5p).
+  - title: Key results
+    source: Scaling Book ch. 2 (TPUs)
+    body: |
+      $$\text{MXU: } 2\cdot128^2 = 32768 \ \text{FLOPs/cycle}$$
+
+      $$1.5\,\text{GHz} \times 4 \ \text{MXUs} \Rightarrow 1.97\times10^{14} \ \text{FLOPs/s (v5e)}$$
+
+      $$T_\text{step} \ge \frac{\text{param bytes per chip}}{W_\text{hbm}}$$
+
+      - TensorCore = MXUs (matmul) + VPU (elementwise, fp32) + VMEM (128 MiB on v5e) + scalar unit; HBM beside it.
+      - Pad matrix dims to ≥ 128 (≥ 256 on v6e). int8 ≈ 2×, int4 ≈ 4× bf16 throughput where supported.
+      - VMEM ≈ 22× HBM bandwidth → ridge ≈ 11 (10–20 in practice).
+      - VPU (v5p): $8\times128$ lanes × 4 ALUs ≈ $7\times10^{12}$ FLOPs/s per core, ≈ 30× below the MXUs.
+      - Megacore: v4/v5p chips = 2 cores sharing HBM; v5e = 1 core.
+      - Ridges (bf16/HBM): v5e 240, v5p 164, v6e 575, v4p 229.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?", App. B
+    prompt: |
+      An MXU is a $128\times128$ systolic array in which every cell completes one multiply-accumulate per cycle. At a 1.5 GHz clock, what is its peak throughput?
+    correct: About $4.9\times10^{13}$ FLOPs/s
+    wrong:
+      - About $2.5\times10^{13}$ FLOPs/s
+      - About $1.97\times10^{14}$ FLOPs/s
+      - About $1.5\times10^{12}$ FLOPs/s
+    explanation: |
+      $128^2 = 16384$ MACs per cycle × 2 FLOPs per MAC × $1.5\times10^9$ cycles/s $\approx 4.9\times10^{13}$. Counting a MAC as one FLOP gives $2.5\times10^{13}$. $1.97\times10^{14}$ is a whole v5e TensorCore with four MXUs.
+  - id: q2
+    source: Scaling Book ch. 2 (TPUs) App. B; Scaling Book ch. 2 §"Key Takeaways"
+    prompt: |
+      TPU v6e moves from $128\times128$ to $256\times256$ systolic arrays. Which consequence follows?
+    correct: 4× MACs per cycle, but dims must be ≥ 256 to fill it
+    wrong:
+      - 2× MACs per cycle, with no change to padding needs
+      - 4× MACs per cycle, and small matrices get more efficient
+      - Same MACs per cycle, but lower latency per matmul
+    explanation: |
+      The cell count grows from $128^2$ to $256^2$, a factor of 4. A larger array is harder to fill: a dimension below 256 leaves cells idle, so tensors need to be twice as large in each dimension to use it fully.
+  - id: q3
+    source: Scaling Book ch. 2 (TPUs) §"Key Takeaways"
+    prompt: |
+      A bf16 matmul has a contracted dimension of only 64, and runs on a TPU with $128\times128$ MXUs. Even with a huge batch, what is the best fraction of peak it can reach?
+    correct: About 50%
+    wrong:
+      - About 100%, once the batch is large enough
+      - About 25%
+      - About 12.5%
+    explanation: |
+      The contracted dimension maps onto one side of the array, so only 64 of its 128 rows of cells hold weights; the dimension is padded to 128 and half the MACs are wasted. Batch size fills the streaming direction, not the idle rows. 25% would apply if both array dimensions were half empty.
+  - id: q5
+    source: Scaling Book ch. 2 (TPUs), Question 4
+    prompt: |
+      On a TPU v5e ($3.94\times10^{14}$ int8 OPs/s, $8.2\times10^{11}$ B/s), int8 weights $[4096, 16384]$ multiply int8 activations $[B, 4096]$, writing int8 $[B, 16384]$. Counting all bytes exactly, roughly where does the matmul become compute-bound when loading from HBM?
+    correct: B ≈ 260
+    wrong:
+      - B ≈ 120
+      - B ≈ 480
+      - B ≈ 11
+    explanation: |
+      $T_\text{math} = 1.34\times10^8\,B / 3.94\times10^{14}$ and $T_\text{comms} = (6.71\times10^7 + 20480\,B)/8.2\times10^{11}$. Equating gives $B \approx 259$, slightly above the int8 rule of 240 because activation bytes count too (the book's rounded arithmetic gives 267). 11 is the VMEM answer; 120 would apply to int8 weights with bf16 math.
+  - id: q6
+    source: Scaling Book ch. 2 (TPUs), Question 1
+    prompt: |
+      A 70B-parameter model with int8 weights is spread evenly over 8 TPU v5e chips ($8.2\times10^{11}$ B/s HBM each). What is a reasonable lower bound on the time per decode step at small batch?
+    correct: About 11 ms
+    wrong:
+      - About 85 ms
+      - About 1.4 ms
+      - About 21 ms
+    explanation: |
+      Each step reads every weight once. Per chip that is $70\times10^9/8 = 8.75\times10^9$ bytes, and $8.75\times10^9/8.2\times10^{11} \approx 10.7$ ms. 85 ms forgets to split across chips; 21 ms assumes bf16 weights (which would not fit in 16 GiB per chip anyway).
+  - id: q7
+    source: Scaling Book ch. 2 (TPUs) App. A §"VPU"
+    prompt: |
+      A TPU v5p core's VPU has $8\times128$ lane positions with 4 ALUs each, at 1.75 GHz, one op per ALU per cycle. Roughly how does its throughput compare with the core's MXUs ($\approx 2.3\times10^{14}$ FLOPs/s)?
+    correct: About $7\times10^{12}$ FLOPs/s, roughly 30× lower
+    wrong:
+      - About $7\times10^{12}$ FLOPs/s, roughly 3× lower
+      - About $1.8\times10^{12}$ FLOPs/s, roughly 130× lower
+      - About $2.3\times10^{14}$ FLOPs/s, the same as the MXUs
+    explanation: |
+      $8\cdot128\cdot4\cdot1.75\times10^9 \approx 7.2\times10^{12}$, and $2.3\times10^{14}/7.2\times10^{12} \approx 32$. Leaving out the 4 ALUs per position gives $1.8\times10^{12}$. Non-matmul work runs about 30× slower, which is why architectures lean on matmuls.
+  - id: q8
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    prompt: |
+      In a transformer layer on a TPU, which of these runs on the **VPU** rather than on an MXU?
+    correct: The exponentials and row sums inside softmax
+    wrong:
+      - The $QK^\top$ attention-score product
+      - The feed-forward up-projection $W_\text{in}$
+      - The attention output projection $W_O$
+    explanation: |
+      The MXU only does matrix multiplies. Elementwise functions (exp) and reductions (sums) go to the VPU. $QK^\top$, $W_\text{in}$ and $W_O$ are all matmuls and run on the MXUs.
+  - id: q9
+    source: Scaling Book ch. 2 (TPUs) App. A §"VPU"
+    prompt: |
+      Which statement about the TPU VPU is **false**?
+    correct: Cross-lane reductions cost about as much as sublane ones
+    wrong:
+      - Its arithmetic runs in fp32 even when matmuls use bf16
+      - A sublane sum needs shuffles by 4, 2, 1 and three adds
+      - All lanes execute the same instruction each cycle
+    explanation: |
+      Sublane reductions use cheap intra-lane shuffles, but cross-lane reductions need the separate, slow XLU unit. So the reduced axis should ideally not sit on lanes. The other three statements are from the book's appendix.
+  - id: q10
+    source: Scaling Book ch. 2 (TPUs) App. A §"Scalar Core"
+    prompt: |
+      A kernel gathers thousands of small, scattered rows from HBM into VMEM, each needing its own copy request. Which TPU design feature is most likely to limit it?
+    correct: One scalar core issues at most one DMA per cycle
+    wrong:
+      - The MXUs stall whenever the VPU is busy computing
+      - Each MXU needs its own separate instruction stream
+      - HBM bandwidth halves for any non-matmul operation
+    explanation: |
+      One scalar core dispatches everything for 4096 VPU ALUs, 4 MXUs, XLUs and DMA engines. That keeps control cheap, but it serializes DMA issue and makes data-dependent control flow awkward. The MXU and VPU can run concurrently, and control is a small fraction of the chip.
+  - id: q15
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?", Question 4
+    prompt: |
+      During decoding on a TPU v5e ($1.97\times10^{14}$ FLOPs/s, HBM $8.2\times10^{11}$ B/s, VMEM ≈ 22× that), a bf16 weight block $[4096, 8192]$ (64 MiB) multiplies a batch of $B = 16$ tokens. Compare the time when the weights are read from HBM with the time when they were already prefetched into VMEM (assume the prefetch was hidden behind earlier work).
+    correct: ≈ 82 µs from HBM; ≈ 5.5 µs from VMEM, now compute-bound
+    wrong:
+      - ≈ 82 µs from HBM; ≈ 3.7 µs from VMEM, still bandwidth-bound
+      - ≈ 5.5 µs either way, since the matmul is compute-bound
+      - ≈ 82 µs either way, since the FLOPs are unchanged
+    explanation: |
+      Weight bytes $= 2\cdot4096\cdot8192 \approx 6.7\times10^7$. From HBM: $6.7\times10^7/8.2\times10^{11} \approx 82$ µs, far above the compute time $2\cdot16\cdot4096\cdot8192/1.97\times10^{14} \approx 5.5$ µs. From VMEM ($\approx 1.8\times10^{13}$ B/s) the load takes ≈ 3.7 µs, now below the compute time, so the matmul becomes compute-bound at ≈ 5.5 µs. With B = 16 above the VMEM ridge (≈ 11), that is expected; 3.7 µs ignores the compute floor.
+  - id: q16
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?", §"TPU specs"
+    prompt: |
+      A TPU v5p chip ($4.59\times10^{14}$ bf16 FLOPs/s, $2.8\times10^{12}$ B/s HBM) runs as one megacore device: two TensorCores sharing the chip's HBM. What is each core's peak, and what ridge does a matmul on the chip see?
+    correct: ≈ 2.3e14 per core; ridge ≈ 164
+    wrong:
+      - ≈ 4.6e14 per core; ridge ≈ 328
+      - ≈ 2.3e14 per core; ridge ≈ 82
+      - ≈ 1.1e14 per core; ridge ≈ 41
+    explanation: |
+      Each core is half the chip: $4.59\times10^{14}/2 \approx 2.3\times10^{14}$. The two cores share the HBM, so the chip-level ridge is $4.59\times10^{14}/2.8\times10^{12} \approx 164$; equivalently each core gets half the bandwidth and half the FLOPs. 82 comes from pairing one core's FLOPs with the whole chip's bandwidth.
+  - id: q17
+    source: Scaling Book ch. 2 (TPUs) App. A §"VPU"
+    prompt: |
+      On a TPU v5p core, the VPU is about 32× slower than the MXUs. A layer spends 90% of its FLOPs in matmuls and 10% in elementwise VPU work. If both units run at their peaks and don't overlap, what fraction of the layer's time goes to the VPU work?
+    correct: About 78%
+    wrong:
+      - About 10%
+      - About 3%
+      - About 50%
+    explanation: |
+      Time is proportional to FLOPs divided by throughput: VPU $0.1\times32 = 3.2$ units, MXU $0.9\times1 = 0.9$ units. The VPU share is $3.2/4.1 \approx 78\%$. The 10% answer counts FLOPs instead of time. This is why compilers fuse elementwise work into matmuls and why architectures keep non-matmul FLOPs small.
+  - id: q18
+    source: Scaling Book ch. 2 (TPUs) App. B
+    prompt: |
+      In a $4\times4$ weight-stationary systolic array, feature $r$ of the first token enters row $r$ at cycle $r$ (row 0 at cycle 0, row 1 at cycle 1, …). Each cell takes one cycle, passes its activation right and its partial sum down. In which cycle does the bottom cell of column 3 finish its work on the first token?
+    correct: Cycle 6
+    wrong:
+      - Cycle 3
+      - Cycle 4
+      - Cycle 15
+    explanation: |
+      The activation for row $r$ reaches column $c$ at cycle $r + c$, and the partial sum from cell $(r-1, c)$ arrives at the same cycle, so cell $(r, c)$ works at cycle $r + c$. The bottom of column 3 is $(3, 3)$: cycle $3 + 3 = 6$. In general the last output of an $n\times n$ array appears after $2n - 1$ cycles, the fill bubble. Cycle 15 would be a fully sequential order.
+  - id: q14
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    prompt: |
+      When does prefetching a layer's weights into VMEM help most?
+    correct: Small-batch decode matmuls whose layer weights fit in VMEM
+    wrong:
+      - Large-batch training matmuls, already compute-bound
+      - Elementwise ops, since they run on the MXU from VMEM
+      - Only when the entire model fits inside VMEM at once
+    explanation: |
+      VMEM lowers the ridge from ≈ 240 to ≈ 10–20, which matters only when the op is below the HBM ridge, as in small-batch decoding. Loading the next feed-forward block during attention hides the weight load. Compute-bound matmuls gain nothing, and no large model fits in 128 MiB.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    front: Name the main units of a TPU TensorCore and what each does.
+    back: |
+      MXU (systolic matmul units), VPU (elementwise ops and reductions, fp32), VMEM (programmer-managed on-chip scratchpad), scalar unit + SMEM (control and DMA). HBM sits beside the core and holds the tensors.
+  - id: f2
+    source: Scaling Book ch. 2 (TPUs) App. B
+    front: What does one MXU compute per 8 cycles, and what is that in FLOPs/s at 1.5 GHz?
+    back: |
+      One $\text{bf16}[8,128]\cdot\text{bf16}[128,128] \to \text{f32}[8,128]$: $2\cdot8\cdot128^2/8 = 32768$ FLOPs/cycle ≈ $4.9\times10^{13}$ FLOPs/s.
+  - id: f3
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    front: How many MXUs does a v5e TensorCore have, and what peak does that give?
+    back: |
+      4 MXUs × $4.9\times10^{13}$ ≈ $1.97\times10^{14}$ bf16 FLOPs/s (int8: $3.94\times10^{14}$).
+  - id: f4
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    front: VMEM on a v5e. Size, relative bandwidth, and resulting ridge?
+    back: |
+      128 MiB; ≈ 22× HBM bandwidth to the MXU; ridge ≈ 240/22 ≈ 11 (10–20 in practice).
+  - id: f5
+    source: Scaling Book ch. 2 (TPUs) §"Key Takeaways"
+    front: What padding rule follows from the MXU size?
+    back: |
+      Matrix dimensions should be ≥ 128 (≥ 256 on v6e), and tiled dims ≥ 128 × number of MXUs; smaller axes are padded and waste cells.
+  - id: f6
+    source: Scaling Book ch. 2 (TPUs), Question 1
+    front: Lower bound on per-token decode latency from parameter loading?
+    back: |
+      $$T \ge \frac{\text{param bytes per chip}}{W_\text{hbm}}$$
+
+      e.g. 200B bf16 over 32 v4p: $12.5\times10^9/1.2\times10^{12} \approx 10$ ms.
+  - id: f7
+    source: Scaling Book ch. 2 (TPUs) App. A §"VPU"
+    front: Shape and throughput of the TPU v5p VPU?
+    back: |
+      $(8\ \text{sublanes}, 128\ \text{lanes})$ × 4 ALUs = 4096 ALUs; ≈ $7\times10^{12}$ FLOPs/s per core at 1.75 GHz, ≈ 30× below the MXUs. 64 VREGs of 4 KiB.
+  - id: f8
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    front: What is megacore?
+    back: |
+      Two TensorCores on one chip sharing HBM, treated as a single device with 2× FLOPs (TPU v4, v5p). v5e has one core per chip; v3 and older exposed two separate devices.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 2 (TPUs) App. B
+    front: Explain how a weight-stationary systolic array multiplies matrices, and why it is efficient.
+    back: |
+      - Load a $128\times128$ weight block, one weight per cell.
+      - Stream activations in from the left, skewed by one cycle per row.
+      - Each cycle each cell multiplies its weight by the passing activation, adds the partial sum from above, sends the activation right and the sum down.
+      - Column $c$ emits $\sum_r x_r w_{rc}$ at the bottom.
+      - Efficient: each weight fetched once, reused by every activation row; only neighbour-to-neighbour movement; $O(n^3)$ work on $O(n^2)$ data.
+      - Costs: a fill bubble at the start, and dims below 128 leave cells idle.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?"
+    front: Walk through what happens on a TPU when it computes $Y = X\cdot A$ with $A$ in HBM, and connect it to the roofline.
+    back: |
+      - Copy chunks of $A$ and $X$ from HBM to VMEM, then into VREGs and the MXUs ($8\times128$ activation, $128\times128$ weight pieces).
+      - Write result chunks back through VMEM to HBM.
+      - Copies and MXU work are pipelined: the next chunk loads while the current one computes; weight chunks are reused across many activation chunks.
+      - So time ≈ max(copy time, MXU time), the roofline lower bound.
+      - If HBM → VMEM copies are slower than MXU work (low intensity, e.g. small batch), the MXU starves: bandwidth-bound.
+  - id: f11
+    type: open
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?", Question 4
+    front: Why does a TPU expose a programmer-managed VMEM rather than a hardware cache, and how can you exploit it?
+    back: |
+      - Explicit placement lets the compiler pipeline copies precisely, keeping the MXU fed on a predictable schedule rather than depending on what a hardware cache happens to hold.
+      - VMEM is ≈ 22× faster than HBM, so operands resident there need intensity ≈ 10–20 rather than 240.
+      - Uses: prefetch the next layer's weights during attention; keep small weights resident for small-batch decoding; run low-intensity kernels (e.g. Flash Attention keeps a Q block and running statistics in VMEM).
+      - Limit: 128 MiB (v5e), so only a layer's worth or a sharded slice fits.
+  - id: f12
+    type: open
+    source: Scaling Book ch. 2 (TPUs), Question 1
+    front: Estimate the minimum per-token latency for decoding a 200B bf16 model on 32 TPU v4p, and explain when the estimate is realistic.
+    back: |
+      - Every decode step must read all parameters: $2\times200\times10^9 = 4\times10^{11}$ bytes.
+      - Per chip: $1.25\times10^{10}$ bytes; at $1.2\times10^{12}$ B/s → ≈ 10 ms.
+      - At small batch the matmuls are bandwidth-bound, so this floor is nearly achieved.
+      - It breaks down at large batch (FLOPs dominate), at long context (KV-cache reads add bytes), or with poor overlap or inter-chip communication.
+      - To go lower: quantize (fewer bytes) or shard over more chips (less per chip).
+
+reading:
+  - title: "Scaling Book ch. 2: How to Think About TPUs"
+    url: https://jax-ml.github.io/scaling-book/tpus/
+    kind: book
+    note: '"What Is a TPU?", Appendix A (VPU, scalar core) and Appendix B (systolic arrays, with animations).'
+  - title: "Jouppi et al. (2017), In-Datacenter Performance Analysis of a Tensor Processing Unit"
+    url: https://arxiv.org/abs/1704.04760
+    kind: paper
+    note: The first TPU paper; explains the systolic matrix unit and uses roofline plots to compare it with CPUs and GPUs.
+  - title: "Henry Ko, TPU Deep Dive"
+    url: https://henryhmko.github.io/posts/tpu/tpu.html
+    kind: blog
+    note: A detailed walk through TPU chip architecture in the spirit of the book, recommended in its further reading.
+  - title: "Fleetwood, Domain-specific architectures for AI inference"
+    url: https://fleetwood.dev/posts/domain-specific-architectures
+    kind: blog
+    note: Contains a clear animation of a weight-stationary systolic array multiplication.

@@ -1,0 +1,435 @@
+id: sys.gpu-basics
+area: applied
+title: "How a GPU executes a training step"
+summary: The vocabulary every performance lesson relies on. SMs, Tensor Cores vs CUDA cores, the memory hierarchy from registers to HBM, kernels, blocks and warps, waves and tile quantisation, and why GPU calls are asynchronous.
+order: 100
+level: core
+tags: [systems, gpu, hardware, tensor-cores, memory-hierarchy, cuda, performance]
+prereqs: []
+
+explainer:
+  - title: "The problem: what is the GPU actually doing?"
+    body: |
+      Later performance lessons speak GPU: rooflines compare FLOP/s with "HBM bandwidth", fusion "keeps data in SRAM", FlashAttention "tiles into shared memory", CUDA graphs "remove launch overhead", profilers show "kernels" on "streams". This lesson defines each from scratch, so you can reason about *why* an operation takes the time it does.
+
+      All numbers are for an **NVIDIA H100 SXM**, taken from the Scaling Book's spec tables. Other SKUs (PCIe cards, H200, A100) differ, so treat them as one concrete example, not universal constants.
+
+      ![An H100 is two halves. Above, 132 SMs that compute, each with 4 Tensor Cores and its own SMEM. Below, 80 GB of off-chip HBM, reached through a shared L2 cache. The CPU talks to the GPU over PCIe.](sys.gpu-basics/gpu-anatomy)
+
+      **Two halves.** A GPU is
+      - many **Streaming Multiprocessors (SMs)**, the compute cores. An H100 has 132. Each SM is largely independent and can run its own piece of work.
+      - **HBM** (high-bandwidth memory), the large off-chip DRAM: 80 GB, read at about 3.35 TB/s. Weights, gradients, optimizer state and activations all live here. It is the memory `nvidia-smi` reports and the one that runs out in a "CUDA out of memory" error.
+      - Between them sits the **L2 cache** (50 MB on H100), shared by all SMs, which absorbs repeated reads so they don't all go to HBM.
+
+      **Host and device.** The CPU is the **host** and the GPU is the **device**. The host runs your Python and sends work to the device over PCIe; the device does the arithmetic. How they cooperate explains a whole class of slowdowns (later card).
+    source: 'Scaling Book Part 12 §"What Is a GPU?", §"Memory", §"Summary of GPU specs"; NVIDIA GPU Performance Background §2'
+
+  - title: "Inside an SM: Tensor Cores vs CUDA cores"
+    body: |
+      Each H100 SM is split into **4 subpartitions**. Each subpartition has:
+      - a **Tensor Core**: a matrix-multiply unit that performs a small matrix multiply-accumulate per instruction;
+      - a **warp scheduler** with **32 CUDA cores**: scalar lanes (ALUs) that all execute the same instruction each cycle, i.e. a 32-wide vector unit (a *warp* is a group of 32 threads; see the execution-model card);
+      - a **register file** of 16,384 32-bit registers (64 KiB), the fastest storage on the chip.
+
+      **Where the FLOPs are.** Count the CUDA cores: $132 \times 4 \times 32 = 16{,}896$ lanes. At the 1.98 GHz boost clock, counting a fused multiply-add (FMA, $a\cdot b + c$ in one instruction) as 2 FLOPs:
+
+      $$\begin{aligned} 16{,}896 \times 1.98\times10^{9} \times 2 &\approx 6.7\times10^{13} \\ &= 67 \text{ TFLOP/s}. \end{aligned}$$
+
+      The Tensor Cores deliver about **990 TFLOP/s** of dense bf16. So they supply about $990/67 \approx 15\times$ the FLOPs of the vector lanes (the Scaling Book rounds the CUDA-core figure to 66). Two consequences:
+      1. A matmul written as ordinary scalar loops runs on CUDA cores and can reach at most $67/990 \approx 7\%$ of the advertised peak. Peak requires the Tensor Core path: NVIDIA's libraries cuBLAS (matmuls) and cuDNN (convolutions, attention), Triton kernels, or compiler-generated code.
+      2. Everything else (activations, norms, softmax, the optimizer update) runs on CUDA cores. That barely matters: these ops do so few FLOPs per byte that memory sets their speed (`sys.roofline`).
+
+      **Number formats.** Tensor Cores multiply low-precision inputs and accumulate in higher precision. Hopper: fp16/bf16 at ≈990 TFLOP/s, fp8 at ≈2×, and **TF32** for fp32 tensors (inputs rounded to a 10-bit mantissa, fp32 accumulation and range). PyTorch disables TF32 for matmuls by default since 1.12. Formats: `sys.fp-formats`.
+
+      **Scope.** 990 is the dense figure (spec sheets print 2×, assuming 2:4 structured sparsity); large H100 matmuls reach roughly 80–85% of it.
+    source: 'Scaling Book Part 12 §"What Is a GPU?" (CUDA cores, Tensor Core, Quiz 1 Q1–Q2); Scaling Book Part 1 §"Where Does the Time Go?" (80–85% side-note); PyTorch CUDA semantics §"TensorFloat-32 (TF32) on Ampere (and later) devices"; NVIDIA GPU Performance Background §2'
+
+  - title: "The memory hierarchy and why data reuse matters"
+    body: |
+      Going up the hierarchy, each level is smaller but faster:
+      - **HBM**: 80 GB, 3.35 TB/s, off-chip.
+      - **L2**: 50 MB, shared by all SMs, measured ≈5.5 TB/s; hardware-managed.
+      - **SMEM / L1**: 256 kB *per SM* (about 34 MB across the chip). It serves as L1 cache or as **shared memory**, managed explicitly by the kernel and readable by all threads of a block.
+      - **Registers**: 256 KiB per SM, private to each thread.
+
+      For scale, FlashAttention's paper estimates A100 on-chip SRAM at ≈19 TB/s vs 1.5–2.0 TB/s HBM, about 10×.
+
+      **The budget per SM.** Divide the chip's resources by 132:
+
+      $$\begin{aligned} \text{FLOP/s per SM} &= 989\text{e}12/132 \\ &\approx 7.5 \text{ TFLOP/s} \\ \text{HBM share per SM} &= 3.35\text{e}12/132 \\ &\approx 25 \text{ GB/s} \end{aligned}$$
+
+      So for every byte an SM pulls from HBM it must do about $7.5\text{e}12/25\text{e}9 \approx 295$ FLOPs, or its Tensor Cores wait. (The SM count cancels: this is just $989/3.35$, the chip's **ridge point**, which `sys.roofline` builds on.)
+
+      **How kernels get there: reuse.** Compute $C = AB$ (shared dimension $K$) with one thread per output element, reading its row of $A$ and column of $B$ from HBM. That is $2K$ bf16 numbers ($4K$ bytes) for $2K$ FLOPs: **0.5 FLOP per byte**, about 600× short. A **tiled** kernel has a block copy a $T\times T$ tile of $A$ and of $B$ into shared memory once; each element is then reused by $T$ outputs. Per step that is $2T^2k$ FLOPs over $4Tk$ bytes, i.e. **$T/2$ FLOPs per byte**. A $128\times256$ tile reaches $128\cdot256/(128+256) \approx 85$, still well below 295. The rest *must* come from L2: neighbouring blocks request the same tiles, which L2 serves without touching HBM, and kernels order their blocks to make that likely. The same reuse idea drives fusion and FlashAttention.
+
+      **Coalescing** (one sentence): a warp reading 32 consecutive elements is served by one wide DRAM burst; scattered reads waste most of it.
+    source: 'Scaling Book Part 12 §"Memory", Quiz 1 Q5; Dao et al. 2022 §2.1; Ultra-Scale Playbook "A primer on GPU", "How to improve performance with Kernels?" (coalescing, tiling)'
+
+  - title: "Execution model: kernels, blocks, warps"
+    body: |
+      **Kernel.** A function that runs on the GPU, such as one matmul or one elementwise add. The host *launches* it over a **grid** of **thread blocks**. Every thread runs the same code, using its indices to find its data.
+
+      **Block → SM.** Each block is placed on a single SM and stays there. Its threads can share data through that SM's shared memory and synchronise with each other. Threads in *different* blocks cannot use shared memory together. One block keeps 1 of 132 SMs busy, so kernels launch many: NVIDIA suggests several times more blocks than SMs.
+
+      **Warp.** The SM runs a block's threads in groups of **32 called warps**. A warp issues one instruction at a time for all 32 threads (NVIDIA calls this SIMT, single instruction, multiple threads). If threads in a warp take different branches of an `if`, the warp runs both paths one after the other, masking off the inactive threads. This **divergence** silently halves throughput or worse.
+
+      **Latency hiding.** A load from HBM takes many cycles. Rather than wait, the warp scheduler switches to another warp that is ready to run. An H100 SM can hold up to **64 resident warps** for this purpose. So a GPU needs far more threads than cores.
+
+      **What limits residency.** Every resident thread keeps its registers. An SM has $4\times16{,}384 = 65{,}536$ registers. If a kernel needs 256 registers per thread,
+
+      $$\frac{65{,}536}{32 \times 256} = 8 \text{ warps}$$
+
+      fit at once, not 64. Fewer resident warps means less latency hiding. Shared memory per block limits residency the same way. The fraction of the maximum that is resident is called **occupancy**.
+
+      **Scope.** You need these facts to *read* profiles and papers; libraries and compilers (cuBLAS, Triton, `torch.compile`, XLA) usually choose blocks and tiles for you.
+    source: 'NVIDIA GPU Performance Background §3, §6; Scaling Book Part 12 §"What Is a GPU?" (SIMT, divergence, 64 resident warps), §"Memory" (registers); Ultra-Scale Playbook "A primer on GPU" (warps, blocks), "Minimizing Control Divergence"'
+
+  - title: "Waves, tiles and why shapes matter"
+    body: |
+      **Waves and the tail effect.** If a kernel's blocks don't all fit on the GPU at once, they run in **waves**: a full set of concurrent blocks, then the next. NVIDIA's example: 12 blocks on 8 SMs, one block per SM: the second wave uses only 4 SMs, so utilisation is $12/16 = 75\%$. The underused last wave is the **tail effect**.
+
+      **How a GEMM is split.** The output matrix is split into tiles, one per block. Two quantisation effects follow:
+      - **Tile quantisation**: if a dimension isn't a multiple of the tile size, edge tiles are mostly padding yet do full math.
+      - **Wave quantisation**: the number of tiles is effectively rounded up to a multiple of the number of SMs.
+
+      **Worked example** with NVIDIA's model from its A100 measurements (one tile per SM at a time), here $128\times256$ tiles on 132 SMs, $M = 4096$:
+      - $N = 4096$: $32 \times 16 = 512$ tiles, $512/132 = 3.88$, so **4 waves**, 97% of SM slots busy.
+      - $N = 4097$: the extra column needs a 17th tile column. $32 \times 17 = 544$ tiles, $544/132 = 4.12$, so **5 waves**.
+
+      One extra column, 0.02% more work, costs about 25% more time.
+
+      ![Modelled time in waves for an M = 4096 GEMM as N grows. Time jumps when a new tile column (every 256 columns) pushes the tile count past a multiple of 132. The gap to the dashed line is waste.](sys.gpu-basics/wave-quantisation)
+
+      cuBLAS softens this by choosing among tile shapes: a mechanism, not a prediction.
+
+      **Alignment.** Tensor Cores work on fixed-size fragments. NVIDIA recommends dimensions that are multiples of 16 bytes (8 elements in fp16/bf16); for A100 it advises up to 128 bytes (64 elements). This is why vocabularies get padded (f4).
+    source: 'NVIDIA GPU Performance Background §3 (Fig. 3); NVIDIA Matrix Multiplication Background §2 (Tensor Core alignment, Table 1), §3 (tile and wave quantisation); NVIDIA Mixed Precision Training §4.1'
+
+  - title: "Host and device: asynchrony and streams"
+    body: |
+      **Asynchrony.** When Python calls a GPU op, PyTorch does not wait for the result. It **enqueues** the kernel and returns immediately. The CPU races ahead, queuing more kernels, while the GPU works through the queue. Results stay correct because each device runs its queue in order and PyTorch inserts waits when data crosses between CPU and GPU.
+
+      **Streams.** A **CUDA stream** is one such ordered queue. Kernels in one stream run in order. Kernels in *different* streams may run concurrently, in any order, unless explicitly synchronised. Training frameworks use this to overlap computation on one stream with communication (all-reduces run by NCCL, NVIDIA's collective-communication library) or host↔device copies on others. With non-default streams, getting the synchronisation right is your responsibility.
+
+      ![(a) The CPU enqueues launches faster than the GPU runs them, so the GPU never waits, and an all-reduce on a second stream overlaps the compute. (b) Calling .item() makes the CPU wait for the queue to drain; the GPU then idles while the CPU launches the next kernel.](sys.gpu-basics/streams-async)
+
+      **Overlap needs care.** Two streams buy concurrency only if neither waits on the other; a dependency between them needs an explicit wait (`wait_stream`, events), or the second kernel may read stale data.
+    source: 'PyTorch CUDA semantics §"Asynchronous execution", §"CUDA streams"'
+
+  - title: "Sync points, timing traps and launch overhead"
+    body: |
+      **Synchronisation points.** Anything that needs a GPU value on the CPU makes the CPU wait for all queued work: `tensor.item()`, `print(cuda_tensor)`, `.cpu()`, `.tolist()`, a Python `if` on a GPU tensor, `torch.cuda.synchronize()`. After the wait the queue is empty, so the GPU sits idle until the CPU issues new work. Logging `loss.item()` every step therefore costs a bubble per step; logging every $k$ steps, or accumulating on the GPU, avoids it.
+
+      **Two traps.** `time.time()` around GPU code measures the *enqueue*; synchronise first or use CUDA events. And a GPU error surfaces at a later sync, so the stack trace points to the wrong line; `CUDA_LAUNCH_BLOCKING=1` makes launches synchronous for debugging.
+
+      **Launch overhead.** Each op costs host time: Python dispatch, framework bookkeeping, the launch itself. Horace He measured PyTorch at about 280,000 tiny ops per second, about $1/280{,}000 \approx 3.6$ µs each (a 2022 measurement on his machine). If GPU kernels are shorter than that, the GPU waits for the CPU: the run is **overhead-bound**. Symptoms: gaps between kernels in a profiler trace, and runtime that barely grows when you double the batch. Remedies are bigger kernels, fusion and compilation (`sys.fusion-codegen`) and CUDA graphs, which replay a recorded sequence of launches with one call.
+    source: 'PyTorch CUDA semantics §"Asynchronous execution", §"CUDA streams"; PyTorch Performance Tuning Guide §"Avoid unnecessary CPU-GPU synchronization"; He 2022 §"Overhead"; PyTorch blog "Accelerating PyTorch with CUDA Graphs" (2021)'
+
+  - title: "Following one layer through the GPU"
+    body: |
+      `y = gelu(x @ W)` in eager PyTorch, `x` $[4096, 4096]$, `W` $[4096, 16384]$, bf16:
+
+      1. **Host.** Python dispatches `matmul`. PyTorch picks a cuBLAS kernel (tile shape) and enqueues it, a few µs of CPU time, then dispatches `gelu` the same way.
+      2. **Matmul kernel.** One block per output tile loops over the shared dimension, loading tiles of `x` and `W` (via L2, else HBM) into shared memory; Tensor Cores accumulate in fp32 registers; the tile is written to HBM as bf16. About $2 \times 4096 \times 4096 \times 16384 \approx 5.5\times10^{11}$ FLOPs on the Tensor Cores: at least 0.56 ms at 989 TFLOP/s.
+      3. **GELU kernel.** A separate kernel reads the whole $[4096, 16384]$ output back from HBM (134 MB in bf16), applies GELU on the CUDA cores and writes 134 MB back. About 268 MB of traffic at 3.35 TB/s is at least 80 µs, almost none of it spent computing.
+      4. **Communication.** Later, a gradient all-reduce runs on another stream, overlapping the backward pass.
+
+      **What this shows.**
+      - The matmul's time is set by **compute**: 0.56 ms of math, against about 0.3 GB of operands to read and write (≈ 90 µs of HBM time).
+      - The GELU's time is set by **memory bandwidth**: it re-reads data the matmul just wrote. If GELU ran inside the matmul kernel's epilogue (its final step, before the tile is written out), while the tile was still in registers, the round trip would vanish. That is **operator fusion**.
+      - With small tensors, steps 2–3 would take microseconds and step 1 would dominate: **overhead**.
+
+      These are Horace He's three regimes (compute, memory bandwidth, overhead), each with its own fix: better kernels, fusion, fewer or captured launches. `sys.roofline` quantifies the first two; `sys.profiling` covers telling them apart.
+    source: 'He 2022 §"Compute", §"Bandwidth", §"Overhead"; NVIDIA Matrix Multiplication Background §2 (tiled outer-product GEMM); Scaling Book Part 12 §"Memory"'
+
+  - title: "What interviewers probe"
+    body: |
+      - *What is an SM, a warp, a kernel?* SM: one of 132 independent compute cores, each with 4 Tensor Cores, vector lanes, registers and SMEM. Warp: 32 threads issuing one instruction together. Kernel: a GPU function launched over a grid of blocks, each block pinned to one SM.
+      - *Why are elementwise ops slow relative to matmuls?* They do about one FLOP per element loaded and stored, so their time is HBM traffic. That they run on the 15× slower CUDA cores barely matters.
+      - *What does shared memory buy you?* Reuse. A tile loaded once is used by many threads, raising FLOPs per HBM byte toward the ~295 an H100 needs.
+      - *Why does GPU code run asynchronously, and what forces a sync?* So the CPU can queue work ahead and the GPU never starves. `.item()`, printing, `.cpu()` and data-dependent Python control flow force a wait.
+      - *Why might $N = 4097$ be slower than $N = 4096$?* Tile and wave quantisation: an extra tile column, possibly an extra wave.
+      - *Why do models pad vocabularies or pick hidden sizes like 4096?* Tensor Core alignment (multiples of 8 elements; NVIDIA advises up to 64 on A100) and clean tiling.
+      - *Is 30% GPU utilisation in `nvidia-smi` bad?* That counter measures the fraction of time *any* kernel runs, not FLOP efficiency. Low values usually point to overhead or input stalls.
+      - *Why can't you just time a forward pass with `time.time()`?* You'd time the enqueue. Synchronise or use CUDA events.
+    source: 'Scaling Book Part 12 §"What Is a GPU?"; NVIDIA Matrix Multiplication Background §3; PyTorch CUDA semantics §"Asynchronous execution"; He 2022 §"Overhead" (GPU-Util)'
+
+  - title: "Key results"
+    body: |
+      - H100 SXM: 132 SMs × 4 subpartitions; 80 GB HBM at 3.35 TB/s; 50 MB L2; 256 kB SMEM and 256 KiB registers per SM.
+      - Tensor Cores ≈ 990 TFLOP/s dense bf16 (fp8 ≈ 2×); CUDA cores ≈ 67 TFLOP/s with FMA. Non-Tensor-Core matmuls cap at ≈ 7% of peak.
+
+      $$\frac{\text{FLOP/s}}{\text{HBM B/s}} = \frac{989\text{e}12}{3.35\text{e}12} \approx 295$$
+
+      FLOPs needed per HBM byte, which is why kernels tile for reuse.
+
+      - Kernel → grid of blocks; block → one SM; warp = 32 threads in lock-step; divergence serialises; up to 64 resident warps per SM hide latency, limited by registers and SMEM.
+      - Waves: $\lceil \text{blocks}/\text{concurrent} \rceil$. Tile and wave quantisation punish awkward shapes. Use multiples of 8 (fp16/bf16); NVIDIA's A100 advice goes up to 64.
+      - Launches are asynchronous and stream-ordered. `.item()`, prints and `.cpu()` force a sync. Launch overhead is microseconds per op.
+      - Three regimes: compute, memory bandwidth, overhead.
+    source: 'Scaling Book Part 12 §"Summary of GPU specs"; NVIDIA GPU Performance Background §3; NVIDIA Matrix Multiplication Background §3; PyTorch CUDA semantics; He 2022'
+
+quiz:
+  - id: q1
+    prompt: |
+      An H100 has 132 SMs, each with 4 subpartitions of 32 fp32 CUDA cores, and a boost clock of 1.98 GHz. Counting a fused multiply-add as 2 FLOPs, what is the peak fp32 throughput of the CUDA cores alone?
+    correct: About 67 TFLOP/s
+    wrong:
+      - About 33 TFLOP/s
+      - About 17 TFLOP/s
+      - About 990 TFLOP/s
+    explanation: |
+      $132\times4\times32 = 16{,}896$ lanes, times $1.98\times10^9$ cycles/s, times 2 FLOPs per FMA, is $6.7\times10^{13}$. 33 TFLOP/s is the same count with the FMA taken as one FLOP, which the question rules out. 17 TFLOP/s forgets the 4 subpartitions. 990 TFLOP/s is the Tensor Core figure.
+    source: 'Scaling Book Part 12 §"What Is a GPU?", Quiz 1 Q2'
+
+  - id: q2
+    prompt: |
+      You implement a matmul as a hand-written CUDA kernel that uses only CUDA cores (no Tensor Core instructions), with perfect memory reuse. On an H100, roughly what fraction of the advertised dense bf16 peak can it reach at best?
+    correct: About 7%, the CUDA-core ceiling
+    wrong:
+      - About 50%, half the SM's arithmetic
+      - About 30%, as memory limits it anyway
+      - Close to 100% with enough tiling
+    explanation: |
+      The Tensor Cores provide ≈990 TFLOP/s; the vector lanes about 67 TFLOP/s, so a kernel that never uses Tensor Cores is capped at $67/990\approx7\%$, however well it reuses data. Better tiling raises intensity, but it cannot lift the compute ceiling of the units you're using. The "memory limits it" option confuses two different ceilings: the question assumes perfect reuse.
+    source: 'Scaling Book Part 12 §"What Is a GPU?"; He 2022 §"Compute"'
+
+  - id: q3
+    prompt: |
+      Which statement about the CUDA execution model is **false**?
+    correct: A block larger than one warp is spread over several SMs, which share its data via L2
+    wrong:
+      - The 32 threads of a warp issue one instruction together, so divergent branches run one after the other
+      - Threads in the same block can exchange data through that SM's shared memory
+      - An SM keeps many warps resident and switches between them to hide memory latency
+    explanation: |
+      A thread block is always placed on a single SM, however many warps it has. That is exactly why its threads can share SMEM and synchronise cheaply. Threads in different blocks cannot share SMEM. The other three statements are the standard SIMT, shared-memory and latency-hiding facts.
+    source: 'NVIDIA GPU Performance Background §3; Scaling Book Part 12 §"What Is a GPU?"'
+
+  - id: q4
+    prompt: |
+      An H100 SM has 65,536 32-bit registers and can hold up to 64 resident warps. A kernel's threads each need 128 registers. How many warps can be resident on one SM, and what does that cost?
+    correct: 16 warps, so fewer warps are available to hide load latency
+    wrong:
+      - 64 warps, since registers are allocated per warp rather than per thread
+      - 4 warps, since each subpartition holds a single warp at a time
+      - 16 warps, but this only matters for kernels that use Tensor Cores
+    explanation: |
+      $65{,}536 / (32 \times 128) = 16$ warps, a quarter of the maximum (occupancy 25%). Each thread keeps its own registers, so heavy register use limits residency. Fewer resident warps means fewer candidates to run while other warps wait on memory, so latency hiding suffers. That affects any kernel, not just Tensor Core ones.
+    source: 'Scaling Book Part 12 §"Memory" (registers, resident warps); NVIDIA GPU Performance Background §3'
+
+  - id: q5
+    prompt: |
+      A kernel launches 300 thread blocks on an H100 (132 SMs). Only one block fits per SM at a time and all blocks take equal time. How many waves run, and what is the average fraction of SMs busy over the kernel?
+    correct: 3 waves, about 76% average utilisation
+    wrong:
+      - 2.27 waves, so 100% utilisation
+      - 3 waves, about 27% average utilisation
+      - 2 waves, about 88% average utilisation
+    explanation: |
+      $\lceil 300/132 \rceil = 3$ waves: two full ones and a tail of 36 blocks. Time is 3 waves' worth for 300 blocks of work, so utilisation is $300/396\approx76\%$. 27% ($36/132$) is the utilisation of the last wave alone, not the average. Waves cannot be fractional, because a partial wave still takes a full block's time.
+    source: 'NVIDIA GPU Performance Background §3 (waves, tail effect)'
+
+  - id: q6
+    prompt: |
+      Model a bf16 GEMM with $M = 4096$ as split into $128\times256$ output tiles (256 along $N$), one tile per SM at a time on 132 SMs. How does the time with $N = 8200$ compare to $N = 8192$?
+    correct: About the same, because both shapes need 8 waves
+    wrong:
+      - About 0.1% slower, in proportion to the extra columns
+      - About 12% slower, because the extra tile column adds a wave
+      - About 2× slower, because the odd shape disables the Tensor Cores
+    explanation: |
+      $N = 8192$ gives $32\times32 = 1024$ tiles, i.e. $\lceil 1024/132\rceil = 8$ waves (7.76 of real work). $N = 8200$ needs a 33rd tile column: $32\times33 = 1056 = 8\times132$ tiles, still exactly 8 waves. Tile quantisation adds work, but here it fills the idle tail. Time moves in whole waves, not in proportion to the work. 8200 is a multiple of 8, so the Tensor Core alignment rule is met.
+    source: 'NVIDIA Matrix Multiplication Background §3 (tile and wave quantisation)'
+
+  - id: q7
+    prompt: |
+      A training loop calls `print(loss.item())` every step. With small, fast steps, why does this measurably slow training?
+    correct: The CPU blocks until the GPU queue drains, then the GPU idles during new launches
+    wrong:
+      - Moving the loss to the CPU also copies the autograd graph across PCIe each step
+      - The print disables asynchronous NCCL communication until the next backward
+      - Reading a scalar forces PyTorch to recompile the model's kernels each step
+    explanation: |
+      `.item()` needs the value on the host, so the CPU blocks until the GPU queue drains. The CPU then launches the next step's kernels from an empty queue, and the GPU waits through that launch latency. Only the scalar crosses PCIe, and there is no recompilation. When steps are long the bubble is negligible, which is why it bites with small steps.
+    source: 'PyTorch Performance Tuning Guide §"Avoid unnecessary CPU-GPU synchronization"; PyTorch CUDA semantics §"Asynchronous execution"'
+
+  - id: q8
+    prompt: |
+      You time a forward pass as `t0 = time.time(); y = model(x); t1 = time.time()` with no synchronisation. The model's GPU kernels take 40 ms. What does `t1 - t0` mostly measure?
+    correct: The CPU time to enqueue the kernels, which can be far less than 40 ms
+    wrong:
+      - The full 40 ms, since Python waits for each kernel by default
+      - 40 ms plus PCIe latency, since results are copied back to the host
+      - Nothing useful; `time.time()` cannot run while CUDA kernels execute
+    explanation: |
+      GPU calls return as soon as the kernel is queued, so the timer stops before the GPU finishes. The interval can be far shorter than the real 40 ms if the CPU runs ahead, or roughly equal if the queue is full and the CPU blocks. Call `torch.cuda.synchronize()` before reading the clock, or record CUDA events. No result is copied to the host unless you ask for one.
+    source: 'PyTorch CUDA semantics §"Asynchronous execution"'
+
+  - id: q9
+    prompt: |
+      Kernel A is launched on stream 1, then kernel B on stream 2, with no synchronisation between the streams. B reads a buffer that A writes. What can happen?
+    correct: B may start before A finishes and read stale data
+    wrong:
+      - B waits for A, since the GPU executes launches in global launch order
+      - B fails with an error, since streams cannot share buffers
+      - A and B are fused into one kernel by the driver
+    explanation: |
+      Only operations within one stream are ordered. Across streams the GPU may run kernels concurrently in any order. That is what lets communication overlap computation, and it is also why the programmer must add an explicit wait (`wait_stream`, events) when there is a dependency. Global launch order would hold only if both kernels were on the same stream.
+    source: 'PyTorch CUDA semantics §"CUDA streams"'
+
+  - id: q10
+    prompt: |
+      An H100 has 989 TFLOP/s of dense bf16 compute, 3.35 TB/s of HBM bandwidth and 132 SMs. To keep its Tensor Cores busy, about how many FLOPs must each SM perform per byte it reads from HBM?
+    correct: About 295
+    wrong:
+      - About 2.2
+      - About 7,500
+      - About 39,000
+    explanation: |
+      Per SM: $989\text{e}12/132\approx7.5$ TFLOP/s and $3.35\text{e}12/132\approx25$ GB/s, a ratio of about 295. The SM count cancels, giving the chip's FLOP/s-to-bandwidth ratio. 39,000 divides the *whole chip's* FLOP/s by one SM's bandwidth. 7,500 is GFLOP/s per SM, not FLOPs per byte.
+    source: 'Scaling Book Part 12 §"Summary of GPU specs", Quiz 1 Q3'
+
+  - id: q11
+    prompt: |
+      A profile of a small-model training step shows the CPU at 100%, short GPU kernels separated by gaps, and the GPU busy about 30% of the time. Which change is most likely to help?
+    correct: Use CUDA graphs or compilation to cut launches
+    wrong:
+      - Move to a GPU with more HBM bandwidth
+      - Move to a GPU with more Tensor Core FLOP/s
+      - Cut the batch size so each kernel ends sooner
+    explanation: |
+      Gaps between kernels with a saturated CPU mean the GPU is waiting for launches: the step is overhead-bound. Fewer or captured launches (CUDA graphs, compilation, fusion) help. More bandwidth or FLOPs only speed up the 30% of time the GPU is running. A smaller batch shortens kernels further and makes the overhead share worse.
+    source: 'He 2022 §"Overhead"; PyTorch blog "Accelerating PyTorch with CUDA Graphs" (2021)'
+
+  - id: q12
+    prompt: |
+      PyTorch is set to allow TF32 for fp32 matmuls on an Ampere or Hopper GPU. What happens to a matmul of two fp32 tensors?
+    correct: Inputs are rounded to 10 mantissa bits; accumulation stays fp32
+    wrong:
+      - Inputs are cast to bf16, so the result's range shrinks to bf16's
+      - The matmul runs on CUDA cores in full fp32, just with fused multiply-adds
+      - Inputs and outputs are stored as 19-bit values in HBM to save bandwidth
+    explanation: |
+      TF32 is a Tensor Core *compute* mode. fp32 inputs are rounded to 10 mantissa bits but keep fp32's 8-bit exponent, so range is unchanged. Accumulation is in fp32. Storage in HBM stays fp32: no bandwidth is saved, only compute is faster. The bf16 option is wrong because bf16 has only 7 mantissa bits, and range is not reduced either way.
+    source: 'PyTorch CUDA semantics §"TensorFloat-32 (TF32) on Ampere (and later) devices"'
+
+  - id: q13
+    prompt: |
+      An H100 matmul kernel keeps its $A$ and $B$ tiles in shared memory, using 200 kB per block. You enlarge the tiles so a block would need 300 kB. What happens?
+    correct: It exceeds the SM's 256 kB SMEM, so tiles must shrink, cutting reuse
+    wrong:
+      - The extra 100 kB spills to L2, which is shared, so speed barely changes
+      - The block is split across two SMs, which pool their shared memory
+      - It runs as before, since L2 caches the tiles that do not fit in SMEM
+    explanation: |
+      A block lives on one SM and its shared memory comes from that SM's 256 kB, so the launch configuration is infeasible. The kernel (or autotuner) must fall back to smaller tiles, which reuse each loaded element fewer times ($T/2$ FLOPs per byte for square tiles). Shared memory does not spill to L2, and blocks are never split across SMs. L2 caching helps tile *reloads*, but cannot stand in for a block's working set.
+    source: 'Scaling Book Part 12 §"Memory"'
+
+cards:
+  - id: f1
+    front: H100 SXM headline numbers (SMs, HBM, L2, SMEM, registers, Tensor Core vs CUDA core FLOP/s)?
+    back: |
+      - 132 SMs, each with 4 subpartitions (Tensor Core + 32 CUDA cores + 64 KiB registers).
+      - HBM 80 GB at 3.35 TB/s; L2 50 MB shared.
+      - SMEM/L1 256 kB per SM; registers 256 KiB per SM.
+      - Tensor Cores ≈ 990 TFLOP/s dense bf16 (fp8 ≈ 2×); CUDA cores ≈ 67 TFLOP/s fp32 with FMA.
+      - Ratio 989/3.35 ≈ 295 FLOPs per HBM byte.
+    source: 'Scaling Book Part 12 §"What Is a GPU?", §"Memory", §"Summary of GPU specs"'
+
+  - id: f2
+    front: Define kernel, grid, thread block and warp, and say what runs where.
+    back: |
+      - **Kernel**: a GPU function launched by the host.
+      - **Grid**: the set of thread blocks the kernel is launched over.
+      - **Block**: a group of threads placed on one SM. Its threads share that SM's shared memory and can synchronise.
+      - **Warp**: 32 threads of a block issuing one instruction together (SIMT). Divergent branches serialise.
+    source: 'NVIDIA GPU Performance Background §3; Ultra-Scale Playbook "A primer on GPU"'
+
+  - id: f3
+    front: What are tile quantisation and wave quantisation?
+    back: |
+      - **Tile quantisation**: matrix dimensions not divisible by the tile size create edge tiles that are mostly padding but do full math.
+      - **Wave quantisation**: the number of tiles (blocks) is effectively rounded up to a multiple of what the GPU runs at once (132 SMs × blocks per SM). A small tail wave leaves most SMs idle for a full wave's time.
+
+      Both make time jump in steps as a dimension grows.
+    source: 'NVIDIA Matrix Multiplication Background §3'
+
+  - id: f4
+    front: What shape rule helps Tensor Core efficiency, and why are vocabularies padded?
+    back: |
+      Make $M$, $N$, $K$ multiples of 16 bytes, i.e. 8 elements in fp16/bf16. On A100, up to 128 bytes (64 elements) helps further. Old cuBLAS/cuDNN versions required it to use Tensor Cores at all. Vocabulary size is a matmul dimension of the output layer, so it is padded up. Megatron-LM padded GPT-2's 50,257 to 51,200, divisible by 128 × 8, so each of 8 tensor-parallel GPUs gets a multiple of 128.
+    source: 'NVIDIA Matrix Multiplication Background §2 (Table 1); NVIDIA Mixed Precision Training §4.1; Shoeybi et al. 2019 §5'
+
+  - id: f5
+    front: Name operations that force a CPU–GPU synchronisation in PyTorch, and the cost.
+    back: |
+      `tensor.item()`, `print(cuda_tensor)`, `.cpu()` / `.tolist()` / `.numpy()`, Python control flow on a GPU value, `torch.cuda.synchronize()`, and blocking device↔host copies.
+
+      Cost: the CPU waits for the queue to drain, then the GPU idles while the next kernels are launched.
+    source: 'PyTorch Performance Tuning Guide §"Avoid unnecessary CPU-GPU synchronization"; PyTorch CUDA semantics §"Asynchronous execution"'
+
+  - id: f6
+    front: How does an SM hide memory latency, and what limits how well it can?
+    back: |
+      It keeps many warps resident (up to 64 on H100) and switches to a ready warp whenever one stalls on a load. Residency (occupancy) is limited by registers per thread (65,536 per SM; at 256 registers per thread only 8 warps fit) and shared memory per block. Too few blocks in the grid also leave SMs idle.
+    source: 'Scaling Book Part 12 §"What Is a GPU?", §"Memory"; NVIDIA GPU Performance Background §3'
+
+  - id: f7
+    front: What is memory coalescing?
+    back: |
+      DRAM returns bursts of consecutive addresses. When the 32 threads of a warp access consecutive elements, the hardware combines them into one wide transaction. Strided or scattered access wastes most of each burst and lowers effective bandwidth. Kernels lay out thread-to-data mappings so warps read contiguous memory.
+    source: 'Ultra-Scale Playbook "How to improve performance with Kernels?" (memory coalescing)'
+
+  - id: f8
+    type: open
+    front: Walk an interviewer through what the GPU does when eager PyTorch runs `y = gelu(x @ W)` in bf16.
+    back: |
+      1. **Host**: Python dispatches matmul; PyTorch picks a cuBLAS kernel and tile shape and enqueues it on the current stream (microseconds of CPU), returns at once, then enqueues GELU.
+      2. **Matmul**: grid of blocks, one per output tile. Each block loops over $K$, loading tiles of `x` and `W` (via L2, else HBM) into shared memory. The Tensor Cores multiply-accumulate in fp32 registers, then the tile is written as bf16 to HBM. Large shapes make this compute-bound.
+      3. **GELU**: a second kernel re-reads the output from HBM, applies GELU on CUDA cores, writes it back. It is memory-bound: its time is bytes / 3.35 TB/s.
+      4. **Implications**: fuse GELU into the matmul epilogue to remove the HBM round trip. For small shapes, launch overhead dominates, so use CUDA graphs or compilation. Shapes should be multiples of 8/64 to avoid tile waste.
+    source: 'He 2022 §"Bandwidth", §"Overhead"; NVIDIA Matrix Multiplication Background §2; PyTorch CUDA semantics §"Asynchronous execution"'
+
+  - id: f9
+    type: open
+    front: Explain why reuse through shared memory is essential for matmul speed on an H100, with numbers.
+    back: |
+      - **Budget**: per SM, about 7.5 TFLOP/s of Tensor Core compute but only about 25 GB/s of HBM bandwidth (3.35 TB/s ÷ 132). So each byte from HBM must feed about 295 FLOPs.
+      - **Naive kernel**: one thread per output reads $K$ elements of $A$ and $K$ of $B$ ($4K$ bytes in bf16) for $2K$ FLOPs: 0.5 FLOP/byte, about 600× too little.
+      - **Tiling**: a block copies $T\times T$ tiles of $A$ and $B$ into SMEM once and reuses each element across $T$ outputs: $2T^2k$ FLOPs per $4Tk$ bytes, i.e. $T/2$ FLOPs/byte. A $128\times256$ tile gives $128\cdot256/384 \approx 85$.
+      - **L2 is essential, not a bonus**: 85 < 295, so the remaining reuse comes from neighbouring blocks hitting the same tiles in L2 (kernels order blocks to make this likely), plus register-level tiling inside the block.
+      - **Same idea elsewhere**: fusion keeps intermediates on chip; FlashAttention tiles attention so the $s\times s$ score matrix never goes to HBM.
+    source: 'Scaling Book Part 12 §"Memory", §"Summary of GPU specs"; Ultra-Scale Playbook "How to improve performance with Kernels?" (tiling)'
+
+  - id: f10
+    type: open
+    front: Your 100M-parameter model trains no faster when you double the per-GPU batch, and nvidia-smi shows low utilisation. Diagnose and fix.
+    back: |
+      - **Hypothesis**: overhead-bound. Kernels are shorter than the host's per-op cost (Python + framework + launch, microseconds each), so the GPU waits for the CPU.
+      - **Check**: a profiler trace shows gaps between GPU kernels and a saturated CPU thread. Also look for sync points (`.item()`, prints, `.cpu()`) that drain the queue each step.
+      - **Alternative explanations**: input pipeline stalls (GPU waiting for data). Or small matmuls whose time is dominated by reading weights, which is also flat in batch (see `sys.roofline`). The trace distinguishes them.
+      - **Fixes**: remove per-step syncs; `torch.compile` or other fusion to cut kernel count; CUDA graphs to replay launches; larger per-GPU work (batch, sequence) if it fits.
+    source: 'He 2022 §"Overhead" (incl. footnote 3); PyTorch Performance Tuning Guide §"Avoid unnecessary CPU-GPU synchronization"; PyTorch blog "Accelerating PyTorch with CUDA Graphs" (2021)'
+
+reading:
+  - title: "Scaling Book Part 12: How to Think About GPUs (§What Is a GPU?, §Memory)"
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    kind: book
+    note: Clear tour of SMs, Tensor Cores, CUDA cores and the memory hierarchy, with H100/B200 spec tables and worked quiz questions. The app's Scaling Book series follows it chapter by chapter.
+  - title: "NVIDIA, GPU Performance Background User's Guide (§2–3)"
+    url: https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html
+    kind: docs
+    note: Short official explanation of SMs, the thread-block hierarchy, latency hiding and the tail effect.
+  - title: "NVIDIA, Matrix Multiplication Background User's Guide (§2.2–3)"
+    url: https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html
+    kind: docs
+    note: Tensor Core alignment rules and measured plots of tile and wave quantisation on A100.
+  - title: "PyTorch docs, CUDA semantics (§Asynchronous execution, §CUDA streams)"
+    url: https://docs.pytorch.org/docs/stable/notes/cuda.html
+    kind: docs
+    note: The authoritative description of asynchronous launches, stream ordering, timing and when you must synchronise.
+  - title: "Horace He, Making Deep Learning Go Brrrr From First Principles"
+    url: https://horace.io/brrr_intro.html
+    kind: blog
+    note: The compute / memory-bandwidth / overhead framing, with measurements; a fast read that ties this lesson to rooflines and fusion.

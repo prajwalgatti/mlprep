@@ -1,0 +1,55 @@
+# Topic id prefixes: fund, linalg, rl, llm, gen, sys, vis, code, sb
+- id: fundamentals
+  title: ML Fundamentals
+  icon: function
+  color: blue
+  blurb: Learning theory, classical models, probability & stats, optimization, deep learning basics.
+  order: 1
+- id: linalg
+  title: Linear Algebra
+  icon: square.grid.3x3
+  color: teal
+  blurb: Eigen-things, rank, PSD matrices, Jacobians and Hessians.
+  order: 2
+- id: llms
+  title: Large Language Models
+  icon: text.bubble
+  color: purple
+  blurb: Attention, positional encodings, MoE, LoRA, scaling laws, RLHF, decoding.
+  order: 3
+- id: genmodels
+  title: Generative Modeling
+  icon: wand.and.stars
+  color: pink
+  blurb: VAEs, GANs, diffusion (DDPM/DDIM, SDEs), flow matching, guidance.
+  order: 4
+- id: vision
+  title: Vision & Video
+  icon: video
+  color: orange
+  blurb: ViT, CLIP, self-supervised vision, DiT, video diffusion, tokenizers, metrics.
+  order: 5
+- id: rl
+  title: Reinforcement Learning
+  icon: arrow.triangle.2.circlepath
+  color: green
+  blurb: MDPs, Bellman, TD/Q-learning, policy gradients, PPO/GRPO/DPO, model-based RL.
+  order: 6
+- id: applied
+  title: Applied ML & Systems
+  icon: cpu
+  color: indigo
+  blurb: DDP/FSDP/tensor & pipeline parallelism, mixed precision, checkpointing, profiling.
+  order: 7
+- id: mlcoding
+  title: ML Coding Drills
+  icon: chevron.left.forwardslash.chevron.right
+  color: red
+  blurb: Spot-the-bug, tensor shapes and fill-the-line for attention, backprop and training loops.
+  order: 8
+- id: scalingbook
+  title: "Special Edition: How to Scale Your Model"
+  icon: square.stack.3d.up
+  color: yellow
+  blurb: A lesson series following the JAX Scaling Book (Google DeepMind) — rooflines, TPUs/GPUs, sharding, transformer math, training and inference at scale.
+  order: 9

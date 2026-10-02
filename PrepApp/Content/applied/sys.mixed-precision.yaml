@@ -1,0 +1,508 @@
+id: sys.mixed-precision
+area: applied
+title: "Mixed-precision training: autocast, master weights, loss scaling"
+summary: Why naive fp16 training fails in three distinct ways, and how fp32 master weights, loss scaling and per-op autocasting fix each one. Covers what lives in which dtype, and what mixed precision does and does not save.
+order: 40
+level: core
+tags: [numerics, mixed-precision, amp, loss-scaling, bf16, fp16, memory]
+prereqs: [sys.fp-formats]
+
+explainer:
+  - title: "The problem: half precision is fast but breaks training"
+    body: |
+      **Why bother.** GPUs do matrix multiplies on **Tensor Cores**, dedicated matrix units that take low-precision inputs. On an H100 they deliver about 990 TFLOP/s in bf16, while the general-purpose CUDA cores manage about 66 TFLOP/s. That is a 15× gap against strict fp32 on CUDA cores (vendor and Scaling-Book peak numbers). The fair fp32 baseline on Ampere and later is TF32 on Tensor Cores, which runs at half the 16-bit rate (A100: 156 TF32 vs 312 FP16 TFLOP/s), so the matmul speedup over TF32 is about 2×. Half precision also halves the bytes per activation (less memory) and per gradient (less communication). (Tensor cores are covered fully in `sys.gpu-basics`.)
+
+      **Naive fp16 diverges or stalls.** Casting everything to fp16 runs into three separate problems. Each follows from the format facts in `sys.fp-formats`: fp16 has 10 mantissa bits, max 65504, min normal $6.1\times10^{-5}$ and min subnormal $5.96\times10^{-8}$.
+      1. **Overflow.** Activations, logits or gradients above 65504 become $\infty$, and soon NaN.
+      2. **Gradient underflow.** Gradients below $2^{-25}\approx2.98\times10^{-8}$ (half the smallest subnormal) round to 0. Those between that and $6.1\times10^{-5}$ survive only as subnormals with reduced precision. Backpropagated gradients are often this small.
+      3. **Lost updates.** Even when the update $\eta g$ is representable on its own, $w+\eta g$ can round back to $w$ if $\eta g$ is below half an ulp of $w$.
+
+      **The recipe** (Micikevicius et al. 2018). Each fix targets one failure:
+      - **fp32 master weights** fix (3): updates are applied to an fp32 copy.
+      - **Loss scaling** fixes (2): gradients are shifted up into fp16's range.
+      - **fp32 accumulation and per-op precision (autocast)** fix (1) and protect sums. Precision-sensitive ops run in fp32.
+
+      With bf16, which has fp32's range, (1) and (2) mostly disappear and loss scaling is dropped. (3) gets *worse*, because bf16 has only 7 mantissa bits. So master weights stay.
+
+    source: Micikevicius et al. 2018 §1, §3; Scaling Book Part 12 "How to Think About GPUs" (Tensor Core vs CUDA core FLOP/s)
+
+  - title: "Lost updates and fp32 master weights"
+    body: |
+      **When does $w+\delta$ round back to $w$?** Let $w\in[2^k,2^{k+1})$ in a format with $m$ mantissa bits. The gap to the next number is $2^{k-m}$ (one ulp). Round-to-nearest returns $w$ whenever $|\delta|$ is under half that gap:
+
+      $$|\delta|<\tfrac12\,\mathrm{ulp}(w)=2^{k-m-1}.$$
+
+      Dividing by $|w|$, which lies between $2^k$ and $2^{k+1}$, gives a threshold on the **relative update**:
+
+      $$\frac{|\delta|}{|w|}<\text{between }2^{-(m+2)}\text{ and }2^{-(m+1)}.$$
+
+      The factor of 2 depends on where $w$ sits in its binade. One subtlety: just above a power of two, a *decrease* sees the smaller gap below, so the tighter bound $2^{-(m+2)}$ applies.
+      - fp16 ($m=10$): relative updates below about $2.4$–$4.9\times10^{-4}$ vanish.
+      - bf16 ($m=7$): below about $2.0$–$3.9\times10^{-3}$.
+
+      **Worked examples** (checked in PyTorch).
+      - $w=1$ in fp16: adding or subtracting $10^{-4}$ or $2\times10^{-4}$ leaves 1 unchanged. Micikevicius et al. phrase it as a weight-to-update ratio above 2048 $=2^{11}$.
+      - $w=1$ in bf16: even $10^{-3}$ is lost.
+      - Late in training with Adam (step size $\approx$ the LR per parameter): LR $3\times10^{-5}$ on a bf16 weight $w=0.05$. Half an ulp there is $2^{-13}\approx1.2\times10^{-4}$, so *every* update is discarded and the weight never moves.
+
+      **The fix.** Keep an fp32 **master copy** of the weights. Each step, cast it to half precision for the forward and backward passes, and apply the update to the fp32 copy. In fp32 the half-ulp at 0.05 is $1.9\times10^{-9}$, so small updates accumulate. After enough steps they move the weight far enough to change its half-precision copy.
+
+      **Evidence.** On a Mandarin speech model, updating fp16 weights directly cost 80% relative accuracy, while an fp32 master copy matched fp32 training. About 5% of that model's weight gradients were below $2^{-24}$, so they would vanish in fp16 even before being added to a weight.
+    source: Micikevicius et al. 2018 §3.1 (Fig. 2); Ultra-Scale Playbook "Mixed Precision Training › FP16 and BF16 training"; values verified in PyTorch
+
+  - title: "Gradient underflow and loss scaling"
+    body: |
+      ![Synthetic gradient magnitudes. Unscaled, most fall below fp16's floor. Multiplying the loss by $2^{12}$ shifts the whole histogram right by 12 binades, into the representable range.](sys.mixed-precision/grad-histogram)
+
+      **The observation.** fp16's normal exponents run from $-14$ to $15$, but gradients cluster at small magnitudes. For an SSD detector, Micikevicius et al. found most of fp16's range unused, while many activation gradients fell below it and became 0. Values in $[2^{-27},2^{-24})$ mattered for accuracy.
+
+      **The trick.** Multiply the loss by a constant $S$ before backprop. The chain rule makes every gradient linear in the loss gradient. For any intermediate $h$:
+
+      $$\frac{\partial(SL)}{\partial h}=S\,\frac{\partial L}{\partial h}.$$
+
+      So every activation gradient and every weight gradient is scaled by the same $S$. This costs one multiply and no change to backprop. Before the optimizer, divide the weight gradients by $S$ **in fp32**. Choosing $S$ as a power of two makes the scaling exact: it only shifts the exponent, so no mantissa bits are touched (barring overflow or underflow).
+
+      **Worked example.** A gradient of $10^{-8}$ casts to 0 in fp16. Scaled by $2^{16}$ it becomes $6.55\times10^{-4}$, which is representable, and dividing by $2^{16}$ in fp32 recovers $10^{-8}$. Lifting $10^{-8}$ into the *normal* range ($\ge6.1\times10^{-5}$) needs $S\ge6100$, so the smallest power of two is $2^{13}$.
+
+      **Choosing $S$.**
+      - **Upper limit.** Too large and the largest gradients overflow: $S\cdot\max|g|$ must stay below 65504. An overflow puts inf or NaN into the gradients, which would wreck the weights if applied.
+      - **Lower limit.** Too small and small gradients still underflow.
+      - Networks in the paper needed constant scales from 8 (SSD) to 32K. Many needed none.
+
+      Because the right value varies by model, framework and batch size, and drifts during training, practice uses **dynamic** scaling (next card).
+    source: Micikevicius et al. 2018 §3.2 (Fig. 3); NVIDIA Train With Mixed Precision §2.3.1–2.3.2
+
+  - title: "Dynamic loss scaling and GradScaler"
+    body: |
+      ![Synthetic GradScaler trace. A burst of halvings at the start, a doubling attempt every 2000 clean steps, and an occasional skipped step.](sys.mixed-precision/dynamic-scale)
+
+      **The algorithm.** Start with a large $S$. After each backward pass, check the gradients for inf or NaN.
+      - **Overflow:** skip this optimizer step and set $S\leftarrow S/2$.
+      - **No overflow:** unscale, then step. After $N$ consecutive clean steps, set $S\leftarrow2S$.
+
+      PyTorch's `GradScaler` defaults are `init_scale=65536` ($2^{16}$), `growth_factor=2`, `backoff_factor=0.5` and `growth_interval=2000`. These match the settings NVIDIA reports training with.
+
+      **Steady state.** $S$ hovers just below the overflow limit. Growth attempts cause at most one skip per $N$ steps, and gradient drift or a bad batch can still cause skips at any time.
+
+      **Why start high, when SSD needed only 8?** The two errors are not symmetric.
+      - A scale that is too high announces itself: an inf appears, one step is skipped, and $S$ halves. Going from $2^{16}$ to $2^{3}$ costs at most 13 skipped steps.
+      - A scale that is too low fails *silently*: gradients underflow to 0 and nothing flags it.
+      So the scaler searches downward from a safe-to-overshoot value.
+
+      **Why skipping is safe.** A skipped step discards one minibatch's gradient, which is like dropping that batch from the data. NVIDIA found that occasional skips need no schedule change to match fp32 accuracy. What is *not* safe is applying an update that contains inf or NaN.
+
+      **Debug signal.** If the scale keeps halving every few steps toward tiny values (even below 1), the overflow is not caused by scaling. Something produces inf or NaN for any $S$: an overflowing activation in the forward pass, a log of 0, or a model that does not fit fp16's range. The PyTorch docs warn that most bf16-pretrained models overflow in fp16. Find the op; don't tune the scaler.
+    source: NVIDIA Train With Mixed Precision §2.3.2; PyTorch torch.amp "Gradient Scaling" (GradScaler defaults); Micikevicius et al. 2018 §3.2
+
+  - title: "Where unscale goes: clipping and accumulation"
+    body: |
+      The gradients in `.grad` are scaled by $S$ until they are unscaled. Anything that reads their *magnitude* must see unscaled values. That includes clipping thresholds, gradient-norm logging and gradient penalties. The canonical loop:
+
+      ```python
+      scaler = torch.amp.GradScaler("cuda")
+      for x, y in data:
+          opt.zero_grad()
+          with torch.autocast("cuda", dtype=torch.float16):
+              loss = loss_fn(model(x), y)
+          scaler.scale(loss).backward()   # grads = S * true grads
+          scaler.unscale_(opt)            # divide by S, in place
+          torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+          scaler.step(opt)    # skips opt.step() if any inf/NaN
+          scaler.update()     # halve on overflow, else maybe grow
+      ```
+
+      `torch.cuda.amp.*` is deprecated in favour of the device-generic `torch.amp.*` used above.
+
+      **What breaks if you clip before unscaling?** The norm you measure is $S\,\|g\|$. With $S=2^{16}$ and threshold 1.0, almost every step gets clipped to norm 1 *in scaled units*. After unscaling, the gradients handed to the optimizer are about $S\times$ too small, and since every step is clipped to the same norm, the clip threshold no longer means anything.
+      - **SGD**: updates shrink by that factor and training crawls.
+      - **Adam**: its update $m/(\sqrt v+\epsilon)$ cancels a constant scale while $|g|\gg\epsilon$. But a total norm of $1/S$ spread over $10^9$ parameters gives elements of about $5\times10^{-10}$, far below $\epsilon=10^{-8}$. $\epsilon$ then dominates, and updates shrink by a model-dependent amount.
+
+      Micikevicius et al. recommend unscaling right after backward, before clipping or weight decay, so that no hyperparameter has to change.
+
+      **Gradient accumulation** over $k$ micro-batches:
+      - Keep the gradients *scaled* and $S$ *constant* while accumulating. If $S$ changed in the middle, the buffer would hold a sum of gradients at different scales, and no single division could recover it.
+      - Divide each micro-batch loss by $k$ if you want the mean.
+      - Call `unscale_` (optionally), `step` and `update` only once per effective batch, after the last micro-batch. `unscale_` twice before a step raises an error.
+
+      **The bf16 version of the loop** has no scaler at all: `loss.backward()`, clip, `opt.step()`. bf16's range makes underflow rare (`sys.fp-formats`).
+    source: PyTorch AMP examples "Typical Mixed Precision Training", "Working with Unscaled Gradients › Gradient clipping", "Gradient accumulation"; Micikevicius et al. 2018 §3.2
+
+  - title: "Autocast: which ops run in which precision"
+    body: |
+      Micikevicius et al. sort network arithmetic into three kinds, each treated differently.
+      1. **Dot products** (matmuls, convolutions). Inputs are half precision, but products are **accumulated in fp32**. A dot product of length $K$ sums $K$ terms, and a half-precision running sum stops absorbing terms once they fall below half its ulp. Example: a bf16 running sum of 10,000 copies of 0.1 stalls at **32** instead of 1000. At 32 the bf16 gap is 0.25, so adding 0.1 rounds away. fp16 stalls at 256. Tensor Cores multiply half inputs and accumulate in fp32. Caveat: for speed, PyTorch by default lets fp16 and bf16 GEMMs truncate some intermediate partial sums to half precision (`allow_fp16_reduced_precision_reduction`, and the bf16 equivalent). This is usually benign, but it can produce rare infs when the final result would fit.
+      2. **Large reductions** (sums, means, softmax denominators, normalisation statistics) run in fp32 for the same reason, and to avoid overflow.
+      3. **Pointwise ops** (activations, elementwise products) are limited by memory bandwidth, so running their arithmetic in fp32 costs nothing. Either precision works.
+
+      **What `torch.autocast` does** (CUDA lists, abridged). You don't cast the model. Inside the region each listed op casts its inputs:
+      - **To half** (fp16, or bf16 if you ask): `matmul`, `linear`, `conv*`, `bmm`, `addmm`, RNN cells.
+      - **To fp32**: `softmax`, `log_softmax`, `exp`, `log`, `pow`, `sum`, `cumsum`, `layer_norm`, `group_norm`, `norm`, and the losses (`cross_entropy`, `mse_loss`, `kl_div`, …).
+      - **Promote to widest**: multi-input ops such as `addcmul`, `dot` and `tensordot` run in fp32 if any input is fp32.
+      - **Unlisted ops** run in whatever dtype their inputs have.
+
+      Backward ops reuse the forward op's dtype, so autocast wraps only the forward pass and the loss. `binary_cross_entropy` raises an error under autocast: its gradient may not fit in fp16. Use the fused `..._with_logits` version.
+
+      **Tensor-Core shapes.** NVIDIA's guide asks for fp16 matmul dimensions that are multiples of 8, and recommends padding batch, hidden sizes and vocabulary to match. For example, pad a vocabulary of 50257 to 50264. Misaligned shapes fall back to slower kernels.
+    source: Micikevicius et al. 2018 §3.3; PyTorch torch.amp "Autocast Op Reference" (CUDA op lists, BCE note); NVIDIA Train With Mixed Precision §4.1; sums verified in PyTorch
+
+  - title: "What lives in which dtype"
+    body: |
+      ![One step of mixed-precision training. fp32 bookends the step (master weights, optimizer, unscale), and half precision fills the middle (matmuls, saved activations, activation gradients).](sys.mixed-precision/dtype-flow)
+
+      Two common layouts, both with Adam.
+
+      **A. `torch.autocast` on an fp32 model** (typical single-node PyTorch).
+      - **Parameters**: fp32. Autocast casts them to bf16 or fp16 per op and caches the cast copy inside the region. The fp32 parameters *are* the master weights.
+      - **Gradients**: fp32. The backward of the cast op converts the gradient back to the parameter's dtype.
+      - **Adam $m$ and $v$**: fp32.
+      - **Saved activations**: half precision for matmul outputs; fp32 for ops autocast runs in fp32.
+      - **Communication**: DDP groups gradients into buckets (25 MB by default) and all-reduces each bucket as soon as it fills. Those buckets hold `.grad`, so DDP sends **fp32** gradients: twice the bytes of bf16. The exceptions are a model cast to bf16, or a registered communication hook (a user function applied to each bucket) that casts it to bf16 before sending.
+
+      **B. bf16 parameters with an fp32 master copy in the optimizer** (Megatron-style, FSDP mixed precision).
+      - Working parameters and gradients are bf16, and the master weights, $m$ and $v$ are fp32.
+      - Many stacks also keep an **fp32 gradient accumulation buffer**, because summing many small bf16 gradients loses precision (the Playbook notes nanotron does this).
+      - FSDP exposes the choices directly: `param_dtype` for compute and all-gather, and `reduce_dtype` for the gradient reduce-scatter. You can therefore compute in bf16 and reduce in fp32.
+
+      **bf16 vs fp16 in practice.**
+      - **bf16**: no loss scaling (Kalamkar et al. trained many workloads without it). fp32 master weights and fp32 optimizer state are still needed, by the lost-update argument above.
+      - **fp16**: everything above *plus* dynamic loss scaling, and care with ops that overflow. It is still used on GPUs without bf16 Tensor Cores and for inference.
+
+      **Scope.** "No loss scaling with bf16" is an empirical finding for the workloads studied. It is not a guarantee for gradients below $10^{-38}$.
+    source: PyTorch torch.amp "Autocasting"; PyTorch DDP note "Internal Design"; PyTorch fully_shard "MixedPrecisionPolicy"; Ultra-Scale Playbook "Memory usage in Transformers"; Kalamkar et al. 2019 §3; fp32 DDP bucket dtype verified in PyTorch
+
+  - title: "Does mixed precision save memory?"
+    body: |
+      **Model states per parameter, Adam.** "Model states" are the parameters, gradients and optimizer state, everything except activations.
+      - **Pure fp32**: weights 4 + gradients 4 + Adam $m$ 4 + $v$ 4 = **16 bytes**.
+      - **Mixed bf16**: bf16 weights 2 + bf16 gradients 2 + fp32 master 4 + $m$ 4 + $v$ 4 = **16 bytes**.
+      - **Mixed with an fp32 gradient buffer**: 2 + 2 + 4 + 4 + 4 + 4 = **20 bytes**.
+
+      So mixed precision does **not** shrink model states. It moves bytes around and can add 4. For a 7B model, model states take $16\times7\times10^9=112$ GB, or 140 GB with the fp32 gradient buffer. Both exceed an 80 GB H100 before a single activation is stored. That is the motivation for sharding (`sys.zero`).
+
+      **What it does save.**
+      - **Activations**, stored in 2 bytes instead of 4. This is often the largest consumer at long sequence lengths or large batches (`sys.memory-anatomy`). Micikevicius et al. report overall training memory "roughly halved" for their workloads because activations dominated there.
+      - **Communication**, if gradients or parameters are sent in bf16 (layout B, or a compression hook).
+      - **Time**: Tensor-Core matmuls, and half the HBM traffic for memory-bound ops.
+
+      **Common wrong answers.**
+      - "Mixed precision halves memory." It halves activation memory and possibly communication, not optimizer state.
+      - "The fp32 master copy is a 50% overhead." For weights it is: 6 bytes (2 + 4) against fp32's 4. But bf16 gradients take 2 bytes instead of 4, which pays for those 2 extra bytes, so the total stays at 16.
+      - "bf16 training doesn't need fp32 anything." The update and the optimizer state still need fp32.
+    source: Ultra-Scale Playbook "Memory usage in Transformers › Weights/grads/optimizer states memory" (16 vs 20 bytes table); Micikevicius et al. 2018 §3.1; Rajbhandari et al. 2020 §3.1
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Why do we need master weights if bf16 has fp32's range?"* Range is not the problem; precision is. An update is lost if it is below half an ulp of the weight: relative $2^{-9}$ to $2^{-8}$ in bf16, against $2^{-25}$ to $2^{-24}$ in fp32. Late-training Adam steps are often smaller than that.
+      - *"Why does loss scaling work?"* Backprop is linear in the upstream gradient, so scaling the loss by $S$ scales every gradient by $S$. Use a power of two, so it is exact. Unscale in fp32 before anything reads the magnitudes.
+      - *"What does GradScaler do on an inf?"* It skips `optimizer.step()`, multiplies $S$ by 0.5, and resets the clean-step counter. After 2000 clean steps it doubles $S$.
+      - *"Where must you call `unscale_`?"* After the final backward of the effective batch, before clipping, logging or penalties, and once per step. Otherwise the clip threshold is in scaled units.
+      - *"Does mixed precision save memory?"* Not for model states (16 bytes per parameter either way, 20 with an fp32 gradient buffer). It halves activations and possibly communication.
+      - *"Which ops stay in fp32 under autocast, and why?"* Reductions, softmax, log and exp, norms and losses. Long sums swamp and exp overflows in half precision, and these ops are memory-bound, so fp32 math is free.
+      - *"DDP plus autocast: what dtype is all-reduced?"* fp32, because the parameters, hence `.grad`, are fp32. That doubles comm time against bf16.
+      - *"Scale collapsing toward 0?"* A genuine inf or NaN in the forward pass, not underflow.
+    source: Micikevicius et al. 2018 §3; PyTorch torch.amp "Gradient Scaling"; PyTorch AMP examples; Ultra-Scale Playbook "Mixed Precision Training"
+
+  - title: "Key results"
+    body: |
+      - Pure fp16 has three failure modes: overflow above 65504, gradients below $2.98\times10^{-8}$ becoming 0, and updates below half an ulp of $w$ being lost. The fixes are autocast with fp32 accumulation, loss scaling, and fp32 master weights.
+      - Lost-update threshold (relative update):
+
+      $$\frac{|\eta g|}{|w|}<\tfrac12\frac{\mathrm{ulp}(w)}{|w|}\in\big[2^{-(m+2)},2^{-(m+1)}\big]$$
+
+      That is about $2.4$–$4.9\times10^{-4}$ for fp16 and $2.0$–$3.9\times10^{-3}$ for bf16.
+      - Loss scaling: $\nabla(SL)=S\,\nabla L$. Use a power-of-two $S$, require $S\max|g|<65504$, and unscale in fp32.
+      - GradScaler: init $2^{16}$; on inf/NaN skip the step and halve; after 2000 clean steps double.
+      - Order: `scale(loss).backward()` → `unscale_` → clip → `step` → `update`. With accumulation, keep $S$ fixed and unscale once per effective batch.
+      - Autocast: matmul/conv in half with fp32 accumulation; softmax, log, exp, sum, norms and losses in fp32.
+      - Adam model states: 16 bytes/param (fp32 or mixed), 20 with an fp32 gradient buffer. 7B gives 112 / 140 GB. Mixed precision saves activations and communication.
+      - bf16 needs no loss scaling (empirically) but still needs fp32 master weights and optimizer state.
+    source: Micikevicius et al. 2018 §3; NVIDIA Train With Mixed Precision §2.3; PyTorch torch.amp; Ultra-Scale Playbook "Memory usage in Transformers"
+
+quiz:
+  - id: q1
+    prompt: |
+      An AdamW setup keeps bf16 working parameters, an fp32 master copy, gradients **only** in fp32, and fp32 $m$ and $v$. How many bytes per parameter do the model states take?
+    correct: '18'
+    wrong:
+      - '16'
+      - '20'
+      - '12'
+    explanation: |
+      $2$ (bf16 params) $+\,4$ (master) $+\,4$ (fp32 grads) $+\,4\,(m)+4\,(v)=18$. 16 is the standard mixed layout with bf16 gradients ($2+2+4+4+4$). 20 adds an fp32 gradient buffer *on top of* bf16 gradients. 12 forgets the optimizer state or the master copy.
+    source: Ultra-Scale Playbook "Memory usage in Transformers"; Rajbhandari et al. 2020 §3.1
+
+  - id: q2
+    prompt: |
+      You train in fp16 with dynamic loss scaling but update the fp16 weights directly (no fp32 master copy). Which symptom is most likely?
+    correct: Late-training progress stalls as small updates round away
+    wrong:
+      - Loss becomes NaN in the first few steps from gradient overflow
+      - Nothing changes, since loss scaling already prevents underflow
+      - Early training stalls, then recovers once the scale has grown
+    explanation: |
+      Loss scaling protects *gradients* during backprop, but they are unscaled before the update. $w+\eta g$ still rounds back to $w$ when $|\eta g|/|w|$ is below about $2.4$–$4.9\times10^{-4}$. That happens increasingly as the LR decays, so progress stalls late. Overflow is what the dynamic scaler handles by skipping steps.
+    source: Micikevicius et al. 2018 §3.1
+
+  - id: q3
+    prompt: |
+      In an fp16 run, GradScaler's scale halves every few steps and drifts down to values below 1. What does this most likely indicate?
+    correct: An inf/NaN arises in the forward pass regardless of scale
+    wrong:
+      - Gradients are underflowing, so the scaler is compensating
+      - The growth interval is too short, so it overshoots repeatedly
+      - The learning rate is too small to move the weights
+    explanation: |
+      The scale only halves when it sees inf or NaN. If halving never cures it, the non-finite values do not come from scaling: an activation overflowing 65504, $\log 0$, or a model trained in bf16 that does not fit fp16's range (the PyTorch docs warn about this). Underflow would never shrink the scale, since a too-small scale just loses gradients silently.
+    source: PyTorch torch.amp "Gradient Scaling"; NVIDIA Train With Mixed Precision §2.3.2
+
+  - id: q4
+    prompt: |
+      Which ordering of calls is correct for fp16 AMP with gradient-norm clipping?
+    correct: 'scale(loss).backward → unscale_ → clip → step → update'
+    wrong:
+      - 'scale(loss).backward → clip → unscale_ → step → update'
+      - 'scale(loss).backward → step → unscale_ → clip → update'
+      - 'scale(loss).backward → unscale_ → clip → update → step'
+    explanation: |
+      Clipping reads the gradient norm, so it must see unscaled gradients, and `step` must come after clipping to use them. `update` adjusts $S$ based on whether this step found infs, so it comes last. Clipping before `unscale_` measures $S\|g\|$ against a threshold meant for $\|g\|$.
+    source: PyTorch AMP examples "Working with Unscaled Gradients › Gradient clipping"
+
+  - id: q5
+    prompt: |
+      With $S=2^{16}$, someone calls `clip_grad_norm_(params, 1.0)` *before* `unscale_`. True gradient norms are around 0.5. What happens?
+    correct: Every step is clipped; the optimizer gets gradients ~S× too small
+    wrong:
+      - Nothing, because clipping is invariant to a constant scale
+      - Clipping never triggers, because the threshold is in fp32
+      - The scaled gradients overflow, so every step is skipped
+    explanation: |
+      The measured norm is $0.5\times65536=32768\gg1$, so every step is rescaled to norm 1 in scaled units. After unscaling, the true norm is $1/65536$ instead of 0.5. With SGD the updates shrink by that factor. Adam cancels a constant scale while $|g|\gg\epsilon$, but gradient elements this small fall below $\epsilon$, so its updates shrink too, by a model-dependent amount. Clipping keeps direction but not magnitude, so it is not scale-invariant.
+    source: PyTorch AMP examples "Working with Unscaled Gradients"; Micikevicius et al. 2018 §3.2; Kingma & Ba 2015 §2
+
+  - id: q6
+    prompt: |
+      Which statement is **false**?
+    correct: bf16 training typically needs dynamic loss scaling
+    wrong:
+      - Under autocast, softmax and layer_norm run in fp32
+      - Under autocast, linear layers run in half precision
+      - With autocast on an fp32 model, `.grad` tensors are fp32
+    explanation: |
+      bf16 has fp32's exponent range, so gradients rarely underflow, and Kalamkar et al. trained without loss scaling. softmax and layer_norm are on autocast's fp32 list, and linear is on its half list. The parameters stay fp32 under autocast, and the backward of the cast returns fp32 gradients to them.
+    source: Kalamkar et al. 2019 §3; PyTorch torch.amp "Autocast Op Reference"
+
+  - id: q7
+    prompt: |
+      What is the smallest power-of-two loss scale that lifts a gradient of $10^{-8}$ into fp16's **normal** range (min normal $6.1\times10^{-5}$)?
+    correct: '$2^{13}$'
+    wrong:
+      - '$2^{10}$'
+      - '$2^{16}$'
+      - '$2^{24}$'
+    explanation: |
+      We need $S\ge6.1\times10^{-5}/10^{-8}\approx6100$. $2^{12}=4096$ gives $4.1\times10^{-5}$, still subnormal. $2^{13}=8192$ gives $8.2\times10^{-5}$, which is normal. $2^{16}$ also works but is not the smallest. $2^{10}$ leaves the value subnormal, about $10^{-5}$.
+    source: Micikevicius et al. 2018 §3.2; Goldberg 1991 "Denormalized Numbers"
+
+  - id: q8
+    prompt: |
+      Micikevicius et al. found a loss scale of 8 sufficient for SSD, yet GradScaler starts at 65536. Why start so high?
+    correct: Too high costs a few skips; too low fails silently
+    wrong:
+      - Larger scales make the unscaled fp32 gradients more precise
+      - 65536 is fp16's largest value, so it uses the full range
+      - Modern models need about 8000× more scaling than SSD did
+    explanation: |
+      A too-large $S$ produces an inf, one step is skipped and $S$ halves. Reaching 8 from 65536 takes at most 13 halvings. A too-small $S$ lets gradients underflow to 0 with no signal. Once representable, gradients unscale to the same fp32 value whatever the scale. fp16's max is 65504, and the scale itself is an fp32 number.
+    source: NVIDIA Train With Mixed Precision §2.3.2; Micikevicius et al. 2018 §3.2
+
+  - id: q9
+    prompt: |
+      GradScaler starts at $2^{16}$ with default settings. Steps 1–5 overflow, and every step from 6 onward is clean. What scale is used at step 4006, and how many optimizer updates have been skipped?
+    correct: '$2^{13}$, with 5 skipped'
+    wrong:
+      - '$2^{11}$, with 5 skipped'
+      - '$2^{12}$, with 5 skipped'
+      - '$2^{13}$, with 0 skipped'
+    explanation: |
+      Five overflows halve $S$ five times, $2^{16}\to2^{11}$, and each of those steps is skipped. Steps 6–2005 are 2000 clean steps, so $S$ becomes $2^{12}$. Steps 2006–4005 are another 2000, so $S$ becomes $2^{13}$ for step 4006. $2^{11}$ ignores growth, and $2^{12}$ counts only one doubling. Overflow steps are always skipped, never applied.
+    source: PyTorch torch.amp "Gradient Scaling" (defaults); NVIDIA Train With Mixed Precision §2.3.2
+
+  - id: q10
+    prompt: |
+      With 4-step gradient accumulation under fp16 AMP, someone calls `scaler.update()` after **every** micro-batch. What goes wrong?
+    correct: Micro-batch gradients at different scales get summed together
+    wrong:
+      - Gradients are unscaled four times, so updates are $S^4$ too small
+      - Nothing, since `update` affects only the next optimizer step
+      - Each micro-batch loss is divided by 4 twice
+    explanation: |
+      `update` may change $S$ (grow or back off), so later micro-batches add gradients scaled by a different factor to the buffer. No single division then recovers the true sum. The rule is to keep $S$ fixed and the gradients scaled during accumulation, and to unscale, step and update once per effective batch. `update` does not unscale anything.
+    source: PyTorch AMP examples "Gradient accumulation"
+
+  - id: q11
+    prompt: |
+      A weight stored in bf16 equals 3.0. The optimizer's update for it is $5\times10^{-3}$. Applied directly in bf16, what happens?
+    correct: The update is lost; half an ulp at 3.0 is about $7.8\times10^{-3}$
+    wrong:
+      - It is applied exactly, since $5\times10^{-3}$ is representable in bf16
+      - It is rounded up to one ulp, $1.6\times10^{-2}$, so the weight overshoots
+      - It is lost only in fp16; bf16's wider range keeps it
+    explanation: |
+      3.0 lies in $[2,4)$, where bf16's gap is $2^{1-7}=2^{-6}\approx1.56\times10^{-2}$. $5\times10^{-3}$ is below half of that, so $w\pm\delta$ rounds back to 3.0 (checked in PyTorch). $\delta$ on its own *is* representable; the loss happens at the addition. Range doesn't help, since this is a precision effect. In fp16 the gap at 3.0 is $2^{-9}$, and this update would survive.
+    source: Micikevicius et al. 2018 §3.1; verified in PyTorch
+
+  - id: q12
+    prompt: |
+      A 1.3B model is trained with DDP and `torch.autocast(dtype=torch.bfloat16)` on an fp32 model, with no comm hook. In what dtype are gradients all-reduced, and what does that imply?
+    correct: fp32, so comm volume is twice a bf16 all-reduce
+    wrong:
+      - bf16, because autocast computes the backward in bf16
+      - bf16, because DDP casts gradients to the autocast dtype
+      - fp32 for matmul weights, bf16 for everything else
+    explanation: |
+      Autocast leaves parameters in fp32, and the backward of the cast returns fp32 gradients to `.grad`. DDP all-reduces those buckets, so 4 bytes per parameter go over the wire instead of 2. To halve it, cast the model to bf16 (keeping an fp32 master copy elsewhere) or register a bf16 compression hook. With FSDP, set `reduce_dtype`.
+    source: PyTorch torch.amp "Autocasting"; PyTorch DDP note "Internal Design"; DDP comm-hook bucket dtype verified in PyTorch
+
+  - id: q13
+    prompt: |
+      A running sum is kept in fp16 and 0.01 is added to it 10,000 times. What does it end at?
+    correct: '32'
+    wrong:
+      - '100'
+      - '64'
+      - '16'
+    explanation: |
+      At 32 the fp16 gap is $2^{5-10}=2^{-5}\approx0.031$, so half a gap is $0.0156>0.01$, and every addition rounds back to 32 (checked in PyTorch). Below 32 the half-gap is smaller than 0.01, so the sum keeps growing until it reaches 32. 100 is the exact answer, which needs an fp32 accumulator. This swamping is why matmuls and reductions accumulate in fp32.
+    source: Micikevicius et al. 2018 §3.3; verified in PyTorch
+
+cards:
+  - id: f1
+    front: The three failure modes of pure fp16 training, and the fix for each.
+    back: |
+      1. **Overflow** (above 65504 becomes inf, then NaN): autocast runs sensitive ops in fp32 and accumulates in fp32.
+      2. **Gradient underflow** (below $2.98\times10^{-8}$ becomes 0): loss scaling.
+      3. **Lost updates** ($\eta g$ below half an ulp of $w$): fp32 master weights.
+    source: Micikevicius et al. 2018 §3
+
+  - id: f2
+    front: When is a weight update lost, and what are the fp16 and bf16 thresholds?
+    back: |
+      When $|\eta g|<\tfrac12\mathrm{ulp}(w)$, i.e. a relative update below between $2^{-(m+2)}$ and $2^{-(m+1)}$, depending on where $w$ sits in its binade.
+      - fp16: about $2.4$–$4.9\times10^{-4}$
+      - bf16: about $2.0$–$3.9\times10^{-3}$
+    source: Micikevicius et al. 2018 §3.1
+
+  - id: f3
+    front: How does loss scaling work, and where is it undone?
+    back: |
+      Compute $SL$ and backprop it. By linearity of the chain rule every gradient becomes $S\nabla L$, so small values move into fp16's range. Use a power of two so the scaling is exact. Divide the weight gradients by $S$ in fp32 after backward, before clipping, weight decay or the optimizer.
+    source: Micikevicius et al. 2018 §3.2; NVIDIA Train With Mixed Precision §2.3.1
+
+  - id: f4
+    front: GradScaler's defaults and update rule.
+    back: |
+      `init_scale` $=2^{16}$, `growth_factor` 2, `backoff_factor` 0.5, `growth_interval` 2000. On inf or NaN in the gradients it skips `optimizer.step()` and halves $S$. After 2000 consecutive clean steps it doubles $S$.
+    source: PyTorch torch.amp "Gradient Scaling"
+
+  - id: f5
+    front: Which ops does CUDA autocast run in half precision, and which in fp32?
+    back: |
+      - **Half**: matmul, linear, conv, bmm, addmm, RNN cells. Products are accumulated in fp32 by Tensor Cores.
+      - **fp32**: softmax, log_softmax, exp, log, pow, sum, cumsum, layer_norm, group_norm, norm, and the losses.
+      - **Promote to widest**: multi-input ops such as addcmul and dot.
+      - **Unlisted**: run in their input dtype.
+    source: PyTorch torch.amp "Autocast Op Reference"
+
+  - id: f6
+    front: Bytes per parameter for Adam's model states, fp32 vs mixed precision, and the 7B totals.
+    back: |
+      - fp32: $4+4+4+4=16$.
+      - Mixed bf16: $2\,(w)+2\,(g)+4\,(\text{master})+4\,(m)+4\,(v)=16$.
+      - With an fp32 gradient buffer: 20.
+
+      For 7B: 112 GB, or 140 GB with the gradient buffer. Mixed precision saves activations and communication, not model states.
+    source: Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - id: f7
+    type: open
+    front: Walk an interviewer through one fp16 mixed-precision training step, naming the dtype of every tensor.
+    back: |
+      1. **Cast.** fp32 master weights are cast to fp16 (autocast does this per op and caches it).
+      2. **Forward.** Matmuls take fp16 inputs and accumulate in fp32, writing fp16 outputs. Softmax, norms, exp, log and the loss run in fp32. Saved activations are mostly fp16.
+      3. **Scale.** The loss (fp32) is multiplied by $S$ (power of two, starting at $2^{16}$).
+      4. **Backward.** Activation gradients are fp16, scaled by $S$. The cast's backward delivers weight gradients to the fp32 `.grad`.
+      5. **Unscale.** Divide by $S$ in fp32 and check for inf or NaN. On overflow, skip the step and halve $S$.
+      6. **Clip** on unscaled gradients.
+      7. **Optimizer.** Adam $m$ and $v$ are fp32. The update is applied to the fp32 master, so updates below fp16's half-ulp still accumulate.
+      8. **Update the scaler.** Double $S$ after 2000 clean steps.
+
+      With bf16, steps 3 and 5's skip logic disappear, and the rest is the same.
+    source: Micikevicius et al. 2018 §3; PyTorch AMP examples; NVIDIA Train With Mixed Precision §2.3
+
+  - id: f8
+    type: open
+    front: Derive why bf16 training still needs fp32 master weights, with a concrete number.
+    back: |
+      - **Setup.** For $w\in[2^k,2^{k+1})$, bf16's gap is $2^{k-7}$. Round-to-nearest returns $w$ for $|\delta|<2^{k-8}$, i.e. relative updates below $2^{-9}$ to $2^{-8}$ ($2.0$–$3.9\times10^{-3}$).
+      - **Typical update.** Adam moves each weight by about the LR per step. Late in training the LR is around $10^{-5}$ to $10^{-4}$, and weights are $O(10^{-2})$ to $O(1)$.
+      - **Example.** $w=0.05$, step $3\times10^{-5}$. Half an ulp is $2^{-13}\approx1.2\times10^{-4}$, so every update is rounded away and the weight freezes.
+      - **Fix.** Accumulate updates in an fp32 master copy, where the half-ulp at 0.05 is $\approx1.9\times10^{-9}$, and recast to bf16 each step. Range is irrelevant here: bf16 has fp32's range but only 8 significant bits.
+      - **Related.** Keep Adam's $m$ and $v$ in fp32 too, and accumulate gradients over micro-batches in fp32 if possible.
+    source: Micikevicius et al. 2018 §3.1; Kalamkar et al. 2019 §3; verified in PyTorch
+
+  - id: f9
+    type: open
+    front: '"Does mixed precision halve training memory?" Give the full answer.'
+    back: |
+      - **Model states: no.** Adam in fp32 takes $4+4+8=16$ bytes per parameter. Mixed bf16 takes $2+2$ (working weights and gradients) $+\,4$ (master) $+\,8$ ($m$, $v$) $=16$, or 20 with an fp32 gradient accumulation buffer. A 7B model needs 112 to 140 GB of model states either way, more than one 80 GB H100.
+      - **Activations: yes, about half.** They are stored in 2 bytes, and they dominate at large micro-batch × sequence length, which is why Micikevicius et al. saw total memory roughly halve.
+      - **Communication: possibly half,** if gradients or parameters are sent in bf16. Plain DDP with autocast still all-reduces fp32 gradients.
+      - **The real wins** are Tensor-Core throughput (about 15× strict fp32 on CUDA cores, about 2× TF32 on Tensor Cores) and less HBM traffic.
+      - **To shrink model states** you need sharding (ZeRO/FSDP), offload, or lower-precision optimizer state.
+    source: Ultra-Scale Playbook "Memory usage in Transformers"; Micikevicius et al. 2018 §3.1
+
+  - id: f10
+    type: open
+    front: Explain why matmuls accumulate in fp32 and which other ops autocast keeps in fp32, with a numerical example.
+    back: |
+      - **The problem.** A dot product of length $K$ adds $K$ terms. A running sum $s$ in half precision ignores any term below half its ulp, about $|s|\,2^{-(m+1)}$. As $s$ grows, smaller terms get swamped.
+      - **Example.** Adding 0.1 ten thousand times stalls at 32 in bf16 (gap 0.25) and at 256 in fp16, against the true 1000. Error grows with $K$, which is in the thousands for hidden sizes.
+      - **The fix.** Tensor Cores multiply half inputs and accumulate in fp32, writing the result back in half. PyTorch's default reduced-precision GEMM reductions relax this slightly. Disable them if you see unexplained infs.
+      - **Same logic for reductions** (sum, mean, softmax denominator, LayerNorm/BatchNorm statistics). Micikevicius et al. run them in fp32.
+      - **Overflow-prone ops**: exp overflows fp16 above 11.09, and losses take logs of small numbers. So autocast's fp32 list includes softmax, log_softmax, exp, log, pow, sum, norms and losses.
+      - **Cost.** These ops are memory-bound, so fp32 arithmetic is essentially free. They still read and write half-precision tensors.
+    source: Micikevicius et al. 2018 §3.3; PyTorch torch.amp "Autocast Op Reference"
+
+  - id: f11
+    type: open
+    front: Your fp16 AMP run diverges. Give a diagnostic checklist specific to mixed precision.
+    back: |
+      1. **Watch the loss scale.** If it collapses toward 1 or below, there is a real inf or NaN in the forward pass. Bisect with hooks to find the op (overflowing activation, un-shifted exp, $\log0$, division by a tiny norm).
+      2. **Check the order** `unscale_` → clip → `step` → `update`. Clipping scaled gradients clips every step and hands the optimizer gradients about $S\times$ too small. Under SGD that shows up as stalling. Under Adam it shows up as $\epsilon$-dominated, shrunken updates. Either way it is stalling, not divergence.
+      3. **Check accumulation**: $S$ must stay constant within an effective batch, with `update` called once per step.
+      4. **Check dtypes**: optimizer state and master weights must be fp32, and $\epsilon$ must not sit in fp16 (where $10^{-8}$ becomes 0).
+      5. **Check model provenance.** A model pretrained in bf16 may simply not fit fp16's range. Switch to bf16.
+      6. **Check custom ops.** Make sure losses use fused, stable forms (`*_with_logits`) and that custom autograd functions use `custom_fwd`/`custom_bwd` (decorators that make a custom autograd Function respect autocast) or explicit fp32.
+    source: PyTorch torch.amp "Gradient Scaling"; PyTorch AMP examples; NVIDIA Train With Mixed Precision §2.3.2
+
+reading:
+  - title: "Micikevicius et al. (2018), Mixed Precision Training, §3"
+    url: https://arxiv.org/abs/1710.03740
+    kind: paper
+    note: The original recipe. §3.1 is master weights (the 2048 ratio), §3.2 loss scaling (SSD histogram), §3.3 fp32 accumulation.
+  - title: "NVIDIA, Train With Mixed Precision, §2.3 and §4"
+    url: https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html
+    kind: docs
+    note: Choosing a scale factor, the dynamic loss-scaling procedure, and Tensor Core shape rules.
+  - title: "PyTorch torch.amp: Autocasting, Gradient Scaling, Autocast Op Reference"
+    url: https://docs.pytorch.org/docs/stable/amp.html
+    kind: docs
+    note: GradScaler defaults and the exact lists of ops autocast runs in half, in fp32, or promotes.
+  - title: "PyTorch AMP examples: unscaled gradients, clipping, accumulation"
+    url: https://docs.pytorch.org/docs/stable/notes/amp_examples.html
+    kind: docs
+    note: Canonical code for where `unscale_` goes with clipping and gradient accumulation.
+  - title: "Ultra-Scale Playbook: Memory usage in Transformers; Mixed Precision Training"
+    url: https://huggingface.co/spaces/nanotron/ultrascale-playbook
+    kind: book
+    note: The 16 vs 20 bytes-per-parameter table, and a short overview of fp16/bf16/fp8 training.

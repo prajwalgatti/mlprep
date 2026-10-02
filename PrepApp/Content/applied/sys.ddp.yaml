@@ -1,0 +1,463 @@
+id: sys.ddp
+area: applied
+title: Distributed Data Parallel (DDP)
+summary: Replicate the model, split the batch, average the gradients. How DDP hides the all-reduce behind the backward pass with hooks and buckets, when per-GPU batch size makes communication exposed, and the hangs and correctness traps that bite in practice.
+order: 180
+level: core
+tags: [distributed-training, data-parallel, ddp, all-reduce, pytorch]
+prereqs: [sys.collectives, sys.memory-anatomy, sys.roofline]
+
+explainer:
+  - title: "The problem: replicate the model, split the batch"
+    body: |
+      **Goal.** One GPU takes too long on our batch, but the model fits on one GPU. The simplest way to use $P$ GPUs is **data parallelism**:
+      - give each of the $P$ ranks a full copy (*replica*) of the model;
+      - split every global batch of $B$ examples (or tokens) into $P$ equal shards;
+      - let each rank run forward and backward on its own shard;
+      - make sure every replica applies the *same* update, so the replicas stay identical.
+
+      **Why averaging gradients gives exactly single-GPU training.** The loss on the full batch is the mean of per-example losses, $L=\frac1B\sum_{i=1}^B\ell_i$. Rank $p$ holds shard $\mathcal B_p$ of size $B/P$ and computes $g_p=\frac{P}{B}\sum_{i\in\mathcal B_p}\nabla\ell_i$, the gradient of its local mean loss. Averaging over ranks:
+
+      $$\begin{aligned}\frac1P\sum_{p=1}^P g_p &=\frac1P\sum_p\frac{P}{B}\sum_{i\in\mathcal B_p}\nabla\ell_i\\ &=\frac1B\sum_{i=1}^B\nabla\ell_i=\nabla L\end{aligned}$$
+
+      So **one all-reduce of the gradients** (sum, then divide by $P$) gives every rank $\nabla L$. Each rank then runs an identical optimizer step locally. This is what PyTorch's `DistributedDataParallel` (DDP) does: it averages, which means summing with NCCL and dividing by the world size.
+
+      **When the equality breaks.** It needs **equal shard sizes**, or more precisely, each $g_p$ must be normalised so that the shards combine with the right weights.
+      - If ranks see different numbers of tokens (variable-length sequences, padding), the mean of per-rank means is not the per-token mean.
+      - Code that sums its loss instead of averaging must divide by the *global* count, because all-reduce sums. Goyal et al. make this point: absorb the $1/(kn)$ into the loss for $k$ workers with $n$ examples each.
+      - Loss normalisation is treated in full in `sys.gradient-accumulation`.
+
+      **Why gradients, not parameters?** One alternative is to average *parameters* after independent local steps. Li et al. note this is not equivalent to single-GPU training once the optimizer has state (momentum, Adam): each rank's state drifts. It also forces compute and communication into separate phases. Syncing gradients avoids both problems.
+    source: 'Li et al. 2020 §2.2–2.3, §3.2.3; PyTorch DDP note "Internal Design"; Goyal et al. 2017 §3 "Gradient aggregation"'
+
+  - title: "Keeping the replicas identical"
+    body: |
+      Identical gradients keep the replicas identical only if they *start* identical and see the *right* data.
+
+      **At construction.** DDP broadcasts the `state_dict` (parameters and buffers) from rank 0 to every rank, so all replicas start bit-identical whatever each process initialised. It also builds a **Reducer**, which assigns gradients to buckets (see below) and registers one autograd hook per parameter.
+
+      **Before each forward.** Model *buffers*, such as BatchNorm running means and variances, are not trained by gradients. DDP makes rank 0 authoritative and broadcasts its buffers before each forward pass.
+
+      **Data.** Every rank must see a *different* shard. PyTorch's `DistributedSampler` gives rank $p$ a disjoint slice of the dataset, and `set_epoch(e)` reshuffles it each epoch. The Tuning Playbook's rule is to use **the same seed for initialisation and different seeds for data order and augmentation**. With identical data seeds every rank trains on the same examples, so the effective batch shrinks by $P\times$ without any warning.
+
+      **Why all-reduce rather than a parameter server.** A central server that receives every gradient and sends back updates must move $(P-1)$ gradient copies through its own link. A ring all-reduce moves only $2\frac{P-1}{P}$ copies through *every* rank's link, so there is no hot spot (derived in `sys.collectives`).
+
+      **DDP vs `nn.DataParallel`.** DataParallel is a single process driving all GPUs from multiple threads. Every forward pass it re-replicates the model from GPU 0 to every GPU, scatters the inputs from GPU 0 and gathers the outputs back to it, and its Python threads contend for the interpreter lock. DDP runs one process per GPU and communicates only gradients with NCCL. PyTorch's tuning guide recommends DDP because it performs and scales better.
+
+      **Checkpointing.** The replicas are identical, so rank 0 alone can save the model. Sharded schemes such as ZeRO/FSDP can't do this (`sys.reliability-checkpointing`).
+    source: 'PyTorch DDP note "Internal Design"; Li et al. 2020 §4.1 "Model Buffers"; Tuning Playbook §"Considerations for multi-host pipelines"; PyTorch Performance Tuning Guide "Use efficient data-parallel backend"; PyTorch torch.utils.data.distributed.DistributedSampler docs; PyTorch "Getting Started with DDP" tutorial, "Comparison between DataParallel and DistributedDataParallel" (not in the source cache)'
+
+  - title: "Overlapping the all-reduce with the backward pass"
+    body: |
+      **Naive version.** Run the whole backward pass, then all-reduce every gradient, then step:
+
+      $$T_{\text{step}}=T_{\text{fwd}}+T_{\text{bwd}}+T_{\text{AR}}$$
+
+      The GPU idles for the whole all-reduce, and the network idles for the whole backward.
+
+      **The key observation.** Backprop produces gradients **layer by layer in reverse**. The last layer's gradients exist long before the first layer's. They can be all-reduced while the backward continues through earlier layers.
+
+      ![Naive DDP vs overlapped DDP for a 4-layer model (illustrative units). Each bucket's all-reduce starts as soon as its gradients exist and runs on a separate communication stream. Only the last bucket, the first layer's gradients, cannot hide behind compute.](sys.ddp/ddp-overlap)
+
+      **How DDP implements it** (Li et al., Algorithm 1):
+      1. At construction, register a hook on each parameter's *gradient accumulator*. Autograd calls the hook right after that parameter's gradient is computed.
+      2. When the hook fires, copy the gradient into its slot in a contiguous **bucket** buffer and mark it ready.
+      3. When every gradient in a bucket is ready, launch an **asynchronous** all-reduce of that bucket on NCCL's communication stream. Buckets are always launched in bucket-index order, so that all ranks issue the same collectives in the same order.
+      4. At the end of the backward, wait for all outstanding all-reduces and write the averaged gradients back into `param.grad`.
+      5. The optimizer step is ordinary local code; it sees the same averaged gradients on every rank.
+
+      **What overlap cannot hide.** The first layers' gradients are computed last, so their bucket's all-reduce starts after the backward has finished. With overlap,
+
+      $$T_{\text{step}}\approx T_{\text{fwd}}+\max(T_{\text{bwd}},T_{\text{AR}})+t_{\text{last}}$$
+
+      Here $t_{\text{last}}$ is roughly the size of the last bucket divided by the bandwidth. The forward pass can't hide communication, because the optimizer step needs every averaged gradient before the next forward.
+    source: 'Li et al. 2020 §3.2.2–3.2.3 (Algorithm 1); PyTorch DDP note "Backward Pass"; Ultra-Scale Playbook "Data Parallelism" (first optimization)'
+
+  - title: "Bucketing: why ~25 MiB"
+    body: |
+      **Why not all-reduce each gradient tensor as soon as it is ready?** Every collective pays a fixed cost $\alpha_{\text{coll}}$ (launch, synchronisation, latency; for a ring $\approx2(P-1)\alpha$, with $\alpha$ per message as in `sys.collectives`), so $k$ all-reduces cost about
+
+      $$T\approx k\,\alpha_{\text{coll}}+2\frac{P-1}{P}\frac{S}{W}$$
+
+      A transformer has hundreds of parameter tensors, many tiny. Li et al. measured the time to all-reduce 60M parameters falling as more went into each call.
+
+      **Why not one giant bucket?** Then nothing starts until the whole backward has finished, and the entire all-reduce is exposed.
+
+      ![Exposed communication per step against bucket size for 1.3B bf16 gradients on 64 GPUs (8192 tokens per GPU). Illustrative α–β model: gradients appear evenly over a 43 ms backward and buckets all-reduce in order. Tiny buckets drown in latency; huge ones leave the last bucket exposed. The cliff is where one bucket's all-reduce becomes faster than the backward produces the next bucket, so the queue stops backing up.](sys.ddp/bucket-tradeoff)
+
+      **The default.** `bucket_cap_mb=25`, interpreted as MiB (25 × 2²⁰ bytes). For a 1.3B-parameter model, fp32 gradients (5.2 GB) fill about 198 buckets, and bf16 gradients about 99. On 16 GPUs with NCCL, Li et al. found 10–25 MB best for ResNet-50 but 50 MB for BERT, which has 15× more parameters: bigger models want bigger buckets. With Gloo, 5 MB won for both, because Gloo's all-reduce stops speeding up beyond about 512 KB. The best size depends on the network and the model, so measure it.
+
+      **Bucket order matters.** Buckets are filled in roughly the *reverse* of `model.parameters()`, assuming layers run in registration order. If the real backward order differs, a bucket waits for its latest gradient and overlap suffers. The PyTorch tuning guide notes that with the default `find_unused_parameters=False`, DDP rebuilds its buckets from the order it observes during the backward pass.
+
+      **Memory cost.** Buckets are extra contiguous buffers, the size of the gradients. `gradient_as_bucket_view=True` makes each `.grad` a view into its bucket, which saves the copy and one gradient-sized buffer.
+    source: 'Li et al. 2020 §3.2.1, §4.2 "Bucket Allreduce", §5 (bucket-size sweeps); PyTorch DDP note "Construction"; PyTorch Performance Tuning Guide "Match the order of layers…"'
+
+  - title: "When is the all-reduce hidden? Deriving B/P > C/W"
+    body: |
+      **Refresher: FLOPs of a matmul.** For $y=xW$, the forward pass costs 2 FLOPs (a multiply and an add) per weight per token. The backward pass computes $\partial L/\partial x=(\partial L/\partial y)W^\top$ and $\partial L/\partial W=x^\top\partial L/\partial y$, which is another $2+2$. So the backward costs about **4 FLOPs per parameter per token**.
+
+      **Compute per step.** Each GPU processes $B/P$ tokens, and $C$ is its FLOP/s:
+
+      $$T_{\text{bwd}}=\frac{4N\,(B/P)}{C}$$
+
+      **Communication per step.** The gradients are $2N$ bytes in bf16, and an all-reduce moves about twice the buffer, per `sys.collectives`:
+
+      $$T_{\text{AR}}\approx\frac{2\cdot 2N}{W}=\frac{4N}{W}$$
+
+      **Ratio.**
+
+      $$\frac{T_{\text{bwd}}}{T_{\text{AR}}}=\frac{B/P}{C/W}$$
+
+      Communication can hide behind compute only if
+
+      $$\frac{B}{P}>\frac{C}{W}$$
+
+      ![Backward time grows with tokens per GPU, while all-reduce time is fixed by the model size (1.3B parameters, large-P limit). The crossings sit at $C/W$; fp32 gradients double the comm time and the threshold.](sys.ddp/dp-roofline)
+
+      **Reading the result.**
+      - $N$ cancels. The threshold depends on the hardware (FLOP/s per byte/s of network), not on the model, and not on $P$ except through $(P-1)/P\approx1$.
+      - For an H100 at peak $C=989$ TFLOP/s: about **2,200 tokens per GPU** inside a node ($W=450$ GB/s) and about **2,470** across nodes ($W=400$ GB/s per node). The Scaling Book rounds these to 2,200 and 2,475.
+      - **fp32 gradients double the threshold** to about 4,400 and 4,950. With plain `torch.autocast` the parameters, and so `.grad`, are fp32, so DDP all-reduces fp32 unless the model is cast to bf16 or a bf16 compression hook is registered.
+
+      **Scope.** The derivation assumes perfect overlap and peak rates. In practice both are lower: about 370 GB/s instead of 450 on NVLink, and matmuls rarely exceed 80–85% of peak. Use achieved values of $C$ and $W$ if you have them. It also ignores the exposed last bucket and the latency term, which matters at very large $P$.
+    source: 'Scaling Book Part 12 "Rooflines for LLM Scaling on GPUs › Data Parallelism"; Scaling Book Part 5 "Data Parallelism"; Ultra-Scale Playbook App. A3 "Data parallelism communication analysis"'
+
+  - title: "Worked example: is the communication hidden?"
+    body: |
+      **Setup.** A 1.3B-parameter model on H100s with bf16 gradients (2.6 GB; this assumes bf16 parameters or a bf16 comm hook) and 8,192 tokens per GPU per step.
+
+      **Backward compute** at peak:
+
+      $$\frac{4\times1.3\text{e}9\times8192}{989\text{e}12}\approx 43\ \text{ms}$$
+
+      **One node, $P=8$, NVLink at 450 GB/s:**
+
+      $$2\cdot\tfrac78\cdot\frac{2.6\text{e}9}{450\text{e}9}\approx10\ \text{ms}$$
+
+      That is about 20 ms with fp32 gradients. Either way it is well under 43 ms, so the all-reduce is **hidden** except for the last bucket. A 25 MiB bucket takes about 0.1 ms, which is negligible.
+
+      **Eight nodes, $P=64$:**
+      - Node-egress model (400 GB/s per node): $2\cdot\frac{63}{64}\cdot2.6\text{e}9/400\text{e}9\approx12.8$ ms.
+      - An explicit hierarchical schedule run *sequentially* has three parts. First a reduce-scatter inside the node, $\frac78\cdot2.6\text{e}9/450\text{e}9\approx5.1$ ms. Then each GPU all-reduces its $1/8$ (0.325 GB) across the 8 nodes through its own 50 GB/s NIC: $2\cdot\frac78\cdot0.325\text{e}9/50\text{e}9\approx11.4$ ms. Finally an all-gather inside the node, 5.1 ms. The total is about 21.5 ms, an upper-end estimate because real implementations pipeline the phases. (Its cross-node phase, 11.4 ms, is below 12.8 ms because 12.8 ms models 8 flat rings with factor $\frac{63}{64}$, while this phase uses $\frac{X-1}{X}$ over $X=8$ nodes; both round to $2S/400\text{e}9\approx13$ ms.)
+      - Both estimates are below 43 ms, so the communication is **hidden**.
+      - The naive "flat ring at 50 GB/s per GPU" would give about 102 ms and the wrong conclusion (`sys.collectives` explains why it is 8× too pessimistic).
+
+      **An exposed case.** Keep 64 GPUs but cut to 1,024 tokens per GPU, below 2,470. The backward now takes $4\cdot1.3\text{e}9\cdot1024/989\text{e}12\approx5.4$ ms, but the all-reduce still takes about 12.8 ms. At least $12.8-5.4\approx7.4$ ms of communication is exposed every step. The fix is not a better network; it is more tokens per GPU, or a different parallelism.
+
+      **At scale.** Global batch is capped by optimisation (critical batch size, `sys.tuning-batch-size`). A 4M-token batch over 2,048 GPUs leaves 2,048 tokens per GPU, below 2,470, so pure DDP is communication-bound.
+    source: 'Scaling Book Part 12 "Data Parallelism", "Cross-node collectives"; NVIDIA 2019 NCCL 2.4 blog (hierarchical rings); Ultra-Scale Playbook "Revisit global batch size"'
+
+  - title: "Hangs and correctness traps"
+    body: |
+      **Unused parameters → hang.** The bucket layout is fixed at construction. If some parameter gets no gradient in an iteration (a skipped branch, an auxiliary head used only every other step, a frozen-in-forward module), its hook never fires and its bucket never completes. Because buckets launch in order, every later bucket stalls too, and the backward waits forever. Two fixes:
+      - `find_unused_parameters=True`. After each forward, DDP walks the autograd graph from the outputs and marks the parameters that aren't in it as ready. This costs a graph traversal every iteration, plus an extra all-reduce of a bitmap recording which parameters were unused on *any* rank. So enable it only when needed.
+      - Restructure the model so every parameter participates every step.
+
+      If the set of used parameters never changes, `static_graph=True` lets DDP record it once instead of walking the graph every step.
+
+      **Rank-dependent control flow.** A branch taken on some ranks but not others makes the ranks' collectives differ, which leads to a hang or to buckets that don't match (Li et al., Fig. 3).
+
+      **Gradient accumulation needs `no_sync()`.** By default DDP all-reduces after *every* backward, so $k$ micro-batches cost $k$ all-reduces. Wrap the first $k-1$ backwards in `with ddp.no_sync():` (hooks off, gradients accumulate locally) and the $k$-th all-reduces the sum. Averaging is linear, so the result is identical.
+
+      **Uneven data.** If one rank runs out of batches first, it stops calling all-reduce and the others hang. `DistributedSampler` pads by default so every rank sees the same count. PyTorch's `Join` context manager shadows the missing collectives for ranks that finish early.
+
+      **Stragglers and `torch.compile`.** The slowest rank sets the step time (`sys.collectives`), so balance tokens per rank. Compiling the whole backward as one graph kills overlap unless DDPOptimizer splits it at bucket boundaries (flashcard f11).
+    source: 'Li et al. 2020 §3.2.3–3.2.4, §4.2 "Globally Unused Parameters"; PyTorch DDP note "Forward Pass", "TorchDynamo DDPOptimizer"; PyTorch Performance Tuning Guide "Skip unnecessary all-reduce…", "Load-balance workload…"'
+
+  - title: "Details that bite, and where DDP stops"
+    body: |
+      **BatchNorm.** Each rank normalises with statistics from its *own* micro-batch. With small per-GPU batches those statistics are noisy. Goyal et al. deliberately keep the per-worker BN batch fixed so that the loss being optimised doesn't change as workers are added. A synchronised BN (PyTorch's `SyncBatchNorm`) all-reduces the statistics instead, at the cost of communication in the forward pass. Running statistics are buffers, so DDP's broadcast makes rank 0's values the ones that are kept.
+
+      **Logged metrics.** Each rank's loss covers only its shard. All-reduce the metric, weighted by counts, before logging, and log from one rank.
+
+      **Loss normalisation.** DDP divides the summed gradient by $P$. That is right only if each rank's loss is a mean over an equal share of the data. Otherwise, sum the per-token losses locally, divide by the *global* token count (all-reduced), and multiply by $P$ to undo DDP's division. The multi-host checklist (one logger, synced BN before evaluating, seeds) is in `sys.tuning-pipeline`.
+
+      **Where DDP stops scaling.**
+      - *Memory.* Every rank stores full model states: with mixed-precision Adam, 16 bytes per parameter (bf16 weights and gradients plus fp32 master weights, $m$ and $v$; see `sys.memory-anatomy`). A 7B model needs 112 GB per GPU before any activations, which is more than an 80 GB H100. Sharding those states is what ZeRO does (`sys.zero`). As a rule, DDP alone needs the model, its gradients and its optimizer state to fit on one GPU.
+      - *Communication.* The all-reduce time is fixed by the model size, while compute shrinks as $B/P$ shrinks. Once $B/P<C/W$, adding GPUs adds exposed communication. The Playbook also notes that at around 512+ GPUs ring latency starts to prevent full overlap.
+      - *Batch size.* $B$ grows with $P$ only until the critical batch size, beyond which more data per step stops paying off.
+    source: 'Goyal et al. 2017 §2.3; Li et al. 2020 §4.1; ZeRO §3.1; Ultra-Scale Playbook "Data Parallelism" (note on 512+ GPUs); Tuning Playbook §"Considerations for multi-host pipelines"'
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Walk me through DDP's backward."** Hooks fire as gradients are produced in reverse layer order. Gradients are copied into buckets, and a full bucket triggers an async all-reduce on the comm stream, in bucket order. At the end DDP waits and writes the averaged gradients into `.grad`. The optimizer step is local.
+      - **"Why buckets?"** A fixed cost per collective makes per-tensor all-reduces latency-bound, and one huge bucket prevents overlap. The default 25 MiB is a compromise.
+      - **"Why does DDP hang with unused parameters?"** Their hooks never fire, so the bucket never completes. Fix with `find_unused_parameters=True` (cost: a graph walk and an extra bitmap all-reduce) or by restructuring the model.
+      - **"When is DDP communication-bound?"** When per-GPU tokens $B/P<C/W$: about 2,200 inside an H100 node and about 2,470 across nodes for bf16 gradients, doubled for fp32. Derive it from $4N(B/P)/C$ vs $4N/W$.
+      - **"DDP vs DataParallel?"** DDP is multi-process, with no scatter/gather through GPU 0 and no thread contention, and it overlaps communication. DataParallel is single-process and multi-threaded.
+      - **"Why average gradients rather than parameters?"** With optimizer state, parameter averaging isn't equivalent to single-device training and can't overlap communication with compute.
+      - **"How does gradient accumulation interact with DDP?"** Use `no_sync()` for $k-1$ micro-batches, then one all-reduce.
+      - **"Does the forward pass communicate?"** Not for gradients. Buffers are broadcast, and SyncBN all-reduces statistics.
+      - **"How much memory does DDP save?"** None for model states; every rank holds all 16 bytes per parameter. It only splits the activations, because each rank processes $B/P$ examples.
+    source: 'Li et al. 2020 §3.2; PyTorch DDP note "Internal Design"; Scaling Book Part 12 "Data Parallelism"'
+
+  - title: "Key results"
+    body: |
+      - Averaging the per-rank mean-loss gradients over equal shards gives exactly $\nabla L$ of the full batch.
+      - **DDP sequence:** broadcast at construction → local forward and backward → bucketed async all-reduce driven by gradient hooks → local optimizer step.
+      - **Step time with overlap:** $T_{\text{fwd}}+\max(T_{\text{bwd}},T_{\text{AR}})+t_{\text{last bucket}}$.
+      - $T_{\text{bwd}}=4N(B/P)/C$; $T_{\text{AR}}\approx 2\cdot\text{grad bytes}/W$.
+      - **Communication is hidden iff**
+
+      $$\frac{B}{P}>\frac{C}{W}$$
+
+        That is about 2,200 tokens per GPU inside an H100 node and about 2,470 across nodes (bf16 gradients), doubled for fp32 gradients.
+      - **1.3B example**, 8,192 tokens per GPU: backward ≈43 ms; all-reduce ≈10 ms in one node and ≈12.8 ms across 8 nodes. Hidden. At 1,024 tokens per GPU it is exposed.
+      - **Defaults:** bucket 25 MiB; `find_unused_parameters=False`; use `no_sync()` for gradient accumulation.
+      - DDP replicates 16 bytes per parameter of model state on every GPU, which is the motivation for ZeRO.
+    source: 'Li et al. 2020 §3.2; Scaling Book Part 12 "Data Parallelism"; ZeRO §3.1'
+
+quiz:
+  - id: q1
+    prompt: |
+      A 1.3B-parameter model with bf16 gradients is trained with DDP on 64 H100s (8 nodes, 8 × 50 GB/s NICs per node). Ignoring latency, about how long does one gradient all-reduce take?
+    correct: "About 13 ms"
+    wrong:
+      - "About 102 ms"
+      - "About 6.4 ms"
+      - "About 26 ms"
+    explanation: |
+      $2\cdot\frac{63}{64}\cdot2.6\text{e}9/400\text{e}9\approx12.8$ ms, because hierarchical or multi-ring all-reduce keeps all 8 NICs of every node busy. 102 ms is the naive flat ring limited by one 50 GB/s NIC. 6.4 ms forgets that an all-reduce moves about twice the buffer. 26 ms is what fp32 gradients would cost, not bf16.
+    source: 'Scaling Book Part 12 "Cross-node collectives"'
+
+  - id: q2
+    prompt: |
+      You move the run from q1 from bf16 parameters to standard `torch.autocast` with fp32 parameters, and register no comm hook. What happens to the all-reduce time and to the per-GPU token count needed to hide it?
+    correct: "Both double: about 26 ms, and about 4,950 tokens/GPU"
+    wrong:
+      - "Neither changes: autocast runs the backward in bf16"
+      - "Time doubles, threshold stays at about 2,470 tokens/GPU"
+      - "Time halves, as fp32 all-reduces reach peak bandwidth"
+    explanation: |
+      Under autocast the parameters, and hence `.grad`, stay fp32, so DDP all-reduces 4 bytes per parameter. The communication time doubles while backward FLOPs are unchanged, so $B/P>C/W$ becomes $B/P>2C/W\approx4{,}950$ across nodes. Autocast lowers the precision of the matmuls, not of the stored gradients that DDP reduces.
+    source: 'Scaling Book Part 12 "Data Parallelism"; PyTorch torch.amp docs (autocast example: model and optimizer in default fp32 precision)'
+
+  - id: q3
+    prompt: |
+      Per step and per GPU, the backward pass takes $4N(B/P)/C$ and the bf16 gradient all-reduce takes about $4N/W$. Which conclusion follows?
+    correct: "Comm can be hidden iff $B/P>C/W$, whatever the model size"
+    wrong:
+      - "Comm can be hidden iff $N>C/W$, so only large models hide it"
+      - "Comm can be hidden iff global $B>C/W$, whatever the GPU count"
+      - "Comm can be hidden iff $P<C/W$, so DDP caps out near 2,500 GPUs"
+    explanation: |
+      The ratio $T_{\text{bwd}}/T_{\text{AR}}=(B/P)/(C/W)$ has no $N$ in it: bigger models have proportionally more compute *and* more bytes. What matters is the per-GPU batch, because compute per GPU shrinks as $1/P$ while communication per GPU doesn't. That is why adding GPUs at fixed global batch eventually exposes communication. The threshold is about 2,470 tokens per GPU across H100 nodes.
+    source: 'Scaling Book Part 5 "Data Parallelism"; Scaling Book Part 12 "Data Parallelism"'
+
+  - id: q4
+    prompt: |
+      A model has an auxiliary head that is used only on even steps. With default DDP settings, training hangs in the backward of step 1. Why?
+    correct: "Head grads never arrive, so their bucket never fills"
+    wrong:
+      - "The optimizer blocks on `None` gradients for the head"
+      - "NCCL rejects buckets containing tensors full of zeros"
+      - "Autograd deadlocks as graphs differ between iterations"
+    explanation: |
+      DDP fixes the gradient-to-bucket mapping at construction and launches a bucket's all-reduce only when every hook in it has fired. A parameter outside this step's graph never fires its hook, so the bucket and all later buckets wait forever. `find_unused_parameters=True` marks such parameters ready after the forward; alternatively, make every parameter participate. Autograd itself is fine with graphs that change between iterations, since PyTorch rebuilds the graph every forward.
+    source: 'Li et al. 2020 §3.2.3; PyTorch DDP note "Forward Pass"'
+
+  - id: q5
+    prompt: |
+      A 1B-parameter model (bf16 gradients) trains with DDP over InfiniBand. You cut `bucket_cap_mb` from 25 to 1. What do you expect?
+    correct: "Slower steps: about 1,900 all-reduces, each with fixed latency"
+    wrong:
+      - "Faster steps: finer buckets overlap better and hide all comm"
+      - "Same speed: the total bytes communicated are unchanged"
+      - "Faster steps: small messages reach peak bandwidth more easily"
+    explanation: |
+      2 GB of gradients in 1 MiB buckets is about 1,907 all-reduces instead of about 76. Each pays a fixed latency or launch cost $\alpha_{\text{coll}}$, so the $k\,\alpha_{\text{coll}}$ term can outgrow the backward pass and leave communication exposed. Overlap does get slightly finer, but only the last bucket was ever exposed, so there is little to gain. Small messages are *further* from peak bandwidth, not closer.
+    source: 'Li et al. 2020 §3.2.1, §5; nccl-tests PERFORMANCE.md "Time"'
+
+  - id: q6
+    prompt: |
+      Which statement about PyTorch DDP is **false**?
+    correct: "It all-reduces the gradients once the entire backward pass is finished"
+    wrong:
+      - "It broadcasts rank 0's state_dict to the other ranks at construction time"
+      - "It assigns gradients to buckets in roughly reverse `parameters()` order"
+      - "Each rank runs its own optimizer step on the identical averaged gradients"
+    explanation: |
+      DDP launches each bucket's all-reduce asynchronously as soon as that bucket's gradients are ready, *during* the backward. That overlap is its main performance feature. The other statements are true. Construction broadcasts rank 0's state. Buckets follow roughly reverse registration order, because that approximates the order gradients are produced. The optimizer step is local and identical on every rank.
+    source: 'PyTorch DDP note "Internal Design"; Li et al. 2020 §3.2.2–3.2.3'
+
+  - id: q7
+    prompt: |
+      Same 1.3B bf16 model on 64 GPUs across nodes, but now with only 1,024 tokens per GPU per step. About how much all-reduce time is exposed each step at peak FLOP/s?
+    correct: "About 7 ms"
+    wrong:
+      - "None: overlap hides all of it"
+      - "About 13 ms: overlap gives nothing"
+      - "About 97 ms on the per-NIC rate"
+    explanation: |
+      The backward takes $4\cdot1.3\text{e}9\cdot1024/989\text{e}12\approx5.4$ ms and the all-reduce about 12.8 ms. Overlap can hide at most the 5.4 ms that compute lasts, leaving at least $\approx7.4$ ms exposed. 1,024 tokens per GPU is below the about 2,470 needed. "About 13 ms" ignores the overlap that does happen. 97 ms subtracts from the flat-ring 102 ms estimate, which is wrong.
+    source: 'Scaling Book Part 12 "Data Parallelism"'
+
+  - id: q8
+    prompt: |
+      Why is DDP usually much faster than `nn.DataParallel` on one 8-GPU machine?
+    correct: "One process per GPU, gradients-only NCCL traffic, overlapped"
+    wrong:
+      - "It all-reduces activations instead of gradients, so less data"
+      - "It skips the forward pass on all ranks except the root rank"
+      - "It averages parameters every few steps rather than gradients"
+    explanation: |
+      DataParallel is one process with a thread per GPU. Every forward it re-replicates the model from GPU 0, scatters the inputs from GPU 0 and gathers the outputs back there, and its threads contend inside one Python interpreter. DDP runs an independent process per GPU, communicates only gradients via NCCL, and overlaps that with the backward. DDP never communicates activations, and every rank runs its own forward.
+    source: 'Li et al. 2020 §2.2; PyTorch Performance Tuning Guide "Use efficient data-parallel backend"; PyTorch "Getting Started with DDP" tutorial (DataParallel comparison)'
+
+  - id: q9
+    prompt: |
+      Rank A processes 1,000 tokens and rank B 3,000 tokens in a step. Each computes its loss as the *mean* over its own tokens, and DDP averages the gradients. What gradient results?
+    correct: "Mean of the per-rank means: A's tokens weigh 3× B's"
+    wrong:
+      - "The exact per-token mean over all 4,000 tokens"
+      - "The sum of the two means: twice the true gradient"
+      - "Token-weighted, as NCCL weights by message size"
+    explanation: |
+      DDP computes $\frac12(g_A+g_B)$, where $g_A$ averages over 1,000 tokens and $g_B$ over 3,000. Each A token therefore carries weight $\frac{1}{2000}$ and each B token $\frac{1}{6000}$. The per-token mean needs local *sums* divided by the global count of 4,000, multiplied by $P$ to undo DDP's division. NCCL's sum knows nothing about token counts.
+    source: 'Goyal et al. 2017 §3 "Gradient aggregation"; PyTorch DDP note "Backward Pass"'
+
+  - id: q10
+    prompt: |
+      A CNN with BatchNorm is trained with DDP at 4 images per GPU on 32 GPUs. With plain `BatchNorm2d`, what statistics normalise the activations in training?
+    correct: "Each GPU's own 4-image batch statistics"
+    wrong:
+      - "All 128 images' stats, all-reduced by DDP"
+      - "Statistics averaged across GPUs in bucket 0"
+      - "Rank 0's 4-image stats, broadcast each step"
+    explanation: |
+      DDP synchronises gradients, not activations, so each GPU computes BatchNorm statistics over its local 4 images, which is very noisy. Getting global statistics needs a synchronised BN, which all-reduces the statistics in the forward pass. DDP does broadcast rank 0's *running* averages (buffers) before each forward, but those are used at evaluation time, not for normalising in training mode.
+    source: 'Goyal et al. 2017 §2.3; Li et al. 2020 §4.1 "Model Buffers"'
+
+  - id: q11
+    prompt: |
+      A team plans pure DDP for a dense model on 2,048 H100s across nodes, with a 4M-token global batch and bf16 gradients. What does the roofline predict?
+    correct: "Comm-bound: 2,048 tokens/GPU is below $C/W\\approx$ 2,470"
+    wrong:
+      - "Compute-bound: a 4M-token batch is far above 2,470"
+      - "Compute-bound: $C/W$ falls as $1/P$ as GPUs are added"
+      - "Comm-bound only if the model has over ~10B parameters"
+    explanation: |
+      The condition is on the *per-GPU* batch: $4{,}194{,}304/2048=2{,}048$ tokens, below about 2,470, so the gradient all-reduce can't fully hide even with perfect overlap. The threshold depends on hardware, not on model size or $P$. The fix is more tokens per GPU (often not possible beyond the critical batch size) or spending GPUs on another parallelism dimension.
+    source: 'Scaling Book Part 12 "Data Parallelism"; Ultra-Scale Playbook "Revisit global batch size"'
+
+  - id: q12
+    prompt: |
+      With gradient accumulation over $k=4$ micro-batches under DDP, how should `no_sync()` be used, and how many gradient all-reduces happen per optimizer step?
+    correct: "Wrap the first 3 backwards; 1 all-reduce per step"
+    wrong:
+      - "Wrap all 4 backwards; 0 all-reduces, synced at step()"
+      - "Wrap the last backward only; 3 all-reduces per step"
+      - "No wrapping needed; DDP spots accumulation, so 1"
+    explanation: |
+      `no_sync()` disables DDP's hooks, so gradients accumulate locally. The first backward outside the context all-reduces the accumulated sum. Because averaging is linear, this matches all-reducing each micro-batch, at a quarter of the communication. DDP can't tell whether you plan to accumulate or step, which is why the context manager exists. Wrapping all four means the gradients are never synchronised and the replicas diverge.
+    source: 'Li et al. 2020 §3.2.4; PyTorch Performance Tuning Guide "Skip unnecessary all-reduce…"'
+
+cards:
+  - id: f1
+    front: Condition for DDP's gradient all-reduce to hide behind the backward pass, with H100 numbers.
+    back: |
+      $$\frac{B}{P}>\frac{C}{W}$$
+
+      Per-GPU tokens must exceed peak FLOP/s divided by the collective bandwidth: about 2,200 inside an H100 node (450 GB/s) and about 2,470 across nodes (400 GB/s per node), for bf16 gradients. fp32 gradients double these. This assumes perfect overlap and peak rates.
+    source: 'Scaling Book Part 12 "Data Parallelism"'
+
+  - id: f2
+    front: Why does DDP bucket gradients, and what is the default bucket size?
+    back: |
+      Each collective has a fixed latency or launch cost, so per-tensor all-reduces are latency-bound, while a single bucket can't overlap with the backward. Buckets are about 25 MiB by default (`bucket_cap_mb=25`, in MiB). They are filled in roughly reverse parameter order and launched in index order on every rank.
+    source: 'Li et al. 2020 §3.2.1, §4.2'
+
+  - id: f3
+    front: What does `find_unused_parameters=True` do, and what does it cost?
+    back: |
+      After each forward it traverses the autograd graph from the outputs and marks parameters not in the graph as ready, so their buckets can complete instead of hanging. The cost is a graph walk every iteration plus an extra all-reduce of a bitmap of globally unused parameters. Enable it only when needed.
+    source: 'Li et al. 2020 §3.2.3, §4.2; PyTorch DDP note "Forward Pass"'
+
+  - id: f4
+    front: What does DDP do at construction time and before each forward pass?
+    back: |
+      - **Construction:** broadcast rank 0's `state_dict` to all ranks, build the Reducer (gradient-to-bucket mapping), and register one autograd hook per parameter.
+      - **Before each forward:** broadcast buffers (e.g. BN running stats) from rank 0.
+    source: 'PyTorch DDP note "Construction"; Li et al. 2020 §4.1'
+
+  - id: f5
+    front: Step time of DDP with overlap, and which part can never be hidden?
+    back: |
+      $$T\approx T_{\text{fwd}}+\max(T_{\text{bwd}},T_{\text{AR}})+t_{\text{last}}$$
+
+      The last bucket, which holds the first layers' gradients, is ready only when the backward ends, so its all-reduce ($\approx$ bucket size / bandwidth) is exposed. The forward pass hides nothing, because the next forward needs the updated weights.
+    source: 'Li et al. 2020 §3.2.2; Ultra-Scale Playbook "Data Parallelism"'
+
+  - id: f6
+    front: Which bytes per parameter does DDP replicate on every GPU (mixed-precision Adam), and what does that imply?
+    back: |
+      16 bytes: bf16 weights (2) + bf16 gradients (2) + fp32 master weights, $m$ and $v$ (12). A 7B model needs 112 GB per GPU of model states alone, so it can't be trained with DDP on 80 GB GPUs. That is the motivation for ZeRO/FSDP.
+    source: 'ZeRO §3.1'
+
+  - id: f7
+    type: open
+    front: Derive the compute-bound condition for data-parallel training, and state its assumptions.
+    back: |
+      1. **Compute.** The backward costs 4 FLOPs per parameter per token: for $y=xW$, both $dX=dY\,W^\top$ and $dW=X^\top dY$ cost 2 each. Per GPU, $T_{\text{bwd}}=4N(B/P)/C$.
+      2. **Communication.** bf16 gradients are $2N$ bytes, and a ring all-reduce moves $2\frac{P-1}{P}\times$ the buffer, so $T_{\text{AR}}\approx4N/W$.
+      3. **Ratio.** $T_{\text{bwd}}/T_{\text{AR}}=(B/P)\,W/C$, so hiding needs $B/P>C/W$.
+      4. **Interpretation.** $N$ cancels. Compute per GPU falls as $P$ grows but communication doesn't, so at fixed global batch, adding GPUs eventually exposes communication.
+      5. **Numbers.** H100: $989\text{e}12/450\text{e}9\approx2{,}200$ (node) and $/400\text{e}9\approx2{,}470$ (cross-node). fp32 gradients ×2.
+      6. **Assumptions.** Perfect overlap (except the last bucket), peak $C$ and $W$, a bandwidth-dominated all-reduce (large buckets, latency ignored), and a dense model. With achieved values, use achieved $C$ and $W$.
+    source: 'Scaling Book Part 5 "Data Parallelism"; Scaling Book Part 12 "Data Parallelism"'
+
+  - id: f8
+    type: open
+    front: Explain to an interviewer how DDP's backward pass works, end to end.
+    back: |
+      1. **Setup.** At construction, rank 0's state is broadcast. Gradients are mapped to ~25 MiB buckets in roughly reverse parameter order, and a hook is placed on each parameter's gradient accumulator.
+      2. **Backward.** Autograd produces gradients from the last layer to the first. Each hook copies its gradient into the bucket buffer and marks it ready.
+      3. **Communication.** When a bucket is full, an async NCCL all-reduce launches on a separate stream, always in bucket-index order so all ranks match. Communication of later layers' buckets overlaps compute of earlier layers.
+      4. **Finish.** DDP waits for all all-reduces and writes averaged gradients (sum ÷ world size) into `.grad`. The optimizer steps locally and identically everywhere.
+      5. **Edge cases.** Unused parameters mean buckets never fill, which hangs unless `find_unused_parameters`. Gradient accumulation should use `no_sync()`. The last bucket is always exposed. `torch.compile` needs DDPOptimizer to keep overlap.
+      6. **Performance.** Communication is hidden when $B/P>C/W$.
+    source: 'Li et al. 2020 §3.2 (Algorithm 1); PyTorch DDP note "Internal Design"'
+
+  - id: f9
+    type: open
+    front: "Estimate: 1.3B model, bf16 gradients, 8,192 tokens per GPU, H100s. Is DDP communication hidden on 1 node? On 8 nodes? What if tokens per GPU drop to 1,024?"
+    back: |
+      - **Backward:** $4\cdot1.3\text{e}9\cdot8192/989\text{e}12\approx43$ ms at peak.
+      - **1 node:** all-reduce $2\cdot\frac78\cdot2.6\text{e}9/450\text{e}9\approx10$ ms. Hidden, except a ~0.1 ms last bucket.
+      - **8 nodes:** node-egress model $2\cdot\frac{63}{64}\cdot2.6\text{e}9/400\text{e}9\approx12.8$ ms. A sequential hierarchical schedule is about 21.5 ms (5.1 + 11.4 + 5.1). Hidden either way. Don't use the flat ring at 50 GB/s (102 ms).
+      - **1,024 tokens per GPU:** backward ≈5.4 ms against 12.8 ms of all-reduce, so ≥7 ms is exposed per step. This matches $1{,}024<C/W\approx2{,}470$.
+      - **Caveats.** These are peak rates; achieved rates are about 370 GB/s NVLink and well below peak FLOP/s. fp32 gradients double the communication. A larger per-GPU batch or another parallelism dimension fixes the exposed case.
+    source: 'Scaling Book Part 12 "Data Parallelism", "Cross-node collectives"; NVIDIA 2019 NCCL 2.4 blog'
+
+  - id: f10
+    type: open
+    front: Compare DDP's gradient all-reduce with a parameter server and with parameter averaging.
+    back: |
+      - **Parameter server.** Every gradient goes through one server's link, $(P-1)$ copies, which makes it a hot spot. A ring all-reduce puts only about $2\times$ the gradient through each rank's link, with no central bottleneck.
+      - **Parameter averaging** (local steps, then average the weights). This is not equivalent to single-device training when the optimizer has state, because momentum and Adam moments diverge across ranks. It also serialises compute and communication around `step()`.
+      - **DDP.** One process per GPU and gradient all-reduce overlapped with the backward. It gives the same update as single-device training on the global batch (given proper loss normalisation) and scales across machines.
+    source: 'Li et al. 2020 §2.2–2.3; PyTorch Performance Tuning Guide "Use efficient data-parallel backend"'
+
+  - id: f11
+    front: Why does compiling a DDP model with torch.compile threaten overlap, and what fixes it?
+    back: |
+      If the whole backward is compiled as one graph, DDP's hooks fire only after that graph finishes, so no all-reduce overlaps compute. TorchDynamo's DDPOptimizer breaks the graph at DDP's bucket boundaries so the all-reduces interleave with the backward. Wrap the model in DDP *before* calling `torch.compile`.
+    source: 'PyTorch DDP note "TorchDynamo DDPOptimizer"'
+
+reading:
+  - title: "Li et al. 2020, PyTorch Distributed: Experiences on Accelerating Data Parallel Training, §3 and §5"
+    url: https://arxiv.org/abs/2006.15704
+    kind: paper
+    note: The design of DDP from the people who built it. Bucketing, overlap, Algorithm 1, unused parameters, no_sync, and bucket-size measurements.
+  - title: "PyTorch note: Distributed Data Parallel"
+    url: https://docs.pytorch.org/docs/stable/notes/ddp.html
+    kind: docs
+    note: A short walkthrough of construction, forward, backward and the optimizer step, plus how DDP interacts with torch.compile (DDPOptimizer).
+  - title: "Ultra-Scale Playbook: Data Parallelism"
+    url: https://huggingface.co/spaces/nanotron/ultrascale-playbook
+    kind: book
+    note: Three optimisations (overlap, bucketing, accumulation) with Picotron code, the global batch-size equation, and measured scaling limits.
+  - title: "How To Scale Your Model, Part 12: Rooflines for LLM Scaling on GPUs › Data Parallelism"
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    kind: book
+    note: The B/X > C/W derivation with H100 numbers (2,200 within a node, 2,475 across nodes) and the MoE E/k extension.

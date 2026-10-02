@@ -1,0 +1,466 @@
+id: gen.diffusion-parameterizations
+area: genmodels
+title: "Diffusion III: Parameterizations, SNR & Noise Schedules"
+summary: Shows that predicting x_0, ε, v or the score carries the same information, derives the conversions and the score–ε link (Tweedie), rewrites every training loss as an SNR weighting of one x_0-error, explains why v-prediction is better conditioned, and works out what a noise schedule does and does not change (VDM invariance, terminal SNR, resolution shift).
+order: 120
+level: core
+tags: [diffusion, parameterization, snr, noise-schedule, v-prediction, score]
+prereqs: [gen.ddpm-objective]
+
+explainer:
+  - title: "The problem: one unknown, four possible targets"
+    source: "Salimans & Ho 2022 §2, §4; Kingma et al. 2021 §3.1; Kingma & Gao 2023 §2.1; Lu et al. 2022 (DPM-Solver) §2.2"
+    body: |
+      At every step the network sees $x_t$ and must undo the noise. Lesson II trained it to output $\epsilon$. But given $x_t$, the clean image and the noise determine each other, so the network could equally output $x_0$, the noise, the **score** $\nabla\log q_t(x_t)$, or a mixture called $v$. These targets carry the same information. What differs is (i) how the loss weights different noise levels, and (ii) how well-conditioned the target is at very low or very high noise. That is what interviewers probe.
+
+      **Notation switch.** Keep Ho's $\bar\alpha_t$ and $\beta_t$ from lessons I–II, and from here on use the continuous-time notation of VDM and Salimans & Ho, which the later lessons (guidance, score SDEs, DDIM, solvers) also use:
+
+      $$x_t=\alpha_t\,x_0+\sigma_t\,\epsilon,$$
+
+      $$\alpha_t=\sqrt{\bar\alpha_t},\qquad \sigma_t=\sqrt{1-\bar\alpha_t}.$$
+
+      So $\alpha_t^2+\sigma_t^2=1$ (variance preserving), and
+
+      $$\mathrm{SNR}(t)=\frac{\alpha_t^2}{\sigma_t^2},\qquad \lambda_t=\log\mathrm{SNR}(t).$$
+
+      From here on, think of the noise level as $\lambda$ rather than $t$: a schedule is just a way of visiting values of $\lambda$. Continuous-time papers let $t\in[0,1]$; the formulas are the same.
+
+      **Convention clashes to convert:**
+
+      - **Warning:** this $\alpha_t$ is *not* lesson I–II's per-step $\alpha_t=1-\beta_t$; it is $\sqrt{\bar\alpha_t}$. Likewise $\sigma_t$ is now the noise coefficient, not Ho's reverse-step standard deviation. Neither of Ho's meanings appears again in this lesson. DDIM writes $\alpha_t$ for $\bar\alpha_t$ itself.
+      - Log-SNR: Salimans & Ho, Kingma & Gao and SD3 use $\lambda=\log\mathrm{SNR}$ (ours). VDM uses $\gamma=-\log\mathrm{SNR}$. DPM-Solver uses $\lambda=\log(\alpha_t/\sigma_t)=\frac12\log\mathrm{SNR}$.
+      - EDM writes a noisy sample as $y+\sigma n$ with $y$ = data. Its $\sigma$ is not ours: for a VP model, EDM's $\sigma=\sigma_t/\alpha_t=\mathrm{SNR}^{-1/2}$.
+  - title: Converting between x₀, ε and v
+    source: "Salimans & Ho 2022 §4, App. D, eqs. (26)–(30); Kingma et al. 2021 §3.4, eq. (10)"
+    body: |
+      **$\epsilon\leftrightarrow x_0$.** Rearranging $x_t=\alpha_tx_0+\sigma_t\epsilon$:
+
+      $$\hat x_0=\frac{x_t-\sigma_t\hat\epsilon}{\alpha_t},\qquad \hat\epsilon=\frac{x_t-\alpha_t\hat x_0}{\sigma_t}.$$
+
+      **$v$, a rotation.** Because $\alpha_t^2+\sigma_t^2=1$, write $\alpha_t=\cos\phi_t$ and $\sigma_t=\sin\phi_t$. Then $x_t=\cos\phi\,x_0+\sin\phi\,\epsilon$ moves on a circle as the noise angle $\phi$ goes from 0 (data) to $\pi/2$ (noise). Salimans & Ho define the target as its velocity:
+
+      $$v:=\frac{dx_t}{d\phi}=\alpha_t\,\epsilon-\sigma_t\,x_0.$$
+
+      In matrix form $(x_t,v)$ is $(x_0,\epsilon)$ rotated by $\phi$:
+
+      $$\begin{aligned} \begin{pmatrix}x_t\\ v\end{pmatrix} &= \begin{pmatrix}\alpha_t & \sigma_t\\ -\sigma_t & \alpha_t\end{pmatrix}\begin{pmatrix}x_0\\ \epsilon\end{pmatrix}. \end{aligned}$$
+
+      A rotation is undone by its transpose, so
+
+      $$\hat x_0=\alpha_tx_t-\sigma_t\hat v,\qquad \hat\epsilon=\sigma_tx_t+\alpha_t\hat v.$$
+
+      Check the first directly:
+
+      $$\begin{aligned} \alpha_tx_t-\sigma_tv &= \alpha_t^2x_0+\alpha_t\sigma_t\epsilon \\ &\quad-\alpha_t\sigma_t\epsilon+\sigma_t^2x_0 \\ &= (\alpha_t^2+\sigma_t^2)\,x_0=x_0. \end{aligned}$$
+
+      The identity $\alpha_t^2+\sigma_t^2=1$ is all it takes.
+
+      **Worked example.** $\bar\alpha_t=0.64$, so $\alpha_t=0.8$, $\sigma_t=0.6$; $x_0=1$, $\epsilon=0.5$.
+
+      - $x_t=0.8+0.3=1.1$ and $v=0.8\cdot0.5-0.6\cdot1=-0.2$.
+      - Back: $\hat x_0=0.8\cdot1.1-0.6\cdot(-0.2)=1.0$ and $\hat\epsilon=0.6\cdot1.1+0.8\cdot(-0.2)=0.5$.
+
+      **Sign and time warning.** Flow-matching "velocities" are different objects. Lipman/Liu run time the other way ($t=0$ noise, $t=1$ data) and use data − noise; SD3 keeps $t=0$ at the data and uses noise − data. Both are for a straight-line path rather than this circle. Salimans & Ho's $v$ agrees with them only up to sign and scale (gen.rectified-flow).
+  - title: "Score ↔ ε: Tweedie in two lines"
+    source: "Luo 2022, \"Three Equivalent Interpretations\" (p.15–17); Kingma et al. 2021 App. (score model); Bishop PRML §1.5.5"
+    body: |
+      The **score** of the noisy marginal $q_t(x)=\int q(x|x_0)\,q(x_0)\,dx_0$ is $\nabla_x\log q_t(x)$: the direction in which noisy data becomes more likely. Score-based models (gen.ebm-score-matching) learn it directly. How does it relate to $\epsilon$?
+
+      **Line 1: the score is an average of conditional scores.** Differentiate under the integral, and use $\nabla q=q\,\nabla\log q$:
+
+      $$\begin{aligned} \nabla\log q_t(x_t) &= \frac{\int q(x_0)\,q(x_t|x_0)\,\nabla\log q(x_t|x_0)\,dx_0}{q_t(x_t)} \\ &= \mathbb E\big[\nabla\log q(x_t|x_0)\,\big|\,x_t\big], \end{aligned}$$
+
+      since $q(x_0)q(x_t|x_0)/q_t(x_t)=q(x_0|x_t)$ by Bayes.
+
+      **Line 2: the conditional score is the noise.** $q(x_t|x_0)=N(\alpha_tx_0,\sigma_t^2I)$, so $\nabla\log q(x_t|x_0)=-(x_t-\alpha_tx_0)/\sigma_t^2=-\epsilon/\sigma_t$. Hence
+
+      $$\nabla\log q_t(x_t)=-\frac{\mathbb E[\epsilon|x_t]}{\sigma_t}.$$
+
+      **Connect to training.** Minimising $\mathbb E\|\epsilon-\epsilon_\theta(x_t)\|^2$ gives the conditional mean $\epsilon_\theta^*=\mathbb E[\epsilon|x_t]$ (an MSE minimiser is the conditional mean). So
+
+      $$\epsilon_\theta^*(x_t)=-\sigma_t\,\nabla\log q_t(x_t):$$
+
+      **a noise predictor is a scaled score model.** Substituting into $\hat x_0=(x_t-\sigma_t\hat\epsilon)/\alpha_t$ gives Tweedie's formula for the optimal denoiser:
+
+      $$\mathbb E[x_0|x_t]=\frac{x_t+\sigma_t^2\,\nabla\log q_t(x_t)}{\alpha_t}.$$
+
+      **Sanity check.** If $x_0\sim N(0,1)$, then $q_t=N(0,1)$ and the score is $-x_t$, so $\mathbb E[\epsilon|x_t]=\sigma_tx_t$. Directly: $\mathrm{Cov}(\epsilon,x_t)/\mathrm{Var}(x_t)=\sigma_t/1$. ✓
+
+      **Numbers.** At $\bar\alpha_t=0.36$, $\sigma_t=0.8$, so the score is $-\hat\epsilon/0.8=-1.25\,\hat\epsilon$. Networks usually output $\epsilon$ or $v$ rather than the raw score, whose scale $1/\sigma_t$ blows up at low noise.
+  - title: Every loss is a weighted x₀-loss
+    source: "Salimans & Ho 2022 §4, eq. (9); Kingma & Gao 2023 §3–4, Table 1, Theorem 1; Kingma et al. 2021 §5.2"
+    body: |
+      Let $\hat x_0,\hat\epsilon,\hat v$ be predictions consistent with the same $x_t$, and write $\Delta x_0=x_0-\hat x_0$, and so on. From $\alpha_t\Delta x_0+\sigma_t\Delta\epsilon=0$:
+
+      $$\begin{aligned} \|\Delta\epsilon\|^2 &= \mathrm{SNR}\,\|\Delta x_0\|^2, \\ \|\Delta v\|^2 &= (1+\mathrm{SNR})\,\|\Delta x_0\|^2, \\ \|\Delta\,\text{score}\|^2 &= \|\Delta\epsilon\|^2/\sigma_t^2. \end{aligned}$$
+
+      For $v$: $\Delta v=\alpha_t\Delta\epsilon-\sigma_t\Delta x_0=-\frac{\alpha_t^2+\sigma_t^2}{\sigma_t}\Delta x_0$, and $1/\sigma_t^2=1+\mathrm{SNR}$. The score line uses score $=-\epsilon/\sigma_t$.
+
+      So every objective is $\mathbb E\big[\text{weight}(\lambda)\,\|\Delta x_0\|^2\big]$. The total weight on a noise level has two factors: the target's factor above, and **how often** that level is sampled. With $t$ uniform, level $\lambda$ is visited with density $p(\lambda)=-dt/d\lambda$, set by the schedule.
+
+      **The ELBO's own weight.** Lesson II's per-step term is $\frac12(\mathrm{SNR}(t-1)-\mathrm{SNR}(t))\|\Delta x_0\|^2$. For small steps $\mathrm{SNR}(t-1)-\mathrm{SNR}(t)\approx-d\,\mathrm{SNR}=-\mathrm{SNR}\,d\lambda$, and $\mathrm{SNR}\|\Delta x_0\|^2=\|\Delta\epsilon\|^2$. So the ELBO is $\frac12\int\|\Delta\epsilon\|^2\,d\lambda$: **flat in log-SNR, measured on the $\epsilon$-error.** Kingma & Gao use this as the reference, $w(\lambda)=1$:
+
+      - $\epsilon$-loss, uniform $t$: $w=p(\lambda)$. For the cosine schedule, $p(\lambda)\propto\mathrm{sech}(\lambda/2)$, a bump at SNR = 1.
+      - $v$-loss, cosine: $p(\lambda)(1+e^{-\lambda})\propto e^{-\lambda/2}$, identical to flow matching with the OT path. (Weights in $\lambda$ do not depend on which end of time is called 0, so Lipman's reversed time direction does not change this.)
+
+      ![Implied weight on the ε-error per unit log-SNR, each curve scaled to 1 at λ = 0 (computed from the formulas). The ELBO is flat; the ε-loss concentrates on mid noise; v/FM-OT keeps rising toward pure noise](gen.diffusion-parameterizations/weightings)
+
+      Kingma & Gao prove that any weighting that is non-increasing in $\lambda$ (more weight on noisier levels) equals the ELBO of the data augmented with Gaussian noise. The ELBO and the $v$-cosine weightings qualify; the $\epsilon$-cosine bump does not. Min-SNR-$\gamma$ and P2 are other published reweightings in the same table.
+  - title: "Numerical conditioning: why v"
+    source: "Salimans & Ho 2022 §4; Karras et al. 2022 §5 (preconditioning)"
+    body: |
+      A target can be fine in exact arithmetic and still badly conditioned: a small error in the network's output can become a large error where it matters. Track a unit output error through each conversion.
+
+      **$\epsilon$-prediction at high noise.** $\hat x_0=(x_t-\sigma_t\hat\epsilon)/\alpha_t$, so an $\epsilon$-error $\delta$ becomes an $x_0$-error $(\sigma_t/\alpha_t)\delta=\delta/\sqrt{\mathrm{SNR}}$. At $t=T$ of Ho's linear schedule $b/a\approx157$. As SNR → 0, $x_t\approx\epsilon$, so predicting $\epsilon$ becomes trivial and says nothing about $x_0$; the $\epsilon$-loss also puts zero weight on the $x_0$-error there (its weight is SNR). Salimans & Ho found this breaks few-step samplers and distillation, where a single step must map pure noise to an image.
+
+      **$x_0$-prediction at low noise.** The mirror image: $\hat\epsilon=(x_t-\alpha_t\hat x_0)/\sigma_t$, so an $x_0$-error is amplified by $\alpha_t/\sigma_t$ in $\epsilon$-space. The network must re-emit the whole input with tiny error, instead of a small correction to it. EDM's skip connection addresses this (gen.diffusion-solvers).
+
+      **$v$-prediction is bounded at both ends.** From $\hat x_0=\alpha_tx_t-\sigma_t\hat v$ and $\hat\epsilon=\sigma_tx_t+\alpha_t\hat v$, a $v$-error $\delta$ becomes an $x_0$-error $\sigma_t\delta$ and an $\epsilon$-error $\alpha_t\delta$, both at most $\delta$. And for unit-variance data, with $\epsilon$ independent of $x_0$, the target has unit variance at every noise level:
+
+      $$\mathrm{Var}(v)=\alpha_t^2\,\mathrm{Var}(\epsilon)+\sigma_t^2\,\mathrm{Var}(x_0)=1.$$
+
+      ![How a unit error in the network output turns into x_0-error (top) and ε-error (bottom) across log-SNR. ε-prediction explodes at the noisy end, x_0-prediction at the clean end; v-prediction stays at or below 1](gen.diffusion-parameterizations/error-amplification)
+
+      Salimans & Ho list three stable options: predict $x_0$ directly, predict both $x_0$ and $\epsilon$ and blend them, or predict $v$. $v$ is now common in practice. EDM's preconditioning generalises the idea with noise-dependent input and output scalings.
+  - title: "Noise schedules: linear vs cosine"
+    source: "Nichol & Dhariwal 2021 §3.2, eq. (17), Figs. 3–5; Ho et al. 2020 §4; Kingma & Gao 2023 §2.1"
+    body: |
+      A **noise schedule** is the decreasing map $t\mapsto\lambda_t$. Two discrete ones, both with $T=1000$:
+
+      - **Linear** (Ho): $\beta_t$ from $10^{-4}$ to $0.02$.
+      - **Cosine** (Nichol & Dhariwal): $\bar\alpha_t=f(t)/f(0)$ with
+
+      $$f(t)=\cos^2\Big(\frac{t/T+s}{1+s}\cdot\frac\pi2\Big),\quad s=0.008.$$
+
+      The offset $s$ keeps the first steps from being too small to learn, and each $\beta_t=1-\bar\alpha_t/\bar\alpha_{t-1}$ is clipped at 0.999 to avoid a singularity at $t=T$.
+
+      ![ᾱ_t and log-SNR for both schedules (T = 1000). The linear schedule hits SNR = 1 at t ≈ 259 and then spends most of its steps at very low SNR; the cosine schedule declines evenly and crosses at t ≈ 496](gen.diffusion-parameterizations/schedules)
+
+      Computed values: at $t=500$, $\bar\alpha_t\approx0.494$ (cosine) vs $0.079$ (linear). About 33% of the linear schedule's steps have $\bar\alpha_t<0.01$, against 6.5% for cosine.
+
+      **Why it mattered.** Nichol & Dhariwal observed that at 64×64 the last quarter of the linear schedule is almost pure noise, and that skipping up to 20% of the reverse process (the noisiest steps) barely hurt FID. Those steps cost training time and sampling compute and contribute little. The cosine form was chosen to fall roughly linearly in the middle and change slowly near both ends; they note the exact $\cos^2$ shape was arbitrary.
+
+      **Think in $\lambda$, not $t$.** Under uniform $t$, a schedule is a density $p(\lambda)$ over noise levels. The linear schedule spends about 30% of its steps below $\lambda=-5$; cosine about 5%. Because the network is conditioned on the noise level, two schedules that visit the same $\lambda$ values define the same denoising tasks, only sampled with different frequencies. The next card turns that into a precise statement.
+  - title: What the schedule does and doesn't change
+    source: "Kingma et al. 2021 §5.1, §5.3, eqs. (15)–(18); Kingma & Gao 2023 §3.1–3.2"
+    body: |
+      **1. The ELBO: only the endpoints matter.** Take lesson II's per-step term to the continuous limit ($T\to\infty$). The SNR drop becomes $-\mathrm{SNR}'(t)\,dt$:
+
+      $$L_\infty=-\frac12\int_0^1\mathrm{SNR}'(t)\,\mathbb E\|x_0-\hat x_0(x_t,t)\|^2\,dt.$$
+
+      SNR is monotone, so change variable to $u=\mathrm{SNR}(t)$, with $du=\mathrm{SNR}'(t)dt$; flipping the limits absorbs the minus sign:
+
+      $$L_\infty=\frac12\int_{\mathrm{SNR}_{\min}}^{\mathrm{SNR}_{\max}}\mathbb E\|x_0-\hat x_0(x_u,u)\|^2\,du.$$
+
+      For a VP process $\alpha^2=u/(1+u)$ and $\sigma^2=1/(1+u)$, so the distribution of $x_u$ depends on $u$ alone, and so does the best possible denoiser. Nothing in the integrand remembers the schedule. **The continuous-time ELBO depends on the schedule only through $\mathrm{SNR}_{\min}$ and $\mathrm{SNR}_{\max}$** (VDM §5.1). What the interior shape still changes is the Monte-Carlo variance of the estimate, which is why VDM tunes the interior to minimise that variance and the endpoints for the bound (§5.3).
+
+      **2. Weighted losses: the schedule *is* the weighting.** For $L_{\text{simple}}$, $v$-losses or flow matching with uniform $t$, the weight on level $\lambda$ includes $p(\lambda)=-dt/d\lambda$. Changing the schedule changes the objective (Kingma & Gao §3.1). They also show the weighted loss is invariant to the schedule if $w(\lambda)$ is held fixed, so the meaningful choice is the weighting; the schedule mainly affects the estimator's variance (§3.2).
+
+      **3. Sampling.** With finitely many steps, the schedule decides which $\lambda$ values the sampler stops at, and so it changes discretisation error. That is why samplers often use a different schedule from training (gen.diffusion-solvers).
+  - title: "Schedule pitfalls: terminal SNR and resolution"
+    source: "Esser et al. 2024 (SD3) §5.3.2, eqs. (24)–(25); Salimans & Ho 2022 §4; Nichol & Dhariwal 2021 §3.2"
+    body: |
+      **Non-zero terminal SNR.** Ho's linear schedule ends at $\bar\alpha_T\approx4\times10^{-5}$, i.e. $\lambda_T\approx-10.1$. Training therefore never shows the network pure noise, yet sampling starts from pure $N(0,I)$: a train–test mismatch at the very first step. The tiny leftover signal sits mostly in the lowest frequencies (e.g. the image mean), which is exactly what a model may learn to read off during training and then cannot find at sampling time.
+
+      The natural fix is to rescale the schedule so that $\mathrm{SNR}(T)=0$. But at SNR = 0, $x_T=\epsilon$ exactly: predicting $\epsilon$ becomes trivial and the implied $\hat x_0=(x_T-\sigma_T\hat\epsilon)/\alpha_T$ is $0/0$ (Salimans & Ho's breakdown, in its extreme). So zero terminal SNR needs $v$- or $x_0$-prediction; with $v$, the target at SNR = 0 is $-x_0$ and the network learns the data mean. Lin et al. (2024) study these fixes; their paper is not in our source cache, so treat that pointer as named only.
+
+      **Resolution.** The same per-pixel noise destroys less global information in a larger image. Suppose $n$ neighbouring pixels share a value $c$ (a flat region). Each pixel is $\alpha_tc+\sigma_t\epsilon_i$; their average is $\alpha_tc$ plus noise of variance $\sigma_t^2/n$, so its SNR is $n\cdot\mathrm{SNR}(t)$. Coarse structure survives longer at high resolution, so a schedule tuned at 256² leaves too much signal at 1024².
+
+      SD3 makes this an explicit rule: moving from $n$ to $m$ pixels, shift the log-SNR at each timestep by
+
+      $$\lambda_m=\lambda_n-\log\frac mn.$$
+
+      From 256² to 1024² ($m/n=16$) that is a shift of $-\log16\approx-2.77$, i.e. 16× lower SNR at the same $t$. SD3 states it for its rectified-flow path, but the argument only uses log-SNR, so it carries over to VP schedules.
+  - title: What interviewers probe
+    source: Salimans & Ho 2022 §4; Kingma et al. 2021 §5; Kingma & Gao 2023 §3; Nichol & Dhariwal 2021 §3.2
+    body: |
+      - *ε, x₀, v, score: which is "right"?* All are equivalent at the optimum (linear maps of each other given $x_t$). They differ in implied weighting and conditioning.
+      - *Convert $\epsilon$ to score.* $\nabla\log q_t=-\epsilon^*/\sigma_t$, from $\nabla\log q_t=\mathbb E[\nabla\log q(x_t|x_0)|x_t]$.
+      - *What is $v$?* $\alpha_t\epsilon-\sigma_tx_0=dx_t/d\phi$; $\hat x_0=\alpha_tx_t-\sigma_t\hat v$, $\hat\epsilon=\sigma_tx_t+\alpha_t\hat v$ (uses $\alpha_t^2+\sigma_t^2=1$).
+      - *Why does ε-prediction fail for one-step distillation?* At SNR → 0 its implied $x_0$ error is amplified by $\sigma_t/\alpha_t\to\infty$ and its loss weight on $x_0$ goes to 0.
+      - *Loss weights?* ε-MSE $=\mathrm{SNR}\cdot x_0$-MSE; v-MSE $=(1+\mathrm{SNR})\cdot x_0$-MSE; ELBO is flat in $\lambda$ on the ε-error.
+      - *Does the schedule change the ELBO?* Not its continuous-time value, except through the endpoints. It changes estimator variance, the effective weighting of losses with uniform $t$, and sampling error.
+      - *Why cosine?* The linear schedule reaches near-pure noise early and wastes steps there, notably at low resolution.
+      - *Why shift schedules at high resolution?* Averaging $n$ pixels raises effective SNR by $n$; SD3 shifts $\lambda$ by $-\log(m/n)$.
+      - *Zero terminal SNR?* Removes the train–test mismatch at $t=T$ but requires $v$ or $x_0$ prediction.
+  - title: Key results
+    source: Salimans & Ho 2022 §4, App. D; Kingma et al. 2021 §5.1; Kingma & Gao 2023 Table 1; Nichol & Dhariwal 2021 eq. (17)
+    body: |
+      $$x_t=\alpha_tx_0+\sigma_t\epsilon,\quad \alpha_t^2+\sigma_t^2=1$$
+
+      $$\lambda=\log\frac{\alpha_t^2}{\sigma_t^2},\quad \alpha_t=\sqrt{\bar\alpha_t}$$
+
+      $$\hat x_0=\frac{x_t-\sigma_t\hat\epsilon}{\alpha_t}=\alpha_tx_t-\sigma_t\hat v$$
+
+      $$v=\alpha_t\epsilon-\sigma_tx_0,\qquad \hat\epsilon=\sigma_tx_t+\alpha_t\hat v$$
+
+      $$\nabla\log q_t(x_t)=-\frac{\mathbb E[\epsilon|x_t]}{\sigma_t}$$
+
+      $$\mathbb E[x_0|x_t]=\frac{x_t+\sigma_t^2\nabla\log q_t(x_t)}{\alpha_t}$$
+
+      $$\|\Delta\epsilon\|^2=\mathrm{SNR}\|\Delta x_0\|^2,\quad \|\Delta v\|^2=(1+\mathrm{SNR})\|\Delta x_0\|^2$$
+
+      $$L_\infty=\frac12\int_{\mathrm{SNR}_{\min}}^{\mathrm{SNR}_{\max}}\mathbb E\|x_0-\hat x_0\|^2\,du$$
+
+      - Implied weights on the ε-error per unit $\lambda$: ELBO 1; ε-loss + cosine $\propto\mathrm{sech}(\lambda/2)$; v-loss + cosine = FM-OT $\propto e^{-\lambda/2}$.
+      - Cosine: $\bar\alpha_t=f(t)/f(0)$, $f=\cos^2(\frac{t/T+s}{1+s}\frac\pi2)$, $s=0.008$, $\beta_t\le0.999$. SNR = 1 at $t\approx496$ (cosine) vs 259 (linear).
+      - Resolution $n\to m$ pixels: $\lambda\to\lambda-\log(m/n)$.
+
+quiz:
+  - id: q1
+    source: "Luo 2022, \"Three Equivalent Interpretations\" (p.16–17); Kingma & Gao 2023 §3"
+    prompt: |
+      A trained network outputs $\hat\epsilon$ at a step with $\bar\alpha_t=0.36$. What is the implied score estimate $\nabla\log q_t(x_t)$?
+    correct: $-1.25\,\hat\epsilon$
+    wrong:
+      - $-1.67\,\hat\epsilon$
+      - $-0.80\,\hat\epsilon$
+      - $-1.56\,\hat\epsilon$
+    explanation: |
+      The score is $-\hat\epsilon/\sigma_t$ with $\sigma_t=\sqrt{1-\bar\alpha_t}=0.8$, giving $-1.25\hat\epsilon$. $-1.67$ divides by $\alpha_t=0.6$ instead; $-0.80$ multiplies by $\sigma_t$; $-1.56$ divides by the variance $1-\bar\alpha_t=0.64$ instead of the standard deviation.
+  - id: q2
+    source: Salimans & Ho 2022 §4, App. D
+    prompt: |
+      With $\bar\alpha_t=0.64$, $x_0=1$ and $\epsilon=0.5$, what is the $v$-prediction target $v=\alpha_t\epsilon-\sigma_tx_0$?
+    correct: −0.2
+    wrong:
+      - "+0.2"
+      - −0.5
+      - "+1.1"
+    explanation: |
+      $\alpha_t=0.8$, $\sigma_t=0.6$, so $v=0.8\cdot0.5-0.6\cdot1=-0.2$. $+0.2$ flips the sign convention; $-0.5$ is $\epsilon-x_0$, SD3's flow-matching velocity, a different object; $1.1$ is $x_t$ itself.
+  - id: q3
+    source: Salimans & Ho 2022 App. D, eqs. (27)–(30)
+    prompt: |
+      To show $\hat\epsilon=\sigma_tx_t+\alpha_t\hat v$ from $x_t=\alpha_tx_0+\sigma_t\epsilon$ and $v=\alpha_t\epsilon-\sigma_tx_0$, which fact is needed?
+    correct: $\alpha_t^2+\sigma_t^2=1$
+    wrong:
+      - $\alpha_t+\sigma_t=1$
+      - $x_0$ and $\epsilon$ are independent
+      - $\hat\epsilon$ is the conditional mean $\mathbb E[\epsilon|x_t]$
+    explanation: |
+      $\sigma_tx_t+\alpha_tv=\alpha_t\sigma_tx_0+\sigma_t^2\epsilon+\alpha_t^2\epsilon-\alpha_t\sigma_tx_0=(\alpha_t^2+\sigma_t^2)\epsilon$. It is pure algebra for the variance-preserving process; no statistical property is used. $\alpha_t+\sigma_t=1$ is the coefficient rule of the straight-line (rectified-flow) path, not of VP diffusion.
+  - id: q4
+    source: Salimans & Ho 2022 §4
+    prompt: |
+      At a noise level with SNR = 1, how does the weight that the $v$-MSE puts on the $x_0$-error compare with the weight of the $\epsilon$-MSE?
+    correct: Twice as large
+    wrong:
+      - The same
+      - Half as large
+      - Four times as large
+    explanation: |
+      $\|\Delta v\|^2=(1+\mathrm{SNR})\|\Delta x_0\|^2=2\|\Delta x_0\|^2$, while $\|\Delta\epsilon\|^2=\mathrm{SNR}\|\Delta x_0\|^2=\|\Delta x_0\|^2$. The gap grows at low SNR, where the $\epsilon$-weight goes to 0 and the $v$-weight to 1.
+  - id: q5
+    source: Salimans & Ho 2022 §4
+    prompt: |
+      As SNR → 0, which parameterisation's implied clean-image estimate $\hat x_0$ becomes unstable, and why does this matter for one-step distillation?
+    correct: ε-prediction; x̂₀ divides by \alpha_t → 0, and one step starts from pure noise
+    wrong:
+      - x₀-prediction; predicting a clean image from pure noise is ill-posed
+      - v-prediction; v tends to −x₀, which the network cannot know
+      - None; the targets differ only by a fixed linear map at every SNR
+    explanation: |
+      $\hat x_0=(x_t-\sigma_t\hat\epsilon)/\alpha_t$ amplifies $\epsilon$-errors by $\sigma_t/\alpha_t$, which diverges as $\alpha_t\to0$. A one-step sampler sees exactly that input. $x_0$- and $v$-prediction both give bounded maps to $\hat x_0$ there (the optimal output is just the data mean, $\mathbb E[x_0]$ or $-\mathbb E[x_0]$). The linear map exists but its coefficients blow up.
+  - id: q6
+    source: Kingma et al. 2021 §5.1, §5.3; Kingma & Gao 2023 §3.1
+    prompt: |
+      Keeping $\mathrm{SNR}_{\min}$ and $\mathrm{SNR}_{\max}$ fixed, you change the shape of a VP noise schedule. Which statement is **false**?
+    correct: It changes the optimum of the continuous-time ELBO
+    wrong:
+      - It changes the effective weighting of L_simple with uniform t
+      - It changes discretisation error when sampling with few steps
+      - It changes the variance of the Monte-Carlo ELBO estimate
+    explanation: |
+      After changing variables to $u=\mathrm{SNR}$, the continuous-time ELBO is $\frac12\int\mathbb E\|x_0-\hat x_0(x_u,u)\|^2du$ between fixed endpoints, so its value and optimum do not depend on the shape. The shape does set $p(\lambda)$ (hence the weighting of uniform-$t$ losses), where a few-step sampler lands, and the estimator's variance, which VDM minimises.
+  - id: q7
+    source: Nichol & Dhariwal 2021 §3.2, Fig. 5
+    prompt: |
+      ![Two noise schedules, ᾱ_t vs t](gen.diffusion-parameterizations/schedules-quiz)
+
+      Which curve is the cosine schedule, and what was the main reason it was introduced?
+    correct: B; the linear schedule wastes many steps at near-zero signal
+    wrong:
+      - A; it destroys signal faster, which improves log-likelihood
+      - B; it keeps β_t constant, which simplifies the posterior
+      - A; it adds noise faster early on, protecting fine detail
+    explanation: |
+      B declines roughly linearly through the middle and reaches $\bar\alpha_t\approx0.49$ at $t=500$; A (linear) is already at 0.079. Nichol & Dhariwal found that at low resolution the end of the linear schedule is nearly pure noise and contributes little (skipping 20% of the reverse process barely changed FID). The cosine $\beta_t$ are not constant.
+  - id: q8
+    source: Esser et al. 2024 (SD3) §5.3.2, eq. (25)
+    prompt: |
+      A model's schedule was tuned at 256×256. Following SD3's resolution rule, how should the log-SNR at each timestep change when training at 1024×1024?
+    correct: Lower it by about 2.77, i.e. 16× less SNR
+    wrong:
+      - Lower it by about 1.39, i.e. 4× less SNR
+      - Raise it by about 2.77, i.e. 16× more SNR
+      - Leave it; per-pixel SNR is all that matters
+    explanation: |
+      $\lambda_m=\lambda_n-\log(m/n)$ with $m/n=1024^2/256^2=16$, so the shift is $-\log16\approx-2.77$. Averaging $n$ pixels raises the effective SNR of coarse structure by $n$, so larger images need more noise. 1.39 uses the side-length ratio 4 instead of the pixel-count ratio.
+  - id: q9
+    source: Kingma et al. 2021 §5.1, eq. (18)
+    prompt: |
+      Why does the continuous-time diffusion ELBO depend on the VP schedule only through $\mathrm{SNR}_{\min}$ and $\mathrm{SNR}_{\max}$?
+    correct: After changing variable to u = SNR(t), the integrand depends only on u
+    wrong:
+      - Because the ε-loss weights every timestep equally
+      - Because each per-step Gaussian KL is independent of the schedule
+      - Because only L_T and L_0 depend on the noise schedule
+    explanation: |
+      $-\frac12\int\mathrm{SNR}'(t)\,\mathbb E\|x_0-\hat x_0\|^2dt=\frac12\int\mathbb E\|x_0-\hat x_0(x_u,u)\|^2du$, and for a VP process $x_u$'s distribution is fixed by $u$. The per-step KLs do depend on the schedule (their weights are SNR drops); only the integral over them does not. The prior and reconstruction terms depend on the endpoints only.
+  - id: q10
+    source: Salimans & Ho 2022 §4
+    prompt: |
+      A schedule is rescaled to have exactly zero SNR at $t=T$. What goes wrong if the model still predicts $\epsilon$?
+    correct: At t = T predicting ε is trivial and the implied x̂₀ is 0/0
+    wrong:
+      - v-prediction becomes undefined there, since v = −x₀
+      - The posterior variance β̃_T becomes infinite at t = T
+      - Nothing; ε-prediction is unaffected by the SNR value
+    explanation: |
+      With $\alpha_T=0$, $x_T=\epsilon$, so $\hat\epsilon=x_T$ is a perfect but useless prediction, and $\hat x_0=(x_T-\sigma_T\hat\epsilon)/\alpha_T$ is undefined. $v=-x_0$ is a perfectly good target (its optimum is $-\mathbb E[x_0]$). $\tilde\beta_T=(1-\bar\alpha_{T-1})\beta_T/(1-\bar\alpha_T)$ stays finite.
+  - id: q11
+    source: "Luo 2022, \"Three Equivalent Interpretations\" (p.16); Bishop PRML §2.3.1"
+    prompt: |
+      For one-dimensional data $x_0\sim N(0,1)$, what is the optimal noise prediction $\mathbb E[\epsilon|x_t]$?
+    correct: $\sigma_t\,x_t$
+    wrong:
+      - $x_t/\sigma_t$
+      - $\alpha_t\,x_t$
+      - $(x_t-\alpha_t)/\sigma_t$
+    explanation: |
+      $x_t=\alpha_tx_0+\sigma_t\epsilon$ has unit variance and $\mathrm{Cov}(\epsilon,x_t)=\sigma_t$, so the Gaussian conditional mean is $\sigma_tx_t$. It matches the score route: $q_t=N(0,1)$, score $=-x_t$, and $\epsilon^*=-\sigma_t\cdot\text{score}$. $\alpha_tx_t$ is the optimal $x_0$ prediction instead.
+  - id: q12
+    source: Kingma & Gao 2023 §3.1, Table 1
+    prompt: |
+      Which statement about implied loss weightings (on the ε-error, per unit log-SNR) is **false**?
+    correct: The ε-loss with cosine schedule weights all log-SNRs equally
+    wrong:
+      - The ELBO weights all log-SNR levels equally
+      - The v-loss with cosine schedule matches flow matching with the OT path
+      - With uniform t, the ε-loss weight equals the density p(λ)
+    explanation: |
+      The flat weighting belongs to the ELBO. The $\epsilon$-loss with uniform $t$ has weight $p(\lambda)$, which for the cosine schedule is $\propto\mathrm{sech}(\lambda/2)$, peaked at SNR = 1. The $v$-cosine and FM-OT weights are both $\propto e^{-\lambda/2}$.
+  - id: q13
+    source: Salimans & Ho 2022 §4; Ho et al. 2020 §4
+    prompt: |
+      At $t=T$ of Ho's linear schedule ($\bar\alpha_T\approx4\times10^{-5}$), an $\epsilon$-network is off by 0.01. Roughly how large is the resulting error in its implied $\hat x_0$?
+    correct: About 1.6
+    wrong:
+      - About 0.01
+      - About 0.16
+      - About 6 × 10⁻⁵
+    explanation: |
+      The $x_0$-error is $(\sigma_T/\alpha_T)\cdot0.01$ with $\sigma_T/\alpha_T=\sqrt{(1-\bar\alpha_T)/\bar\alpha_T}\approx157$, so about 1.6, larger than the data range's half-width. 0.01 forgets the amplification; $6\times10^{-5}$ multiplies by $\alpha_T$ instead of dividing.
+
+cards:
+  - id: f1
+    source: Kingma et al. 2021 §3.1; Salimans & Ho 2022 §2; Lu et al. 2022 §2.2
+    front: Define $\alpha_t$, $\sigma_t$, SNR and $\lambda$ for a VP diffusion, and name the main notation clashes.
+    back: |
+      $x_t=\alpha_tx_0+\sigma_t\epsilon$, $\alpha_t=\sqrt{\bar\alpha_t}$, $\sigma_t=\sqrt{1-\bar\alpha_t}$, $\alpha_t^2+\sigma_t^2=1$; $\mathrm{SNR}=\alpha_t^2/\sigma_t^2$; $\lambda=\log\mathrm{SNR}$.
+
+      VDM/Salimans–Ho write $\alpha_t,\sigma_t$ for $\alpha_t,\sigma_t$. VDM's $\gamma=-\lambda$; DPM-Solver's $\lambda$ is half ours.
+  - id: f2
+    source: Salimans & Ho 2022 §4, App. D
+    front: Conversions between $\hat x_0$, $\hat\epsilon$ and $\hat v$ given $x_t$.
+    back: |
+      $\hat x_0=(x_t-\sigma_t\hat\epsilon)/\alpha_t$; $\hat\epsilon=(x_t-\alpha_t\hat x_0)/\sigma_t$.
+
+      $v=\alpha_t\epsilon-\sigma_tx_0$; $\hat x_0=\alpha_tx_t-\sigma_t\hat v$; $\hat\epsilon=\sigma_tx_t+\alpha_t\hat v$ (a rotation by the noise angle $\phi$, $\alpha_t=\cos\phi$).
+  - id: f3
+    source: Luo 2022, "Three Equivalent Interpretations" (p.15–17)
+    front: Relation between the optimal ε-predictor, the score and the optimal denoiser (Tweedie).
+    back: |
+      $$\epsilon^*(x_t)=\mathbb E[\epsilon|x_t]=-\sigma_t\nabla\log q_t(x_t)$$
+
+      $$\mathbb E[x_0|x_t]=\frac{x_t+\sigma_t^2\nabla\log q_t(x_t)}{\alpha_t}$$
+  - id: f4
+    source: Salimans & Ho 2022 §4, eq. (9); Kingma & Gao 2023 §3
+    front: How the ε-, v- and score-MSE relate to the $x_0$-MSE at one noise level.
+    back: |
+      $\|\Delta\epsilon\|^2=\mathrm{SNR}\|\Delta x_0\|^2$; $\|\Delta v\|^2=(1+\mathrm{SNR})\|\Delta x_0\|^2$; $\|\Delta\,\text{score}\|^2=\|\Delta\epsilon\|^2/\sigma_t^2$.
+  - id: f5
+    source: Nichol & Dhariwal 2021 §3.2, eq. (17)
+    front: The cosine noise schedule, its constants, and how it compares with the linear one.
+    back: |
+      $\bar\alpha_t=f(t)/f(0)$, $f(t)=\cos^2\big(\frac{t/T+s}{1+s}\frac\pi2\big)$, $s=0.008$, $\beta_t$ clipped at 0.999.
+
+      At $t=500$ of 1000: $\bar\alpha\approx0.494$ vs 0.079 (linear). SNR = 1 at $t\approx496$ vs 259.
+  - id: f6
+    source: Kingma et al. 2021 §5.1, §5.3
+    front: What does VDM's invariance result say about noise schedules?
+    back: |
+      The continuous-time ELBO $=\frac12\int_{\mathrm{SNR}_{\min}}^{\mathrm{SNR}_{\max}}\mathbb E\|x_0-\hat x_0(x_u,u)\|^2du$ depends on the schedule only through its endpoint SNRs. The interior shape changes only the Monte-Carlo variance (which VDM minimises).
+  - id: f7
+    source: Kingma & Gao 2023 Table 1, Theorem 1
+    front: Implied weightings $w(\lambda)$ (on the ε-error, per unit log-SNR) of the ELBO, ε-loss with cosine, and v-loss with cosine. Which are monotone?
+    back: |
+      ELBO: 1. ε-loss + cosine: $\mathrm{sech}(\lambda/2)$. v-loss + cosine (= FM-OT): $e^{-\lambda/2}$.
+
+      ELBO and v-cosine are monotone (non-increasing in $\lambda$), so they equal the ELBO of noise-augmented data; ε-cosine is not.
+  - id: f8
+    type: open
+    source: Salimans & Ho 2022 §4; Karras et al. 2022 §5
+    front: Compare ε-, x₀- and v-prediction. When does each fail, and why is v popular?
+    back: |
+      - Same information: given $x_t$ each is a linear map of the others; the optimum is the same.
+      - ε: $\hat x_0=(x_t-\sigma_t\hat\epsilon)/\alpha_t$ amplifies errors by $\sigma_t/\alpha_t=\mathrm{SNR}^{-1/2}$; at SNR → 0 the prediction is trivial and the $x_0$ weight is 0. Breaks few-step sampling and distillation.
+      - x₀: $\hat\epsilon=(x_t-\alpha_t\hat x_0)/\sigma_t$ amplifies by $\alpha_t/\sigma_t$ at low noise; the network must re-emit the input (EDM adds a skip path).
+      - v $=\alpha_t\epsilon-\sigma_tx_0$: $x_0$-error $=\sigma_t\delta$, ε-error $=\alpha_t\delta$, both ≤ δ; $\mathrm{Var}(v)=1$ for unit-variance data. Loss weight $(1+\mathrm{SNR})$ on $x_0$ stays positive at SNR = 0.
+      - Hence v suits zero-terminal-SNR schedules and distillation; EDM preconditioning generalises it.
+  - id: f9
+    type: open
+    source: "Luo 2022, \"Three Equivalent Interpretations\" (p.15–17); Kingma et al. 2021 §3.4"
+    front: Derive the relation between the score of the noisy marginal and the optimal noise predictor, and state Tweedie's formula.
+    back: |
+      - $q_t(x_t)=\int q(x_0)q(x_t|x_0)dx_0$; differentiate under the integral with $\nabla q=q\nabla\log q$.
+      - Bayes: $\nabla\log q_t(x_t)=\mathbb E_{q(x_0|x_t)}[\nabla\log q(x_t|x_0)]$.
+      - Gaussian kernel: $\nabla\log q(x_t|x_0)=-(x_t-\alpha_tx_0)/\sigma_t^2=-\epsilon/\sigma_t$.
+      - So score $=-\mathbb E[\epsilon|x_t]/\sigma_t$; the MSE-optimal $\epsilon_\theta$ is $\mathbb E[\epsilon|x_t]$, hence $\epsilon_\theta^*=-\sigma_t\cdot$score.
+      - Tweedie: $\mathbb E[x_0|x_t]=(x_t+\sigma_t^2\nabla\log q_t)/\alpha_t$.
+      - Check with $x_0\sim N(0,1)$: score $=-x_t$, $\mathbb E[\epsilon|x_t]=\sigma_tx_t$.
+  - id: f10
+    type: open
+    source: Kingma et al. 2021 §4–5.1; Luo 2022, "Learning Diffusion Noise Parameters" (p.14)
+    front: Starting from the discrete DDPM ELBO, show that the continuous-time ELBO depends on the noise schedule only through its endpoints.
+    back: |
+      - With Ho's reverse variance set to $\tilde\beta_t$ (lesson II), step $t$ contributes $\frac12(\mathrm{SNR}(t-1)-\mathrm{SNR}(t))\,\mathbb E\|x_0-\hat x_0\|^2$.
+      - As $T\to\infty$: $L_\infty=-\frac12\int_0^1\mathrm{SNR}'(t)\,\mathbb E\|x_0-\hat x_0\|^2dt$ (the discrete sum is an upper Riemann sum, so more steps tighten it).
+      - Substitute $u=\mathrm{SNR}(t)$ (monotone): $L_\infty=\frac12\int_{\mathrm{SNR}_{\min}}^{\mathrm{SNR}_{\max}}\mathbb E\|x_0-\hat x_0(x_u,u)\|^2du$.
+      - For VP, $\alpha^2=u/(1+u)$, $\sigma^2=1/(1+u)$: the noisy distribution and the optimal denoiser depend on $u$ only.
+      - So the schedule's shape drops out; it only affects estimator variance (VDM tunes it for that) and, for weighted losses with uniform $t$, the effective weighting.
+  - id: f11
+    type: open
+    source: Nichol & Dhariwal 2021 §3.2; Kingma & Gao 2023 §3; Esser et al. 2024 §5.3.2; Salimans & Ho 2022 §4
+    front: An interviewer asks "what does the noise schedule actually do?" Give a complete answer, including two practical pitfalls.
+    back: |
+      - A schedule is a map $t\mapsto\lambda_t$; with uniform $t$ it is a density $p(\lambda)$ over noise levels.
+      - ELBO (continuous): invariant to the shape between fixed endpoints; shape affects only estimator variance.
+      - Weighted losses ($L_{\text{simple}}$, v, FM) with uniform $t$: the weight includes $p(\lambda)$, so the schedule *is* the weighting.
+      - Sampling: decides where a finite-step sampler evaluates, so it sets discretisation error.
+      - Linear vs cosine: linear spends ~30% of steps at $\lambda<-5$ (cosine ~5%); Nichol saw those steps barely matter at 64×64.
+      - Pitfall 1, terminal SNR: linear ends at $\lambda\approx-10.1$, not pure noise; fixing to SNR = 0 needs v/x₀ prediction.
+      - Pitfall 2, resolution: averaging $n$ pixels multiplies SNR by $n$; SD3 shifts $\lambda$ by $-\log(m/n)$ (−2.77 for 256²→1024²).
+
+reading:
+  - title: "Salimans & Ho (2022), Progressive Distillation for Fast Sampling of Diffusion Models, §4 and App. D"
+    url: https://arxiv.org/abs/2202.00512
+    kind: paper
+    note: Why ε-prediction breaks at low SNR, the x / (x, ε) / v options, the SNR and SNR+1 weightings, and the angular derivation of v.
+  - title: "Kingma, Salimans, Poole & Ho (2021), Variational Diffusion Models, §3–5"
+    url: https://arxiv.org/abs/2107.00630
+    kind: paper
+    note: The α/σ/SNR formulation, the discrete and continuous losses, and the proof that the ELBO depends only on the endpoint SNRs (§5.1).
+  - title: "Kingma & Gao (2023), Understanding Diffusion Objectives as the ELBO with Simple Data Augmentation, §2–4"
+    url: https://arxiv.org/abs/2303.00848
+    kind: paper
+    note: Table 1 rewrites ε, v, EDM and flow-matching losses as weightings w(λ); Theorem 1 links monotone weightings to the ELBO.
+  - title: "Nichol & Dhariwal (2021), Improved Denoising Diffusion Probabilistic Models, §3.2"
+    url: https://arxiv.org/abs/2102.09672
+    kind: paper
+    note: The cosine schedule, the evidence that the linear schedule wastes its noisiest steps, and the ᾱ_t comparison plot.
+  - title: "Luo (2022), Understanding Diffusion Models, \"Three Equivalent Interpretations\" (p.15–17)"
+    url: https://arxiv.org/abs/2208.11970
+    kind: paper
+    note: The x₀, ε and score views of the same model, with Tweedie's formula derived.

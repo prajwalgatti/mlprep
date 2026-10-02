@@ -1,0 +1,470 @@
+id: sys.pipeline-parallel
+area: applied
+title: "Pipeline Parallelism: GPipe, the Bubble, 1F1B"
+summary: Splitting the layers into stages on different GPUs. Deriving the pipeline bubble, why 1F1B keeps GPipe's bubble but caps activation memory at p micro-batches, synchronous semantics, cheap point-to-point communication, load balance, and how PP interacts with DP and ZeRO.
+order: 230
+level: core
+tags: [parallelism, pipeline-parallel, gpipe, 1f1b, distributed-training]
+prereqs: [sys.memory-anatomy, sys.collectives, sys.ddp, sys.zero, sys.tensor-parallel]
+
+explainer:
+  - title: "The problem: split the layers, and only one GPU works"
+    body: |
+      Tensor parallelism splits every layer, but its all-reduces need NVLink, so it stops at one node (`sys.tensor-parallel`). For a model whose weights do not fit even on 8 GPUs, we need a way to cross nodes that communicates little. **Pipeline parallelism (PP)** puts consecutive groups of layers on different devices. With $L$ layers and $p$ **stages**, stage $i$ holds layers $(i-1)L/p+1$ to $iL/p$, with their weights, gradients and optimizer state. Stages exchange only the activations at their boundary in forward, and the gradient of that boundary activation in backward.
+
+      **The naive schedule.** Push the whole batch through stage 1, then stage 2, and so on, then run backward in reverse. Stage $i$ cannot start until stage $i-1$ has finished, so at any moment exactly one stage is busy, and each GPU's utilisation is $1/p$: 12.5% for $p=8$. Memory is split $p$ ways, but there is no speed-up at all.
+
+      **The fix: micro-batching.** Split the batch into $m$ **micro-batches**. As soon as stage 1 has finished the forward of micro-batch 1 and sent it on, it starts on micro-batch 2 while stage 2 works on micro-batch 1. Most stages are now busy at once. Idle time remains at the start (the pipeline filling) and the end (draining), and this idle time is called the **bubble**.
+
+      **Notation.**
+      - $t_f$, $t_b$: time for one micro-batch's forward and backward through *one stage*. We assume stages are balanced; figures use $t_b=2t_f$ (backward computes gradients for both inputs and weights, two matmuls per forward matmul).
+      - $m$: micro-batches per optimizer step (per *flush*); $b$: micro-batch size; $d$: data-parallel degree.
+    source: Ultra-Scale Playbook "Pipeline Parallelism"; Narayanan et al. 2021 §2.2; Huang et al. 2019 §2.2
+
+  - title: "GPipe: deriving the bubble"
+    body: |
+      ![GPipe with $p=4$, $m=8$, simulated from the dependencies. The grey wedges are the bubble: $p-1$ forward slots at the start and $p-1$ backward slots at the end on every stage.](sys.pipeline-parallel/gpipe-schedule)
+
+      **GPipe** (also called *all-forward-all-backward*, AFAB) runs all $m$ forwards, then all $m$ backwards, then one optimizer step.
+
+      **Forward phase.** Stage 1 starts micro-batch $k$ at $(k-1)t_f$, and each stage passes it on one slot later, so micro-batch $k$ starts on stage $i$ at $(k+i-2)t_f$. The last micro-batch therefore finishes on stage $p$ at $(m+p-1)t_f$.
+
+      **Backward phase.** It is the mirror image: it starts at stage $p$, and stage 1 finishes its last backward $(m+p-1)t_b$ later. So the step takes
+
+      $$T_{\text{GPipe}}=(m+p-1)(t_f+t_b).$$
+
+      **Ideal time.** Each stage does $m(t_f+t_b)$ of useful work, so the idle time per stage is $(p-1)(t_f+t_b)$. Two conventions for the bubble are in use; know both.
+      - **Fraction of the step spent idle** (GPipe paper):
+
+      $$\frac{p-1}{m+p-1}$$
+
+      - **Bubble relative to ideal time** (Megatron, Narayanan et al.):
+
+      $$\frac{t_{pb}}{t_{id}}=\frac{p-1}{m}$$
+
+      Both depend only on $p$ and $m$. $t_f$ and $t_b$ cancel, so the $t_b=2t_f$ choice affects the drawing, not the result. Both shrink only when $m\gg p$.
+
+      ![Solid: idle fraction $(p-1)/(m+p-1)$; dashed: Megatron's $(p-1)/m$. Both need $m\gg p$; at $m=4p$ the idle fraction is still ≈18%.](sys.pipeline-parallel/bubble-vs-m)
+
+      **Worked numbers.**
+      - $p=4$, $m=8$: idle fraction $3/11=27.3\%$; ratio $3/8=37.5\%$.
+      - $p=8$, $m=32$: $7/39=17.9\%$; ratio $21.9\%$.
+      - $p=8$, $m=8$: $46.7\%$; ratio $87.5\%$.
+
+      GPipe reports the bubble as "negligible" for $m\ge4p$. By the formula, $m=4p$ still idles $(p-1)/(5p-1)$, which is 17.9% at $p=8$. Their measured overhead was lower partly because recomputation could start early and fill some idle slots. Treat "negligible" as a loose empirical claim.
+    source: Huang et al. 2019 §2.2–2.3; Narayanan et al. 2021 §2.2.1
+
+  - title: "1F1B: same bubble, bounded memory"
+    body: |
+      ![1F1B with the same $p=4$, $m=8$. The step length is unchanged, but stage $i$ never holds more than $p-i+1$ micro-batches' activations.](sys.pipeline-parallel/1f1b-schedule)
+
+      **The memory problem with GPipe.** A micro-batch's activations must be kept from its forward until its backward. In GPipe no backward starts until all $m$ forwards are done, so at the peak every stage stores **all $m$ micro-batches**. Raising $m$ to shrink the bubble grows memory in proportion.
+
+      **1F1B** (PipeDream-Flush) starts each backward as early as possible. Stage $i$ (1-indexed) runs:
+      - **warm-up**: $p-i$ forwards;
+      - **steady state**: one forward, then one backward, repeated;
+      - **cool-down**: the remaining backwards.
+
+      A micro-batch's activations are freed as soon as its backward finishes. Stage $i$ therefore holds at most $p-i+1$ micro-batches: $p$ on stage 1, and 1 on the last stage, which runs each backward right after its forward.
+
+      **Why the bubble is unchanged.** Look at the last stage. It cannot start before $(p-1)t_f$, when micro-batch 1 arrives. It must do $m(t_f+t_b)$ of work. After its final backward, that gradient still needs $(p-1)t_b$ to travel back to stage 1. So *any* schedule of this kind takes at least
+
+      $$\begin{aligned}T&\ge(p-1)t_f+m(t_f+t_b)+(p-1)t_b\\&=(m+p-1)(t_f+t_b).\end{aligned}$$
+
+      GPipe meets this bound, and so does 1F1B, because its last stage is never starved once filled. So 1F1B does **not** shrink the bubble. What it changes is memory: it decouples memory from $m$, so $m$ can be raised to shrink the bubble without running out of memory. (Shrinking the bubble itself needs interleaved or zero-bubble schedules: `sys.pipeline-schedules`.)
+    source: Narayanan et al. 2021 §2.2.1; Narayanan et al. 2019 (PipeDream) §3.3; Ultra-Scale Playbook "One-forward-one-backward"
+
+  - title: "Activation memory: worked comparison"
+    body: |
+      Let $A$ be the activation memory of one layer for one micro-batch. A stage holds $L/p$ layers.
+
+      **GPipe peak per stage:**
+
+      $$m\cdot\frac{L}{p}\cdot A.$$
+
+      **1F1B, first stage** (the worst case):
+
+      $$p\cdot\frac{L}{p}\cdot A=L\cdot A.$$
+
+      So the first stage stores **a whole model's worth** of activations for one micro-batch, whatever $p$ and $m$ are. Adding stages divides the weights but not this peak. Later stages hold less, which makes memory imbalanced across stages.
+
+      **Example** (GPT-3-like: $L=96$, $h=12288$, $s=2048$, $a=96$, $b=1$; 8-way TP inside each stage). From `sys.tensor-parallel`, one layer stores $sbh(10+24/8+5as/(8h))=23\,sbh\approx0.58$ GB. With $p=8$ (12 layers per stage) and $m=32$:
+      - GPipe: $32\times12\times0.58\approx222$ GB per stage, far beyond 80 GB;
+      - 1F1B stage 1: $8\times12\times0.58\approx55.6$ GB ($=96$ layers $\times\,0.58$ GB), bounded but still large. Each GPU also holds ≈ 44 GB of model states ($175\text{B}/64$ GPUs × 16 bytes with mixed-precision Adam), so in practice recomputation, sequence parallelism or ZeRO-1 is still needed. Narayanan et al. note that recomputation is required for large models under PP.
+
+      **Recomputation.** GPipe pairs pipelining with re-materialisation. Each stage keeps only its *input* for each micro-batch ($2sbh\approx50$ MB here, so 1.6 GB for 32 micro-batches) and re-runs its forward during backward. The peak is then those stored inputs plus one micro-batch's full intermediates. The price is roughly one extra forward pass of compute. Megatron makes recomputation optional with 1F1B, and checkpointing every 1–2 layers is usually best (`sys.activation-checkpointing`).
+
+      The micro-batch size $b$ is itself a knob. Smaller $b$ cuts $A$ and allows larger $m$ at a fixed batch, but skinny GEMMs run less efficiently, so the best $b$ depends on the model, $p$, $d$ and the batch.
+    source: Korthikanti et al. 2022 §4.2.3; Huang et al. 2019 §2.3 "Performance Optimization"; Narayanan et al. 2021 §2.2.1, §3.4–3.5
+
+  - title: "Synchronous semantics: why the flush"
+    body: |
+      **Gradient-accumulation refresher.** Split a batch into $m$ equal micro-batches $\mathcal{B}_j$, each with mean loss $\ell_j(w)$. The batch loss is $\ell=\frac1m\sum_j\ell_j$, so by linearity of the gradient
+
+      $$\nabla\ell(w)=\frac1m\sum_{j=1}^{m}\nabla\ell_j(w).$$
+
+      Computing the micro-batch gradients one after another at the *same* $w$, summing them, and taking one optimizer step gives the same update as the full batch, up to floating-point summation order.
+
+      **The pipeline does exactly this.** Each stage adds up its weights' gradients over the $m$ backwards. At the **flush** (the end of the step, once all backwards are done) every stage takes one optimizer step. Every micro-batch saw the same weights in forward and backward, so PP plus flush is *mathematically* the same as non-pipelined training on that batch. The bubble is the price of this exactness.
+
+      **Where equivalence breaks (scope).**
+      - **BatchNorm**: statistics are computed per micro-batch, not per batch, so results differ (GPipe tracks the moving averages over the whole mini-batch only for evaluation).
+      - **Unequal micro-batches**: with padding or packing, averaging per micro-batch weights tokens unequally. Normalise by the total token count of the batch instead.
+      - **Global operations at the step**, such as gradient-norm clipping and NaN checks, need all stages' gradients, which forces a synchronisation at the flush.
+
+      **Why not drop the flush?** Without it, stage 1 would run micro-batch 5's forward on weights already updated by micro-batch 1, and its backward on yet newer weights. The resulting update is not the gradient of any loss. PipeDream keeps a copy of each weight version until the matching backward (*weight stashing*), but updates still lag by up to $p-1$ steps. Most LLM training keeps the flush (`sys.pipeline-schedules`).
+    source: Huang et al. 2019 §2.2; Narayanan et al. 2021 §2.2; Narayanan et al. 2019 (PipeDream) §3.4; HF blog "Fixing Gradient Accumulation" (2024)
+
+  - title: "Communication: why PP goes across nodes"
+    body: |
+      **What is sent.** At each stage boundary, each micro-batch's output activation, $b\times s\times h$ values, goes forward, and its gradient (the same size) goes back. These are **point-to-point** send/recv between neighbouring stages, not collectives.
+
+      **Compare with TP.** In one micro-batch's forward pass, a stage of $\ell$ layers with $t$-way TP has each GPU send $\ell\cdot2\cdot2\frac{t-1}{t}\,bsh$ values in all-reduces. PP sends $bsh$ once per boundary, whatever the number of layers per stage.
+
+      **Worked example** (GPT-3-like, $b=1$, $s=2048$, $h=12288$, bf16; 12 layers per stage; $t=8$; H100):
+      - stage forward compute per micro-batch: $12\times(24bsh^2+4bs^2h)/(tC)\approx11.6$ ms;
+      - PP boundary transfer: $2bsh\approx50$ MB. Each GPU uses its own 50 GB/s NIC, so ≈ 1.0 ms if every TP rank sends the full tensor;
+      - with Megatron's **scatter/gather** trick, the 8 TP ranks hold identical copies, so each sends only $1/8$ (≈ 0.13 ms) and the receiving node all-gathers over NVLink (≈ 0.1 ms);
+      - for comparison, the stage's own TP all-reduces (12 layers × 2 all-reduces) take ≈ 4.7 ms even on NVLink.
+
+      So PP communication is about 2–9% of the stage's forward compute (with and without scatter/gather), and it tolerates the slower inter-node network. Hence the standard layout: **TP inside a node, PP across nodes** (Megatron takeaway #1). The Scaling Book calls PP's communication "basically free" per layer.
+
+      **The caveat.** Each transfer sits on the critical path: the next stage waits for it. Unless sends are asynchronous and overlapped, they shift the stages relative to each other and lengthen the bubble. Llama 3 reported that asynchronous point-to-point communication gave a considerable speed-up.
+    source: Narayanan et al. 2021 §3.2, Takeaway #1, §4.1 (scatter/gather); Scaling Book Part 12 "Pipeline Parallelism"; Dubey et al. 2024 (Llama 3) §3.3.2
+
+  - title: "Load balance and the batch-size constraint"
+    body: |
+      **The slowest stage sets the pace.** The bubble formula assumes equal stages. Let stage $i$ take $\tau_i=t^f_i+t^b_i$ per micro-batch. For identical micro-batches the step takes exactly
+
+      $$T=\sum_i\tau_i+(m-1)\max_i\tau_i.$$
+
+      One micro-batch must pass through every stage, and the remaining $m-1$ queue behind the slowest one. With equal stages this reduces to $(m+p-1)(t_f+t_b)$. For $m\gg p$, $T\approx m\max_i\tau_i$: the other stages idle while they wait for the slowest. The partitioner tries to equalise stage costs (GPipe minimises their variance). Two sources of imbalance are built in:
+      - **The LM head and loss** on the last stage. The output matmul costs $2bshV$ FLOPs, versus about $24bsh^2$ for a layer, so it is worth $\approx V/(12h)$ layers. For $h=4096$, $V=128{,}256$ that is 2.6 layers. With 32 layers over $p=4$ stages, the last stage does $\approx10.6$ layer-equivalents against 8. For large $m$ the step is $\approx10.6/8\approx1.33\times$ that of the same pipeline without the head ($\approx1.27\times$ at $m=16$). Spreading the head's work perfectly over the stages would cost only $34.6/32\approx1.08\times$.
+      - **The embedding and the warm-up micro-batches** load the *first* stage's memory.
+
+      Llama 3 removed one transformer layer from both the first and the last stage for this reason. Also, $L$ must split evenly unless the framework supports uneven stages.
+
+      **The batch-size constraint.** The global batch, in sequences, is
+
+      $$B_{\text{seq}}=b\cdot m\cdot d.$$
+
+      A small bubble needs $m\gg p$, which needs a large batch per DP replica. But the global batch is capped by convergence (`sys.tuning-batch-size`). With $n=p\cdot d$ GPUs (no TP) and $b'=B_{\text{seq}}/b$ micro-batches in total, Narayanan's bubble ratio is
+
+      $$\frac{p-1}{m}=\frac{n/d-1}{b'/d}=\frac{n-d}{b'},$$
+
+      so at fixed $n$ and batch, trading DP for PP *raises* the bubble.
+
+      **Example.** Llama 3 405B on 16K GPUs used TP 8, PP 16, DP 128 and a 16M-token batch, i.e. 16 sequences of 8192 tokens per DP group. With one sequence per micro-batch, $m=p=16$, and plain 1F1B would idle $15/31\approx48\%$ of the time. This is why they used an interleaved schedule (`sys.pipeline-schedules`).
+    source: Huang et al. 2019 §2.2–2.3; Narayanan et al. 2021 §3.3.1; Dubey et al. 2024 (Llama 3) §3.3.2 and Table 4
+
+  - title: "PP with data parallelism and ZeRO"
+    body: |
+      PP is combined with DP: $d$ copies of the whole pipeline, each fed different data. Their gradients must be averaged before the optimizer step (`sys.ddp`). Two interactions matter.
+
+      **ZeRO-2/3 fight micro-batching** (`sys.zero`).
+      - *ZeRO-3* shards the weights and all-gathers them just before use. Under PP a stage uses its weights once per micro-batch, so it would re-gather them $m$ times per step, each time amortised over only $b$ sequences. The alternative is to keep them gathered, which forfeits the memory saving.
+      - *ZeRO-2* shards gradients. Done naively, the gradient is reduce-scattered after every micro-batch's backward, which is $m$ times the traffic. The alternative is to keep a full gradient buffer and reduce-scatter once per step, which forfeits the gradient-memory saving.
+      - *ZeRO-1* shards only the optimizer state. Gradients accumulate locally over the $m$ micro-batches, and one reduce-scatter/all-gather happens per step. So PP is usually paired with **ZeRO-1**, as in DeepSeek-V3 (16-way PP with 2-way ZeRO-1 DP). Labels vary: Llama 3's report describes FSDP sharding gradients and optimizer state alongside 16-way PP, while the Scaling Book calls the same setup ZeRO-1.
+
+      **The DP gradient sync is hard to hide.** A stage's gradients are final only after its *last* backward. In the 1F1B figure, the last stage finishes its backwards first, so its all-reduce can overlap the remaining cool-down of earlier stages. Stage 1's last backward is the final op of the step, so its all-reduce has nothing left to overlap with and is exposed. Plain DDP, by contrast, overlaps the all-reduce with the whole backward.
+
+      **The upside.** PP divides each GPU's parameter count by $p$, so the DP all-reduce per GPU shrinks $p$-fold. The Scaling Book notes that Llama 3's 16-way PP cuts its DP all-reduce cost by 16×.
+    source: Scaling Book Part 12 "Pipeline Parallelism" and "Examples"; Dubey et al. 2024 (Llama 3) §3.3.2; Narayanan et al. 2021 §3.3
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Derive the bubble."** Fill takes $(p-1)t_f$, the last stage works $m(t_f+t_b)$, and the drain takes $(p-1)t_b$, so $T=(m+p-1)(t_f+t_b)$. Idle fraction $(p-1)/(m+p-1)$; Megatron's ratio to ideal $(p-1)/m$. Say which one you mean.
+      - **"GPipe vs 1F1B?"** Same bubble, same synchronous result. Peak activations: $m$ micro-batches per stage (GPipe) vs at most $p$ (1F1B stage 1, which is $L$ layers' worth).
+      - **"Why must $m\gg p$, and why can't you just raise $m$?"** The bubble is about $(p-1)/m$. But $m=B_{\text{seq}}/(bd)$ is fixed by the global batch, which convergence caps, and by $b$, which GEMM efficiency floors.
+      - **"Why PP across nodes and TP within?"** PP sends $bsh$ point-to-point once per boundary per micro-batch. TP all-reduces $bsh$ twice per layer per pass on the critical path.
+      - **"Is pipelined training the same as normal training?"** Yes with a flush, given equal-weighted micro-batch losses and no BatchNorm. Without a flush, stale weights are used (PipeDream).
+      - **"What breaks with ZeRO-3?"** It re-gathers weights per micro-batch, so pair PP with ZeRO-1.
+      - **"Which stage is the bottleneck?"** For memory, the first (embedding plus $p$ in-flight micro-batches). For time, often the last (LM head plus loss). Rebalance layers.
+    source: Narayanan et al. 2021 §2.2.1, §3.3; Huang et al. 2019 §2.3; Scaling Book Part 12 "Pipeline Parallelism"; Korthikanti et al. 2022 §4.2.3
+
+  - title: "Key results"
+    body: |
+      - Naive layer splitting: utilisation $1/p$.
+      - GPipe and 1F1B step time:
+
+      $$T=(m+p-1)(t_f+t_b)$$
+
+      - Bubble as a fraction of the step, and Narayanan's ratio to ideal time:
+
+      $$\frac{p-1}{m+p-1}\qquad\frac{p-1}{m}$$
+
+      - $p=8$, $m=32$: 17.9% (ratio 21.9%). $m=4p$ still idles about 18%.
+      - Peak in-flight micro-batches: GPipe $m$ per stage; 1F1B $p-i+1$ on stage $i$, so the first stage holds $L$ layers' worth of activations, independent of $p$ and $m$.
+      - Communication: point-to-point $bsh$ per boundary per micro-batch each way. Megatron's scatter/gather sends $1/t$ of it per TP rank.
+      - Global batch $=b\cdot m\cdot d$ sequences. At fixed GPUs and batch, the bubble ratio is $(n-d)/b'$.
+      - Pairs with ZeRO-1, not ZeRO-3. Stage 1's DP gradient sync is exposed.
+    source: Huang et al. 2019 §2.3; Narayanan et al. 2021 §2.2.1, §3.3.1, §4.1; Korthikanti et al. 2022 §4.2.3
+
+quiz:
+  - id: q1
+    prompt: |
+      A balanced GPipe pipeline has $p=8$ stages and $m=32$ micro-batches per step. What fraction of the step's wall-clock time is each GPU idle?
+    correct: ≈ 17.9%
+    wrong:
+      - ≈ 21.9%
+      - ≈ 12.5%
+      - ≈ 3.1%
+    explanation: |
+      Idle time is $(p-1)(t_f+t_b)$ out of a step of $(m+p-1)(t_f+t_b)$, so $7/39\approx17.9\%$. 21.9% is $(p-1)/m$, Megatron's bubble *relative to ideal time*, a different denominator. 12.5% is $1/p$, the naive utilisation, not idleness.
+    source: Huang et al. 2019 §2.3; Narayanan et al. 2021 §2.2.1
+
+  - id: q2
+    prompt: |
+      Using Megatron's definition (bubble time divided by ideal compute time), what is the bubble for $p=4$, $m=8$?
+    correct: "37.5%"
+    wrong:
+      - "27.3%"
+      - "50.0%"
+      - "75.0%"
+    explanation: |
+      Bubble time is $(p-1)(t_f+t_b)$ and ideal time is $m(t_f+t_b)$, so the ratio is $3/8=37.5\%$. 27.3% ($3/11$) is the same idle time as a fraction of the whole step, the GPipe-style convention. Always check which denominator is meant.
+    source: Narayanan et al. 2021 §2.2.1
+
+  - id: q3
+    prompt: |
+      Which statement about GPipe and 1F1B (same $p$, same $m$, balanced stages) is **false**?
+    correct: 1F1B has a smaller bubble than GPipe because backwards start earlier
+    wrong:
+      - 1F1B's first stage stores activations for at most $p$ micro-batches at once
+      - At a fixed micro-batch size, GPipe's peak activation memory grows with $m$
+      - With a flush, both give the same update as non-pipelined accumulation
+    explanation: |
+      Both schedules take $(m+p-1)(t_f+t_b)$. The fill time $(p-1)t_f$ and the drain time $(p-1)t_b$ are forced by the dependencies, and both schedules keep the last stage busy in between. Starting backwards early frees activations sooner, which is a memory win, not a time win. The other three statements are standard properties.
+    source: Narayanan et al. 2021 §2.2.1; Ultra-Scale Playbook "One-forward-one-backward"
+
+  - id: q4
+    prompt: |
+      ![A pipeline schedule with 4 stages and 6 micro-batches (F = forward, B = backward).](sys.pipeline-parallel/schedule-quiz)
+
+      At its peak, how many micro-batches' activations does **stage 2** hold at once?
+    correct: "3"
+    wrong:
+      - "6"
+      - "4"
+      - "2"
+    explanation: |
+      This is 1F1B. Stage 2 runs 3 forwards (micro-batches 1–3) before its first backward, and from then on alternates one F and one B, so it never holds more than 3. In general stage $i$ holds at most $p-i+1$. 4 is the first stage's peak ($p$). 6 ($m$) would be GPipe.
+    source: Narayanan et al. 2021 §2.2.1; Korthikanti et al. 2022 §4.2.3
+
+  - id: q5
+    prompt: |
+      A 1F1B pipeline has $p=4$ and $m=16$. You double the depth to $p=8$, keeping the data-parallel degree, micro-batch size and global batch fixed. What happens?
+    correct: Bubble rises from ≈16% to ≈30%; stage-1 activations stay about the same
+    wrong:
+      - Bubble is unchanged since $m$ is unchanged; stage-1 activation memory halves
+      - Bubble rises from ≈16% to ≈30% of the step; stage-1 activation memory halves
+      - Bubble halves because each stage is shorter; stage-1 activations stay the same
+    explanation: |
+      $m=B_{\text{seq}}/(bd)$ stays 16, so the idle fraction goes from $3/19\approx15.8\%$ to $7/23\approx30.4\%$. Stage 1 now holds 8 micro-batches of $L/8$ layers instead of 4 of $L/4$, which is still $L$ layers' worth. Weights per GPU do halve, but activations do not, which is the trap in the second distractor.
+    source: Narayanan et al. 2021 §2.2.1; Korthikanti et al. 2022 §4.2.3
+
+  - id: q6
+    prompt: |
+      A model has $L=48$ layers, and one layer stores 0.5 GB of activations per micro-batch. With $p=8$ stages and $m=32$ under 1F1B (no recomputation), how much activation memory does the **first** stage need at its peak?
+    correct: 24 GB
+    wrong:
+      - 3 GB
+      - 96 GB
+      - 21 GB
+    explanation: |
+      Stage 1 holds $p=8$ micro-batches of $L/p=6$ layers: $8\times6\times0.5=24$ GB, i.e. $L\times0.5$. 96 GB is GPipe ($m=32$ micro-batches × 6 × 0.5). 3 GB counts only one micro-batch. 21 GB is stage 2's peak (7 micro-batches).
+    source: Korthikanti et al. 2022 §4.2.3
+
+  - id: q7
+    prompt: |
+      Why can't you simply make the bubble negligible by setting $m=1000$?
+    correct: At fixed $b$ and $d$, $m$ sets the global batch, which convergence caps
+    wrong:
+      - 1F1B's activation memory grows linearly with $m$, so memory runs out first
+      - Beyond about $m=4p$ the bubble starts growing again as stages fall out of sync
+      - Each micro-batch adds a fixed send/recv volume per step that saturates the links
+    explanation: |
+      $B_{\text{seq}}=b\cdot m\cdot d$, so a large $m$ means a huge batch, and beyond the critical batch extra examples stop reducing the number of steps. Shrinking $b$ instead keeps the batch fixed but makes GEMMs skinny and inefficient. 1F1B's memory is capped at $p$ micro-batches, independent of $m$. That decoupling is its whole point.
+    source: Narayanan et al. 2021 §3.3.1, §3.4; Ultra-Scale Playbook "One-forward-one-backward"
+
+  - id: q8
+    prompt: |
+      A stage has 12 layers with 8-way TP. In one micro-batch's **forward** pass, how does the PP boundary send compare with each GPU's TP all-reduce traffic (in units of $bsh$ values)?
+    correct: PP sends $bsh$ once; TP sends about $42\,bsh$ per GPU
+    wrong:
+      - PP sends $12\,bsh$; TP sends about $42\,bsh$ per GPU
+      - About equal, $bsh$ each, one activation apiece
+      - PP sends $bsh$ once; TP sends about $2\,bsh$ per GPU
+    explanation: |
+      TP has 2 all-reduces per layer, each costing $2\cdot\frac78\,bsh$ per rank, so $12\times2\times1.75=42\,bsh$. PP sends only the stage's output activation, once, however many layers the stage has. That is why PP crosses nodes and TP stays on NVLink. Only layers at the stage boundary send anything over PP, so "one per layer" is wrong.
+    source: Narayanan et al. 2021 §3.2
+
+  - id: q9
+    prompt: |
+      A CNN with BatchNorm is trained with GPipe and a flush. Why might its training differ from non-pipelined training on the same mini-batch?
+    correct: BatchNorm statistics come from each micro-batch, not the whole mini-batch
+    wrong:
+      - Micro-batches use different weight versions in forward and backward passes
+      - Gradients from earlier micro-batches are overwritten instead of accumulated
+      - The bubble changes the effective learning rate by a factor of $(p-1)/m$
+    explanation: |
+      With a flush, every micro-batch sees the same weights and gradients are summed, so for per-example losses the update is exact. BatchNorm couples examples within the normalisation set, and that set is now a micro-batch. GPipe computes training statistics per micro-batch and tracks the moving averages over the mini-batch for evaluation. Weight-version mismatch is the *asynchronous* (no-flush) problem.
+    source: Huang et al. 2019 §2.2
+
+  - id: q10
+    prompt: |
+      Why is pipeline parallelism usually combined with ZeRO-1 rather than ZeRO-3?
+    correct: ZeRO-3 would all-gather each stage's weights once per micro-batch
+    wrong:
+      - ZeRO-3 cannot shard parameters that live on a pipeline stage other than the first
+      - ZeRO-1 removes the DP gradient all-reduce, which PP cannot overlap anyway
+      - ZeRO-3 changes the optimizer's semantics, so the flush is no longer exact
+    explanation: |
+      Under PP each stage runs forward and backward once per micro-batch. ZeRO-3 re-gathers the sharded weights each time, with only $b$ sequences to amortise each gather, or else keeps them gathered and loses the saving. ZeRO-1 only shards optimizer state, so gradients accumulate locally and are synchronised once per step. ZeRO-1 does not remove the gradient synchronisation; it becomes a reduce-scatter plus an all-gather of the updated weights.
+    source: Scaling Book Part 12 "Pipeline Parallelism"
+
+  - id: q11
+    prompt: |
+      A 32-layer model ($h=4096$, $V=128{,}256$) is split into 4 stages of 8 layers, with the LM head on the last stage. Treating the head as $\approx V/(12h)$ layer-equivalents, roughly how much slower is each step than the same pipeline without the LM head (large $m$)?
+    correct: About 33% slower, since every stage moves at the last stage's pace
+    wrong:
+      - About 8% slower, the cost if the head's work were spread perfectly
+      - No slower, since the extra head work is absorbed by the bubble
+      - About 23% slower, the overload measured against the mean stage time
+    explanation: |
+      $V/(12h)=128256/49152\approx2.6$, so the last stage does $\approx10.6$ units against 8 elsewhere. In steady state every stage waits on the slowest, so for large $m$ the step stretches by $10.6/8\approx1.33$ (at $m=16$ it is ≈27%, from $T=\sum_i\tau_i+(m-1)\max_i\tau_i$). 8% ($34.6/32$) is what the head would cost if its work could be spread evenly over the stages, which a fixed partition cannot do. 23% ($10.6/8.65$) compares against the *mean* stage time, i.e. a rebalanced pipeline with the head included, which is a different baseline. Llama 3 moved one layer off the last (and first) stage for this reason.
+    source: Huang et al. 2019 §2.3; Dubey et al. 2024 (Llama 3) §3.3.2
+
+  - id: q12
+    prompt: |
+      PP is combined with data parallelism and 1F1B. Which stage's DP gradient all-reduce is hardest to overlap with computation?
+    correct: Stage 1's, since its last backward is the step's final computation
+    wrong:
+      - The last stage's, because it also computes the loss and the LM head
+      - All are equal, since DP synchronisation can only start after the flush
+      - None of them, since each overlaps with the next step's warm-up forwards
+    explanation: |
+      A stage's gradients are complete only after its final backward. The last stage finishes first and can all-reduce during the earlier stages' cool-down. Stage 1 finishes last, so its sync is fully exposed. It cannot overlap the next step's forwards, because those need the updated weights, which in turn need the synchronised gradients.
+    source: Scaling Book Part 12 "Pipeline Parallelism"
+
+cards:
+  - id: f1
+    front: Pipeline bubble for GPipe/1F1B with $p$ stages and $m$ micro-batches. Give both conventions.
+    back: |
+      Step time $(m+p-1)(t_f+t_b)$; idle per stage $(p-1)(t_f+t_b)$.
+      - As a fraction of the step: $(p-1)/(m+p-1)$.
+      - Relative to ideal time (Megatron): $(p-1)/m$.
+
+      Independent of $t_b/t_f$; assumes balanced stages.
+    source: Huang et al. 2019 §2.3; Narayanan et al. 2021 §2.2.1
+
+  - id: f2
+    front: Peak in-flight micro-batches (activations held) per stage under GPipe vs 1F1B.
+    back: |
+      - **GPipe**: all $m$ on every stage.
+      - **1F1B**: $p-i+1$ on stage $i$. Stage 1 holds $p$, i.e. $L$ layers' worth of activations, independent of $p$ and $m$. The last stage holds 1.
+      - The bubble is the same for both.
+    source: Narayanan et al. 2021 §2.2.1; Korthikanti et al. 2022 §4.2.3
+
+  - id: f3
+    front: Describe the three phases of a 1F1B schedule on stage $i$ of $p$.
+    back: |
+      1. **Warm-up**: $p-i$ forwards.
+      2. **Steady state**: alternate one forward, one backward.
+      3. **Cool-down**: the remaining backwards.
+
+      Each micro-batch's activations are freed after its backward. A flush and one optimizer step end the batch.
+    source: Narayanan et al. 2021 §2.2.1; Narayanan et al. 2019 (PipeDream) §3.3
+
+  - id: f4
+    front: What does PP communicate per micro-batch, and how does Megatron's scatter/gather optimisation reduce it?
+    back: |
+      - Point-to-point send/recv of the boundary activation ($b\cdot s\cdot h$ values) forward and its gradient backward, between neighbouring stages.
+      - With $t$-way TP, all $t$ ranks hold identical copies. So each sends $1/t$ over its own NIC, and the receiving node all-gathers over NVLink.
+    source: Narayanan et al. 2021 §3.2, §4.1
+
+  - id: f5
+    front: How do global batch, micro-batches and DP degree relate under PP, and what is the bubble at fixed GPUs and batch?
+    back: |
+      $B_{\text{seq}}=b\cdot m\cdot d$. With $n=p\,d$ GPUs (no TP) and $b'=B_{\text{seq}}/b$:
+
+      $$\frac{p-1}{m}=\frac{n-d}{b'}.$$
+
+      At fixed $n$ and $B$, more PP (less DP) means a bigger bubble; a bigger batch means a smaller one.
+    source: Narayanan et al. 2021 §3.3.1
+
+  - id: f6
+    front: Why does PP pair with ZeRO-1, and why is the DP gradient sync hard to overlap under PP?
+    back: |
+      - ZeRO-3 would re-all-gather weights for each of the $m$ micro-batches. Naive ZeRO-2 would reduce-scatter gradients $m$ times, or else keep a full gradient buffer and lose its saving. ZeRO-1 lets gradients accumulate locally and syncs once per step.
+      - Gradients are final only after a stage's last backward. Stage 1 finishes last, so its sync is exposed.
+    source: Scaling Book Part 12 "Pipeline Parallelism"
+
+  - id: f7
+    type: open
+    front: Derive the pipeline bubble for GPipe and show that 1F1B cannot beat it.
+    back: |
+      1. Setup: $p$ balanced stages, $m$ micro-batches, per-stage times $t_f$, $t_b$.
+      2. GPipe forward: micro-batch $k$ starts on stage $i$ at $(k+i-2)t_f$, so the last stage finishes forwards at $(m+p-1)t_f$. Backward is the mirror: $(m+p-1)t_b$. Total $(m+p-1)(t_f+t_b)$.
+      3. Useful work per stage is $m(t_f+t_b)$, so idle is $(p-1)(t_f+t_b)$. Fraction $(p-1)/(m+p-1)$, or $(p-1)/m$ relative to ideal.
+      4. Lower bound for any flush schedule: the last stage starts no earlier than $(p-1)t_f$, works $m(t_f+t_b)$, and its final gradient needs $(p-1)t_b$ to reach stage 1. So $T\ge(m+p-1)(t_f+t_b)$.
+      5. 1F1B keeps the last stage busy once filled, so it meets the bound with the same bubble. Its advantage is memory ($\le p$ in flight vs $m$).
+      6. To go lower you must change the dependency structure: interleaved chunks or splitting B and W (zero-bubble).
+    source: Narayanan et al. 2021 §2.2.1; Huang et al. 2019 §2.3
+
+  - id: f8
+    type: open
+    front: Explain to an interviewer why 1F1B replaced GPipe in Megatron-style training, with a memory example.
+    back: |
+      - **Problem.** Activations must live from a micro-batch's forward to its backward. GPipe runs all forwards first, so each stage peaks at $m$ micro-batches: $m\cdot(L/p)\cdot A$. Shrinking the bubble needs $m\gg p$, so memory explodes.
+      - **1F1B.** Warm up with $p-i$ forwards, then alternate F/B. Stage $i$ holds $\le p-i+1$, so stage 1 holds $p\cdot(L/p)\cdot A=L\cdot A$, independent of $m$.
+      - **Example.** $L=96$, $A=0.58$ GB (GPT-3-like layer, 8-way TP), $p=8$, $m=32$: GPipe 222 GB per stage vs 1F1B 55.6 GB on stage 1.
+      - **The catch.** The bubble is unchanged; 1F1B just allows a large $m$. Memory is imbalanced (stage 1 is worst), and the scheduling logic is more complex than a single training loop.
+    source: Narayanan et al. 2021 §2.2.1; Korthikanti et al. 2022 §4.2.3
+
+  - id: f9
+    type: open
+    front: You must train a model too large for one 8-GPU node. When would you add pipeline parallelism, and what would you watch out for?
+    back: |
+      - **When.** Weights plus optimizer state exceed what TP within the node (and FSDP) can handle, or FSDP across many nodes is latency- or batch-limited. PP crosses nodes cheaply: $bsh$ point-to-point per boundary, a few percent of compute.
+      - **Layout.** TP inside nodes, PP across nodes, DP/ZeRO-1 outside that.
+      - **Watch:**
+        - the bubble $(p-1)/(m+p-1)$ needs $m\gg p$, but $m=B/(bd)$ is capped by the batch, so consider interleaving;
+        - stage balance (move layers off the LM-head stage and the embedding stage);
+        - first-stage activation memory ($L$ layers' worth), so consider recomputation;
+        - avoid ZeRO-2/3, since they repeat traffic per micro-batch;
+        - stage 1's exposed DP sync;
+        - async p2p to keep transfers off the critical path;
+        - the flush, and BatchNorm or loss-normalisation subtleties.
+    source: Narayanan et al. 2021 Takeaways #1–3; Scaling Book Part 12 "Pipeline Parallelism"; Dubey et al. 2024 (Llama 3) §3.3.2
+
+  - id: f10
+    type: open
+    front: Why do synchronous pipelines flush at the end of each batch, and what goes wrong without it?
+    back: |
+      - **With a flush:** all $m$ micro-batches run forward and backward on the same weights, and gradients are summed. Since $\nabla\frac1m\sum_j\ell_j=\frac1m\sum_j\nabla\ell_j$, one optimizer step equals full-batch training (exact up to fp summation order, given equal-weighted micro-batches and no BatchNorm). Global steps such as clipping and NaN checks happen at the barrier.
+      - **Without a flush:** stages update as soon as they can. A micro-batch's forward and backward then use different weight versions, and different stages are stale by different amounts, so the update is not a true gradient.
+      - **PipeDream's fixes:** weight stashing (keep the forward's version for the backward), with updates still delayed by up to $p-1$ steps. Hence most LLM training keeps the flush and attacks the bubble with better schedules.
+    source: Narayanan et al. 2019 (PipeDream) §3.4; Narayanan et al. 2021 §2.2; Huang et al. 2019 §2.2
+
+reading:
+  - title: "Huang et al. 2019, GPipe, §2.2–2.3"
+    url: https://arxiv.org/abs/1811.06965
+    kind: paper
+    note: Micro-batching, re-materialisation, the bubble O((K−1)/(M+K−1)), and the BatchNorm caveat.
+  - title: "Narayanan et al. 2021, Efficient Large-Scale LM Training (Megatron-LM), §2.2, §3, §4.1"
+    url: https://arxiv.org/abs/2104.04473
+    kind: paper
+    note: The (p−1)/m bubble, PipeDream-Flush (1F1B) memory, how PP interacts with TP and DP, and the scatter/gather optimisation.
+  - title: "Korthikanti et al. 2022, Reducing Activation Recomputation, §4.2.3"
+    url: https://arxiv.org/abs/2205.05198
+    kind: paper
+    note: Why 1F1B's first stage stores L layers' worth of activations.
+  - title: "The Ultra-Scale Playbook (Hugging Face), Pipeline Parallelism"
+    url: https://huggingface.co/spaces/nanotron/ultrascale-playbook
+    kind: book
+    note: Animated AFAB and 1F1B schedules with measured scaling on a GPU cluster.
+  - title: "How To Scale Your Model, Part 12: How to Think About GPUs (Pipeline Parallelism)"
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    kind: book
+    note: Why PP communication is nearly free, and why PP plays badly with ZeRO-3 and DP overlap. Includes the DeepSeek-V3 and Llama 3 configurations.

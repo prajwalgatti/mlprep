@@ -1,0 +1,571 @@
+id: fund.backprop
+area: fundamentals
+title: Backpropagation & Automatic Differentiation
+summary: How reverse-mode autodiff gets the exact gradient of a scalar loss for about the cost of a forward pass, with vector–Jacobian products, the forward/reverse trade-off, checkpointing and gradient checks.
+order: 460
+level: core
+tags: [backprop, autodiff, deep-learning, implementation]
+prereqs: []
+
+explainer:
+  - title: "The problem: a gradient with a billion entries"
+    body: |
+      Training needs $\nabla_\theta L$, the gradient of a scalar loss $L$ with respect to every parameter $\theta\in\mathbb{R}^n$, where $n$ may be $10^9$. There are three ways to get derivatives out of a computer.
+
+      **Finite differences.** Perturb one parameter at a time:
+
+      $$\frac{\partial L}{\partial \theta_i}\approx\frac{L(\theta+he_i)-L(\theta)}{h}$$
+
+      where $e_i$ is the $i$-th unit vector. That costs one extra forward pass *per parameter*, so $n+1$ passes, and the result is approximate (card 8 shows why). It is useless for training but good for checking.
+
+      **Symbolic differentiation** manipulates formulas, as a computer-algebra system does. Applied naively it suffers *expression swell*: the product rule copies subexpressions, so the derivative of a deep composition can be exponentially longer than the function. It also struggles with loops and branches.
+
+      **Automatic differentiation (AD)** applies the chain rule to the *numbers* flowing through the program, one elementary operation at a time, and never builds a formula. It is exact up to floating-point rounding. Its reverse mode returns the whole gradient for a small constant multiple of one forward pass.
+
+      AD works on a **computational graph**: a directed acyclic graph whose nodes are variables (scalars or tensors). Each non-input node is produced by an operation applied to its parent nodes. The forward pass evaluates nodes in topological order (parents before children) and **caches** whatever each operation's derivative will need, for example the inputs of a multiply or the output of a tanh.
+
+      **Terminology.** "Backprop" means reverse-mode AD applied to a scalar loss. It only computes the gradient; an optimizer such as SGD then uses it. People sometimes say "backprop" for the whole training procedure. Goodfellow et al. flag this as a common confusion.
+    source: Goodfellow DL §6.5, §6.5.1; Baydin et al. 2018 §2.1–2.2
+
+  - title: "The chain rule on a graph: adjoints add up"
+    body: |
+      **Scalar chain rule.** If $y=g(x)$ and $z=f(y)$, then $dz/dx=(dz/dy)(dy/dx)$.
+
+      **Vector version.** Let $x\in\mathbb{R}^m$, $y=g(x)\in\mathbb{R}^k$ and $z$ a scalar. Then $x_i$ affects $z$ through every $y_j$:
+
+      $$\frac{\partial z}{\partial x_i}=\sum_j\frac{\partial z}{\partial y_j}\frac{\partial y_j}{\partial x_i}$$
+
+      In matrix form this is $\nabla_x z=J^\top\nabla_y z$, where $J=\partial y/\partial x$ is the $k\times m$ Jacobian.
+
+      **Adjoints.** Write $\bar v=\partial L/\partial v$ for the *adjoint* of node $v$. It has the same shape as $v$. In a general graph, $v$ may feed several children (fan-out); call that set $\mathrm{ch}(v)$. $L$ depends on $v$ only through those children, so
+
+      $$\bar v=\sum_{c\in\mathrm{ch}(v)}\bar c\,\frac{\partial c}{\partial v}$$
+
+      Why a sum? Nudge $v$ by $\delta$. Each child moves by about $(\partial c/\partial v)\,\delta$, and to first order the effects of those moves on $L$ add. So:
+      - A **shared weight** (tied embeddings, an RNN weight reused at every time step) collects one contribution per use.
+      - A **residual connection** $y=x+F(x)$ gives $\bar x=\bar y+(\text{contribution through }F)$. The identity path hands the gradient back unchanged.
+
+      **The algorithm.** Run the forward pass. Set $\bar L=1$. Visit nodes in *reverse* topological order. When a node is reached, all its children are done, so its adjoint is complete; push its contribution $\bar c\,\partial c/\partial v$ to each parent.
+
+      Each edge is handled once, so the cost is proportional to the number of edges, the same order as the forward pass. Expanding the chain rule as a sum over all input-to-output *paths* could take exponentially many terms. Reverse mode avoids this because each $\bar c$ is computed once and reused by all of $c$'s parents.
+    source: Goodfellow DL §6.5.2–6.5.3 (Alg. 6.2); Murphy PML1 §13.3.4
+
+  - title: "Worked example by hand"
+    body: |
+      ![Forward values above each node, adjoints below. $w$ fans out to the product and to the penalty, so its two adjoint contributions add.](fund.backprop/graph-forward-backward)
+
+      Take one tanh unit with a squared error and a weight-decay penalty:
+
+      $$L=(\tanh(wx+b)-y)^2+\lambda w^2$$
+
+      with $w=0.25$, $x=2$, $b=0$, $y=1$ and $\lambda=0.1$. Name the intermediates $a=wx+b$, $h=\tanh a$ and $r=h-y$.
+
+      **Forward pass** (cache $h$, because tanh's derivative uses it):
+
+      $$\begin{aligned} a &= 0.25\cdot 2+0=0.5\\ h &= \tanh 0.5=0.4621\\ r &= 0.4621-1=-0.5379\\ L &= 0.2893+0.00625=0.2956 \end{aligned}$$
+
+      **Backward pass.** Start from $\bar L=1$. The loss is a sum, so both $r^2$ and $\lambda w^2$ receive adjoint 1.
+
+      $$\begin{aligned} \bar r &= 2r=-1.0758\\ \bar h &= \bar r\cdot 1=-1.0758\\ \bar a &= \bar h\,(1-h^2)=-0.8460\\ \bar b &= \bar a\cdot 1=-0.8460 \end{aligned}$$
+
+      The tanh step uses $\tanh'(a)=1-\tanh^2(a)=0.7864$, computed from the cached $h$ with no new tanh call.
+
+      **The fan-out.** $w$ reaches $L$ along two paths, through $a$ (local derivative $\partial a/\partial w=x$) and through the penalty (local derivative $2\lambda w$). The two contributions add:
+
+      $$\begin{aligned} \bar w &= \bar a\,x+2\lambda w\\ &= -1.6921+0.0500=-1.6421 \end{aligned}$$
+
+      The same sweep also gives $\bar x=\bar a\,w=-0.2115$. We don't need it here, but it is free. PyTorch's autograd returns the same $\bar w$ and $\bar b$ to machine precision.
+    source: Goodfellow DL §6.5.3, Fig. 6.8(d); d2l §5.3
+
+  - title: "Vector–Jacobian products, not Jacobians"
+    body: |
+      For an operation $Y=f(X)$, the backward pass needs only the **vector–Jacobian product** (VJP)
+
+      $$\bar X_i=\sum_j \bar Y_j\,\frac{\partial Y_j}{\partial X_i}$$
+
+      It never needs the Jacobian itself. A linear layer with 4096 inputs and outputs on a batch of 1024 has $(1024\cdot4096)^2\approx 1.8\times10^{13}$ Jacobian entries, so frameworks give each operation a hand-written VJP rule.
+
+      **Elementwise ops** $Y=\phi(X)$ have a diagonal Jacobian, so the VJP is $\bar X=\bar Y\odot\phi'(X)$. That is $O(n)$ work rather than $O(n^2)$.
+
+      **Matrix multiply.** Take $Y=XW$ with $X\in\mathbb{R}^{B\times n}$ (a batch of rows), $W\in\mathbb{R}^{n\times m}$ and $Y\in\mathbb{R}^{B\times m}$. Entry by entry, $Y_{ij}=\sum_k X_{ik}W_{kj}$. Since $W_{kj}$ appears only in column $j$ of $Y$, multiplied by $X_{ik}$:
+
+      $$\begin{aligned} \bar W_{kj} &= \textstyle\sum_i \bar Y_{ij}X_{ik}=(X^\top\bar Y)_{kj}\\ \bar X_{ik} &= \textstyle\sum_j \bar Y_{ij}W_{kj}=(\bar YW^\top)_{ik} \end{aligned}$$
+
+      **Shape check.** $X^\top\bar Y$ is $(n\times B)(B\times m)=n\times m$, the shape of $W$. A gradient always has the shape of its variable, and there is usually only one way to combine the available matrices into that shape. Each VJP is a matmul the size of the forward one, so a linear layer's backward costs about twice its forward.
+
+      **Bias.** In $Y=XW+b$, the vector $b\in\mathbb{R}^m$ is *broadcast* to all $B$ rows, so its adjoint *sums* over the batch: $\bar b=\sum_i\bar Y_{i,:}$.
+
+      **Layout conventions differ.** CS229 and Bishop use column vectors, $z=Wa$ with $W$ shaped (out, in), which gives $\bar W=\bar z\,a^\top$. Textbooks also disagree on whether a Jacobian is laid out $\partial y_i/\partial x_j$ or transposed. Check shapes rather than memorising one layout.
+    source: Murphy PML1 §13.3.3; CS229 notes §7.4.3; Goodfellow DL §6.5.2
+
+  - title: "A catalogue of VJPs"
+    body: |
+      **Sum and broadcast are adjoints of each other.**
+      - If $y=\sum_i x_i$, then $\bar x_i=\bar y$: the gradient is copied (broadcast) to every input.
+      - If a scalar $x$ is broadcast into copies $y_i=x$, then $\bar x=\sum_i\bar y_i$. Fan-out is exactly this.
+
+      **Reshape, transpose and slicing** only move numbers, so the VJP moves them back: reshape $\bar Y$ to $X$'s shape, transpose it back, or scatter a slice's gradient into a zero tensor.
+
+      **Max** routes the whole gradient to the winner. If $y=\max_i x_i$, then $\bar x_i=\bar y$ at the argmax and 0 elsewhere. Max-pooling and $\mathrm{ReLU}(x)=\max(0,x)$ work this way. At ties, PyTorch's full-tensor `max()` splits the gradient evenly, while `max(dim=…)` sends it all to the returned index. At $x=0$, frameworks use 0 as ReLU's derivative.
+
+      **Softmax with cross-entropy, fused.** Take logits $z\in\mathbb{R}^K$, a one-hot label $y$, $p=\mathrm{softmax}(z)$ and $L=-\sum_k y_k\log p_k$. Because $\log p_k=z_k-\log\sum_j e^{z_j}$ and $\sum_k y_k=1$:
+
+      $$\begin{aligned} L &= -\textstyle\sum_k y_kz_k+\log\sum_j e^{z_j}\\ \frac{\partial L}{\partial z_i} &= -y_i+\frac{e^{z_i}}{\sum_j e^{z_j}}=p_i-y_i \end{aligned}$$
+
+      "Prediction minus target." Backpropagating through softmax and log separately would form the $K\times K$ softmax Jacobian $\mathrm{diag}(p)-pp^\top$ and could take $\log$ of an underflowed 0. Plain backprop doesn't find the algebraic simplification on its own, so libraries hand-code the fused op.
+
+      The fused op computes the log-sum-exp stably by subtracting $m=\max_j z_j$:
+
+      $$\log\sum_j e^{z_j}=m+\log\sum_j e^{z_j-m}$$
+
+      All exponents are now $\le0$, so nothing overflows, and the largest term is $e^0=1$, so the sum can't underflow to 0.
+    source: Goodfellow DL §6.5.9; CS229 notes §7.4.3; Blanchard et al. 2021 §1, §4
+
+  - title: "Forward mode, and why reverse mode wins for losses"
+    body: |
+      ![$f:\mathbb{R}^6\to\mathbb{R}$ through two 4-wide layers. Reverse mode multiplies from the scalar end, so every intermediate is a row vector. Forward mode needs one sweep per input.](fund.backprop/forward-vs-reverse)
+
+      **Forward mode** carries a *tangent* $\dot v=\partial v/\partial x_i$ alongside each value and pushes it forward with **Jacobian–vector products** (JVPs): if $y=f(x)$ then $\dot y=J\dot x$.
+
+      One way to implement it is **dual numbers** $x+\dot x\varepsilon$ with $\varepsilon^2=0$. Taylor-expanding gives $f(x+\dot x\varepsilon)=f(x)+f'(x)\dot x\varepsilon$. For example $(2+\varepsilon)^2=4+4\varepsilon$, and the $\varepsilon$-coefficient is the derivative.
+
+      **The cost comparison.** For $f:\mathbb{R}^n\to\mathbb{R}^m$ with Jacobian $J=J_3J_2J_1$:
+      - One forward sweep, seeded with $\dot x=e_i$, gives one *column* of $J$: all outputs' sensitivity to input $i$.
+      - One reverse sweep, seeded with $\bar y=e_j$, gives one *row*: output $j$'s gradient with respect to all inputs.
+
+      So the full Jacobian costs $n$ forward sweeps or $m$ reverse sweeps. Each sweep costs $c\cdot\mathrm{ops}(f)$, where Griewank and Walther guarantee $c<6$ and typically $c\approx2$–$3$.
+
+      For a loss, $m=1$: reverse mode needs **one** sweep and forward mode needs $n=10^9$. Forward mode wins when $n\ll m$ (a few inputs, many outputs). It also needs no stored tape.
+
+      **Hessian–vector products.** The full Hessian $H$ is $n\times n$, far too big to store. But
+
+      $$Hv=\nabla_\theta\big[(\nabla_\theta L)^\top v\big]$$
+
+      is the gradient of a scalar, so one more AD pass through the gradient computation gives it. That pass can be reverse-over-reverse ("double backprop", `create_graph=True` in PyTorch) or forward-over-reverse. The cost is a small multiple of one gradient and $O(n)$ memory. HVPs power Newton-CG and estimates of the top Hessian eigenvalue (sharpness) by power iteration.
+    source: Baydin et al. 2018 §3.1, §3.1.1, §3.2, §4.1; Murphy PML1 §13.3.1; Goodfellow DL §6.5.9–6.5.10
+
+  - title: "The memory bill and gradient checkpointing"
+    body: |
+      ![Activations held over one training step of a 16-layer chain (illustrative unit costs: forward 1, backward 2 per layer). Four checkpoints halve the peak for one extra forward pass.](fund.backprop/checkpointing)
+
+      Reverse mode must keep everything the backward pass will read. That means the cached inputs and outputs of every operation, from the start of the forward pass until backward reaches them. For $L$ layers, batch $B$ and width $d$, activation memory grows like $L\cdot B\cdot d$, times sequence length for sequence models. In deep nets this usually dwarfs the parameters (Chen et al. §1). Forward mode stores nothing but would need $n$ sweeps.
+
+      **Gradient checkpointing** (Chen et al. 2016) trades compute for memory:
+      1. Split the $L$ layers into $k$ segments.
+      2. In the forward pass, keep only the $k$ activations at segment boundaries and discard the rest.
+      3. In the backward pass, take one segment at a time from the end. Re-run its forward pass from the stored boundary, backprop through it, then free it.
+
+      Peak memory is the checkpoints plus one segment's activations:
+
+      $$\text{mem}\approx k+\frac{L}{k}$$
+
+      Setting the derivative $1-L/k^2$ to zero gives $k=\sqrt L$, so the peak is $2\sqrt L$ instead of $L$. The price is that every segment's forward runs twice, so the step costs **one extra forward pass**. If backward costs about $2\times$ forward, a step goes from 3 units to 4, about 33% more compute.
+
+      **Cheaper variants.**
+      - Recompute only cheap ops: keep a convolution's output but drop the BatchNorm and ReLU outputs after it, which cost almost nothing to recompute.
+      - Recurse: checkpoint inside segments as well. This reaches $O(\log L)$ memory for $O(L\log L)$ forward computation.
+    source: Chen et al. 2016 §1, §4.2–4.3; Baydin et al. 2018 §3.2
+
+  - title: "Gradient checking"
+    body: |
+      When you hand-write a backward pass, compare it with finite differences. Taylor-expand around $x$:
+
+      $$f(x\pm h)=f\pm hf'+\tfrac{h^2}{2}f''\pm\tfrac{h^3}{6}f'''+\dots$$
+
+      **Forward difference:** $\frac{f(x+h)-f(x)}{h}=f'+\frac h2f''+\dots$, so the truncation error is $O(h)$.
+
+      **Centred difference:** subtracting the two expansions cancels the even terms:
+
+      $$\frac{f(x+h)-f(x-h)}{2h}=f'+\frac{h^2}{6}f'''+\dots$$
+
+      so the truncation error is $O(h^2)$, for the same two evaluations.
+
+      **Round-off pushes the other way.** Each evaluation of $f$ carries a relative error of about $\epsilon$, the machine epsilon: $2.2\times10^{-16}$ in float64 and $1.2\times10^{-7}$ in float32. The difference of two nearly equal numbers keeps that absolute error of about $\epsilon|f|$, and dividing by $h$ inflates it to about $\epsilon|f|/h$. Balancing the two errors gives an optimal step of $h^\star\sim\sqrt\epsilon\approx1.5\times10^{-8}$ (forward) and $h^\star\sim\epsilon^{1/3}\approx6\times10^{-6}$ (centred) in float64. In float32 the centred optimum is about $5\times10^{-3}$, and the best error is only about $\epsilon^{2/3}\approx2\times10^{-5}$, too coarse to expose subtle bugs.
+
+      ![Real errors for the worked example's $dL/dw$ in float64. Truncation dominates on the right, round-off on the left.](fund.backprop/fd-error)
+
+      ```python
+      def grad_check(f, x, g_analytic, h=1e-5):
+          """Max relative error vs centred differences. Perturbs x in place."""
+          g_num = np.zeros_like(x)
+          for i in range(x.size):
+              old = x.flat[i]
+              x.flat[i] = old + h; f_plus = f(x)
+              x.flat[i] = old - h; f_minus = f(x)
+              x.flat[i] = old
+              g_num.flat[i] = (f_plus - f_minus) / (2 * h)
+          denom = np.maximum(np.abs(g_analytic) + np.abs(g_num), 1e-12)
+          return np.max(np.abs(g_analytic - g_num) / denom)
+      ```
+
+      **Practice.**
+      - Use float64, $h\approx10^{-5}$ and a small net. A correct gradient then gives a relative error around $10^{-9}$ (that is what the next lesson's MLP gets). A bug gives something like $10^{-2}$ or worse.
+      - Stay away from kinks. If a ReLU input lies within $h$ of 0, $x\pm h$ straddles the kink and the check fails even for correct code.
+      - Each entry costs two forward passes, so for big tensors check a random subset, or check the scalar $u^\top g(x)$ for a random vector $u$.
+    source: Baydin et al. 2018 §2.1; Goodfellow DL §11.5
+
+  - title: "Autograd in practice"
+    body: |
+      **Define-by-run vs traced.**
+      - PyTorch records a *tape* while your Python code runs. Each result remembers the operation that made it (`grad_fn`), and `loss.backward()` replays the tape in reverse. The tape is rebuilt on every call, so ordinary `if` and `for` statements just work: AD only sees the branch that actually ran.
+      - JAX's `jax.grad` transforms a pure function into its gradient function, and `jit` traces it once into a compiled graph. Static-graph frameworks such as Theano and TF1 built the graph up front.
+
+      **`.grad` accumulates.** PyTorch *adds* into `p.grad` on every `backward()`. Fan-out relies on this, and so does gradient accumulation. It is also why training loops call `zero_grad()`.
+
+      **Cutting the graph.**
+      - `torch.no_grad()` stops recording altogether. Use it for evaluation and for manual parameter updates.
+      - `y.detach()` returns the same values with no history, so no gradient flows back into whatever produced `y`. This is a "stop-gradient": it is used for target networks and EMA teachers.
+
+      For example, with $a=3w$, `L = a * a.detach()` has $dL/dw=3a$, half of the $6a$ you get without the detach.
+
+      **In-place ops.** Overwriting a tensor that backward needs (`y = x.sigmoid(); y.add_(1)`) makes autograd's version counter raise "modified by an inplace operation".
+
+      **Non-smooth and unstable ops.**
+      - Kinks get a subgradient convention, for example ReLU$'(0)=0$.
+      - Prefer fused, log-space ops (`log_softmax`, `cross_entropy` on raw logits, `logsumexp`) to composing `exp` and `log` yourself.
+
+      **Input gradients are free.** The same reverse sweep yields $\partial L/\partial x$. That gives saliency maps and adversarial examples, and it lets you check which outputs depend on which inputs.
+    source: Baydin et al. 2018 §3, §4.2, §5.3; Goodfellow DL §6.5.8
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Why not finite differences?"** They need $n$ extra passes and they are approximate. Use them only to verify.
+      - **"What does backprop cost compared with the forward pass?"** The same order: one visit per edge, about $2$–$3\times$ the forward. A linear layer's backward is two matmuls ($\bar X$ and $\bar W$) against one forward.
+      - **"Why reverse mode?"** There is one scalar output and many inputs. Reverse mode costs one sweep per output; forward mode costs one per input.
+      - **"A variable is used twice. What happens?"** The adjoints add. Shared weights accumulate gradient from every use.
+      - **"Does backprop build Jacobians?"** No. Each operation applies a VJP; its Jacobian is never formed.
+      - **"Where does the memory go?"** Into cached activations. Checkpointing every $\sqrt L$ layers cuts the peak to about $2\sqrt L$ for one extra forward pass.
+      - **"Derive the softmax–cross-entropy gradient."** Write $L=-y^\top z+\mathrm{LSE}(z)$, so $\nabla_z L=p-y$.
+      - **"How do you test a custom backward?"** Centred differences in float64 with $h\approx10^{-5}$, a relative-error metric, and no inputs near kinks.
+      - **"What do `detach` and `no_grad` do?"** `detach` blocks gradient flow through one tensor; `no_grad` stops recording the graph entirely.
+      - **"Can you get second-order information?"** Yes: Hessian–vector products cost a couple of gradients, via double backprop or forward-over-reverse. The Hessian itself is never formed.
+    source: Goodfellow DL §6.5.6, §6.5.9–6.5.10; Baydin et al. 2018 §3.2, §4.1; Chen et al. 2016 §4.3
+
+  - title: "Key results"
+    body: |
+      - **Fan-out:** $\bar v=\sum_{c}\bar c\,\partial c/\partial v$, summed over the children $c$ of $v$.
+      - **Matmul** $Y=XW$, with $X$ of shape $B\times n$:
+
+      $$\bar W=X^\top\bar Y,\qquad \bar X=\bar YW^\top$$
+
+      - **Broadcast bias:** $\bar b=\sum_{\text{batch}}\bar Y$. **Elementwise:** $\bar X=\bar Y\odot\phi'(X)$.
+      - **Softmax + CE:** $\partial L/\partial z=p-y$.
+      - **Cost of a full $m\times n$ Jacobian:** $n$ forward-mode or $m$ reverse-mode sweeps, each about $2$–$3\times$ the forward ($<6\times$).
+      - **Checkpointing:** memory $\approx k+L/k$, minimised at $k=\sqrt L$, for one extra forward pass.
+      - **Finite differences:** forward error $O(h)$, centred error $O(h^2)$. Use float64, $h\approx10^{-5}$, and compare by relative error.
+      - **HVP:** $Hv=\nabla[(\nabla L)^\top v]$, for $O(n)$ memory and a few gradients' cost.
+    source: Goodfellow DL §6.5; Murphy PML1 §13.3; Baydin et al. 2018 §3; Chen et al. 2016 §4.3
+
+quiz:
+  - id: q1
+    prompt: |
+      $L=(\tanh(wx)-y)^2$ with $w=0.5$, $x=2$, $y=0$. What is $\partial L/\partial w$? (Use $\tanh 1=0.7616$.)
+    correct: '$\approx 1.28$'
+    wrong:
+      - '$\approx 0.64$'
+      - '$\approx 3.05$'
+      - '$\approx 0.73$'
+    explanation: |
+      Chain the three local derivatives: $2(\tanh(wx)-y)\cdot(1-\tanh^2(wx))\cdot x=2(0.7616)(0.4200)(2)=1.28$. The value 0.64 drops the final factor $x=2$, the derivative of $wx$ with respect to $w$. The value 3.05 forgets the tanh derivative $1-\tanh^2$. The value 0.73 uses $1-\tanh$ instead of $1-\tanh^2$.
+    source: Goodfellow DL §6.5.2
+
+  - id: q2
+    prompt: |
+      What does this print?
+
+      ```python
+      w = torch.tensor(3.0, requires_grad=True)
+      x = torch.tensor(2.0)
+      a = w * x
+      L = a * w
+      L.backward()
+      print(w.grad)
+      ```
+    correct: "12.0"
+    wrong:
+      - "6.0"
+      - "36.0"
+      - "18.0"
+    explanation: |
+      $w$ reaches $L$ along two paths, so its adjoint is the sum: via $a$ it is $\bar a\cdot x=w\cdot x=6$, and directly it is $a=6$, for a total of 12. That matches $L=w^2x$, whose derivative is $2wx=12$. The answer 6 counts only one path. The answer 36 multiplies the two path contributions instead of adding them.
+    source: Goodfellow DL §6.5.6; Murphy PML1 §13.3.4
+
+  - id: q3
+    prompt: |
+      You need the full Jacobian of a function $f:\mathbb{R}^{10}\to\mathbb{R}^{1000}$ using AD. Which plan is cheapest?
+    correct: "Forward mode: 10 JVP sweeps, one per input"
+    wrong:
+      - "Reverse mode: one sweep, since backprop is always cheaper"
+      - "Reverse mode: 10 VJP sweeps, one per input"
+      - "Forward mode: 1000 JVP sweeps, one per output"
+    explanation: |
+      A forward sweep seeded with $e_i$ yields one column, the derivatives of all outputs with respect to input $i$. So 10 sweeps give the whole Jacobian. Reverse mode yields one row per sweep and would need 1000. "Reverse is always cheaper" is a misreading: it wins only when there are few outputs, as with a scalar loss.
+    source: Baydin et al. 2018 §3.2; Murphy PML1 §13.3.1
+
+  - id: q4
+    prompt: |
+      Which statement about reverse-mode AD (backprop) on a feed-forward net is **false**?
+    correct: "It forms each layer's Jacobian and multiplies the matrices"
+    wrong:
+      - "Its cost is a small constant multiple of one forward pass"
+      - "Its memory grows with depth because forward activations are cached"
+      - "The same sweep also gives the gradient with respect to the inputs"
+    explanation: |
+      Backprop applies each operation's vector–Jacobian product, for example $\bar Y\odot\phi'(X)$ or $\bar YW^\top$, and never materialises a Jacobian. An elementwise layer's Jacobian alone would be $n\times n$. The other three statements are true: the cost is $O(\#\text{edges})$, activations are stored until backward uses them, and $\partial L/\partial x$ comes out of the same sweep.
+    source: Goodfellow DL §6.5.2, §6.5.6; CS229 notes §7.4.3
+
+  - id: q5
+    prompt: |
+      $Y=XW+b$ with $X$ of shape (64, 784), $W$ of shape (784, 256) and $b$ of shape (256,), broadcast over rows. Given $\bar Y$ of shape (64, 256), what is $\bar b$?
+    correct: '$\bar Y$ summed over the batch axis, shape (256,)'
+    wrong:
+      - '$\bar Y$ itself, shape (64, 256), since $\partial Y/\partial b=1$'
+      - '$\bar Y$ averaged over the batch axis, shape (256,)'
+      - '$\bar Y$ summed over the feature axis, shape (64,)'
+    explanation: |
+      Broadcasting copies $b$ into every row, and the adjoint of a copy is a sum. Each of the 64 rows contributes $\bar Y_{i,:}$. A gradient must have the variable's shape, which rules out (64, 256) and (64,). Averaging is wrong here because any $1/B$ from a mean loss is already inside $\bar Y$; dividing again would shrink the bias gradient by 64.
+    source: Murphy PML1 §13.3.3; CS229 notes §7.5
+
+  - id: q6
+    prompt: |
+      Logits $z=(2,1,0)$ and the true class is the first one. What is $\partial L/\partial z$ for softmax cross-entropy?
+    correct: '$(-0.335,\ 0.245,\ 0.090)$'
+    wrong:
+      - '$(0.335,\ -0.245,\ -0.090)$'
+      - '$(-0.335,\ 0,\ 0)$'
+      - '$(0.665,\ 0.245,\ 0.090)$'
+    explanation: |
+      $p=\mathrm{softmax}(2,1,0)=(0.665,0.245,0.090)$, and the gradient is $p-y=(-0.335,0.245,0.090)$. It pushes the true logit up and the others down. The second choice has the sign flipped. The third forgets that the wrong classes also receive gradient through the normaliser. The fourth is $p$ itself, which forgets to subtract $y$.
+    source: Goodfellow DL §6.5.9; CS229 notes §7.4.3
+
+  - id: q7
+    prompt: |
+      In a computational graph, $y=\max(x_1,x_2,x_3)$ with $x=(1,5,3)$, and the upstream adjoint is $\bar y=2$. What is $\bar x$?
+    correct: '$(0,\ 2,\ 0)$'
+    wrong:
+      - '$(2/3,\ 2/3,\ 2/3)$'
+      - '$(0,\ 1,\ 0)$'
+      - '$(2,\ 2,\ 2)$'
+    explanation: |
+      Locally, $\max$ is the identity on the winning input and constant in the others, so the whole upstream gradient goes to $x_2$. Spreading it evenly is the VJP of an *average*, not a max. $(0,1,0)$ is the local derivative alone, without multiplying by $\bar y$.
+    source: Murphy PML1 §13.3.3; Goodfellow DL §6.5.6
+
+  - id: q8
+    prompt: |
+      A 100-layer chain is trained with gradient checkpointing, keeping one activation every 10 layers. Backward costs about twice the forward. Compared with storing everything, what happens to peak activation memory and compute?
+    correct: "Peak ≈ 20 layers' activations; ≈ 33% more compute"
+    wrong:
+      - "Peak ≈ 10 layers' activations; no extra compute"
+      - "Peak ≈ 10 layers' activations; compute doubles"
+      - "Peak ≈ 50 layers' activations; ≈ 33% more compute"
+    explanation: |
+      You hold 10 checkpoints plus one recomputed 10-layer segment, so $k+L/k=10+10=20$. Recomputing every segment adds one forward pass: from 1 + 2 = 3 units to 4, about 33% more. "Peak ≈ 10" counts the checkpoints but forgets the live segment. And recomputation is never free.
+    source: Chen et al. 2016 §4.3
+
+  - id: q9
+    prompt: |
+      You gradient-check a new layer in **float32** with centred differences and $h=10^{-7}$. Every entry shows relative error near 1. What is the most likely explanation?
+    correct: "Round-off: in float32, $h$ is too small to resolve the difference"
+    wrong:
+      - "The backward pass is wrong, since errors that large are never numerical"
+      - "Truncation error: $h$ is too large for an $O(h^2)$ method"
+      - "ReLU kinks: some inputs sit within $h$ of zero"
+    explanation: |
+      float32's $\epsilon\approx1.2\times10^{-7}$, so $x\pm10^{-7}$ barely changes $f$. The difference $f(x+h)-f(x-h)$ is mostly rounding noise. The optimal centred step in float32 is about $5\times10^{-3}$, and float64 with $h\approx10^{-5}$ is the standard fix. A real bug is possible, but error near 1 in *every* entry at a tiny $h$ is the round-off signature. Kinks would affect only a few entries.
+    source: Baydin et al. 2018 §2.1; Goodfellow DL §11.5
+
+  - id: q10
+    prompt: |
+      Subtract the Taylor expansions of $f(x+h)$ and $f(x-h)$ and divide by $2h$. Which term is the leading error of the centred difference?
+    correct: '$\tfrac{h^2}{6}f''''''(x)$'
+    wrong:
+      - '$\tfrac{h}{2}f''''(x)$'
+      - '$\tfrac{h^2}{2}f''''(x)$'
+      - '$\tfrac{h^3}{3}f''''''(x)$'
+    explanation: |
+      In the subtraction the even-order terms ($f$ and $\frac{h^2}{2}f''$) cancel, leaving $2hf'+\frac{h^3}{3}f'''$. Dividing by $2h$ gives $f'+\frac{h^2}{6}f'''$. $\frac h2f''$ is the forward difference's error. $\frac{h^3}{3}f'''$ is the error *before* dividing by $2h$.
+    source: Baydin et al. 2018 §2.1
+
+  - id: q11
+    prompt: |
+      What does this print?
+
+      ```python
+      w = torch.tensor(3.0, requires_grad=True)
+      for _ in range(2):
+          L = w ** 2
+          L.backward()
+      print(w.grad)
+      ```
+    correct: "12.0"
+    wrong:
+      - "6.0"
+      - "36.0"
+      - "RuntimeError: graph already freed"
+    explanation: |
+      Each `backward()` adds $dL/dw=2w=6$ into `w.grad`, and nothing zeroes it, so it ends at 12. There is no error: each loop iteration builds a fresh graph, and "trying to backward through the graph a second time" happens only if you call `backward()` twice on the *same* graph. This accumulation is why training loops call `zero_grad()`.
+    source: Baydin et al. 2018 §4.2
+
+  - id: q12
+    prompt: |
+      What does this print?
+
+      ```python
+      w = torch.tensor(2.0, requires_grad=True)
+      a = w * 3
+      L = a * a.detach()
+      L.backward()
+      print(w.grad)
+      ```
+    correct: "18.0"
+    wrong:
+      - "36.0"
+      - "0.0"
+      - "6.0"
+    explanation: |
+      `a.detach()` is treated as the constant 6, so $L=6a$ and $dL/dw=6\cdot3=18$. Without the detach, $L=a^2$ and the gradient is $2a\cdot3=36$. Detaching one factor doesn't block the other path, so 0 is wrong. 6 forgets the $da/dw=3$ factor.
+    source: Baydin et al. 2018 §3.2
+
+  - id: q13
+    prompt: |
+      Evaluate $f(x)=x^2\sin x$ on the dual number $2+\varepsilon$, where $\varepsilon^2=0$. What is the coefficient of $\varepsilon$?
+    correct: '$\approx 1.97$'
+    wrong:
+      - '$\approx 3.64$'
+      - '$\approx -1.66$'
+      - '$\approx 3.64\,\varepsilon^2$, so 0'
+    explanation: |
+      The $\varepsilon$-coefficient is $f'(2)=2x\sin x+x^2\cos x=4\sin2+4\cos2=3.637-1.665=1.97$. Each of the first two distractors keeps only one product-rule term. The last applies $\varepsilon^2=0$ too early: the product rule appears automatically because $(a+\dot a\varepsilon)(b+\dot b\varepsilon)=ab+(a\dot b+\dot ab)\varepsilon$.
+    source: Baydin et al. 2018 §3.1.1
+
+cards:
+  - id: f1
+    front: Give the VJPs of $Y=XW$ (with $X$ of shape $B\times n$) and of a broadcast bias.
+    back: |
+      $$\bar W=X^\top\bar Y,\qquad \bar X=\bar YW^\top$$
+
+      $\bar b=\sum_{\text{rows}}\bar Y$, because broadcasting is a copy and the adjoint of a copy is a sum. Check the shapes: a gradient has the shape of its variable.
+    source: Murphy PML1 §13.3.3
+
+  - id: f2
+    front: Gradient of softmax cross-entropy with respect to the logits, and why frameworks fuse the two ops.
+    back: |
+      $L=-y^\top z+\log\sum_j e^{z_j}$, so $\nabla_zL=p-y$.
+
+      Fusing avoids building the $K\times K$ softmax Jacobian and avoids taking $\log$ of an underflowed probability. It computes log-sum-exp stably as $m+\log\sum_j e^{z_j-m}$ with $m=\max_j z_j$.
+    source: Goodfellow DL §6.5.9; Blanchard et al. 2021 §1
+
+  - id: f3
+    front: How many forward-mode vs reverse-mode sweeps does the full Jacobian of $f:\mathbb{R}^n\to\mathbb{R}^m$ take, and what does each sweep cost?
+    back: |
+      $n$ forward sweeps (JVPs, one column each) or $m$ reverse sweeps (VJPs, one row each). Each costs $c\cdot\mathrm{ops}(f)$ with $c<6$, typically 2–3. For a scalar loss, reverse mode needs a single sweep.
+    source: Baydin et al. 2018 §3.2
+
+  - id: f4
+    front: Truncation error and optimal step for forward vs centred finite differences in float64.
+    back: |
+      - Forward: error $O(h)$, best $h\sim\sqrt\epsilon\approx1.5\times10^{-8}$.
+      - Centred: error $\frac{h^2}{6}f'''=O(h^2)$, best $h\sim\epsilon^{1/3}\approx6\times10^{-6}$.
+
+      Round-off adds about $\epsilon|f|/h$, which is why too small an $h$ also fails. In practice use $h\approx10^{-5}$, centred, in float64.
+    source: Baydin et al. 2018 §2.1
+
+  - id: f5
+    front: Memory and compute of $\sqrt L$ gradient checkpointing.
+    back: |
+      With $k$ segments, peak memory is about $k+L/k$, minimised at $k=\sqrt L$ to give about $2\sqrt L$ activations instead of $L$. The cost is one extra forward pass (about 33% more if backward is twice the forward). Recursive checkpointing reaches $O(\log L)$ memory for $O(L\log L)$ forward computation.
+    source: Chen et al. 2016 §4.3
+
+  - id: f6
+    front: How do you get a Hessian–vector product without forming the Hessian?
+    back: |
+      $$Hv=\nabla_\theta\big[(\nabla_\theta L)^\top v\big]$$
+
+      Differentiate the scalar $g^\top v$ through the gradient computation, either reverse-over-reverse (`create_graph=True`) or forward-over-reverse (a JVP of the gradient). It costs a small multiple of one gradient and $O(n)$ memory.
+    source: Goodfellow DL §6.5.10; Baydin et al. 2018 §4.1
+
+  - id: f7
+    front: Sum and broadcast, and max — what are their VJPs?
+    back: |
+      - Sum $\to$ broadcast: $\bar x_i=\bar y$.
+      - Broadcast or fan-out $\to$ sum: $\bar x=\sum_i\bar y_i$.
+      - Max $\to$ route $\bar y$ to the argmax and 0 elsewhere. This covers max-pooling and ReLU.
+    source: Murphy PML1 §13.3.3
+
+  - id: f8
+    type: open
+    front: "Derive the backward pass for $L=(\\tanh(wx+b)-y)^2+\\lambda w^2$ and explain each step to an interviewer."
+    back: |
+      1. **Forward, caching:** $a=wx+b$, $h=\tanh a$ (cache it), $r=h-y$, $L=r^2+\lambda w^2$.
+      2. **Seed:** $\bar L=1$. A sum passes its adjoint unchanged to both terms.
+      3. **Square:** $\bar r=2r$. Subtracting a constant: $\bar h=\bar r$.
+      4. **tanh:** $\bar a=\bar h(1-h^2)$, reusing the cached $h$. This is why the forward pass stores activations.
+      5. **Affine:** $\bar b=\bar a$ and $\bar x=\bar aw$.
+      6. **Fan-out of $w$:** it feeds the product and the penalty, so $\bar w=\bar ax+2\lambda w$. The adjoints add by the multivariate chain rule.
+      7. **Check:** with $w=0.25$, $x=2$, $b=0$, $y=1$, $\lambda=0.1$ you get $\bar w=-1.642$ and $\bar b=-0.846$. These match autograd and a centred finite difference.
+
+      Point out that each node did $O(1)$ work, so the total is linear in the graph size.
+    source: Goodfellow DL §6.5.3; Murphy PML1 §13.3.4
+
+  - id: f9
+    type: open
+    front: Explain forward- vs reverse-mode AD and when you'd choose forward mode.
+    back: |
+      - **The setup:** both apply the chain rule to numbers. The Jacobian of a composition is $J=J_L\cdots J_1$.
+      - **Forward mode** pushes tangents input-to-output with JVPs $\dot y=J\dot x$ (dual numbers, $\varepsilon^2=0$). One sweep gives one column, and nothing needs storing.
+      - **Reverse mode** first runs forward, caching values, then pulls adjoints output-to-input with VJPs $\bar x=J^\top\bar y$. One sweep gives one row.
+      - **Cost:** for $f:\mathbb{R}^n\to\mathbb{R}^m$, it's $n$ forward sweeps vs $m$ reverse sweeps, each a small constant ($<6$) times the forward.
+      - **Losses** have $m=1$, hence backprop. The price is activation memory, which checkpointing mitigates.
+      - **Choose forward mode** when inputs are few and outputs many (sensitivity of many outputs to a few hyperparameters), when memory is tight, or inside forward-over-reverse Hessian–vector products.
+    source: Baydin et al. 2018 §3; Murphy PML1 §13.3.1
+
+  - id: f10
+    type: open
+    front: You've written a custom CUDA op with a hand-coded backward. How do you convince yourself the gradient is right?
+    back: |
+      1. **Float64, tiny shapes,** random inputs placed away from any kinks (ReLU at 0, max ties).
+      2. **Centred differences** $\frac{f(x+h)-f(x-h)}{2h}$ with $h\approx10^{-5}$. The error is $O(h^2)$, with round-off of about $\epsilon/h$; this $h$ is near the optimum.
+      3. **Relative error** $|g_a-g_n|/(|g_a|+|g_n|)$ per entry. Around $10^{-7}$ or below is fine; around $10^{-2}$ is a bug.
+      4. **Vector-valued ops:** reduce to a scalar with a random projection, $f=u^\top g(x)$, and repeat for a few $u$ so a bug orthogonal to one projection can't hide.
+      5. **Large tensors:** check a random subset of entries, since each costs two forward passes.
+      6. **Cross-check** against a slow reference built from framework primitives with autograd (`torch.autograd.gradcheck` automates this).
+      7. **Then the training-level test:** can the model overfit one small batch?
+    source: Goodfellow DL §11.5; Baydin et al. 2018 §2.1
+
+  - id: f11
+    type: open
+    front: Why does training memory blow up with depth and sequence length, and what can you do about it?
+    back: |
+      **Why:** reverse mode needs every cached forward activation until backward reaches it. Memory scales like layers × batch × width (× sequence length), and in deep nets that usually exceeds the parameter memory.
+
+      **Remedies, from Chen et al. and practice:**
+      - Smaller micro-batches with gradient accumulation.
+      - Recompute cheap ops (BatchNorm, activations) instead of storing them.
+      - $\sqrt L$ checkpointing: about $2\sqrt L$ activations for one extra forward pass.
+      - Recursive checkpointing for $O(\log L)$ memory.
+      - In-place ops and memory sharing where the backward doesn't need the overwritten value.
+
+      **The trade-off:** compute for memory. Forward mode would avoid the tape but costs one sweep per parameter, so it is not an option for training.
+    source: Chen et al. 2016 §1, §4; Baydin et al. 2018 §3.2
+
+reading:
+  - title: "Goodfellow, Bengio & Courville, Deep Learning §6.5 (Back-Propagation and Other Differentiation Algorithms)"
+    url: https://www.deeplearningbook.org/contents/mlp.html
+    kind: book
+    note: Computational graphs, Algorithm 6.2's adjoint table, the MLP backward (Alg. 6.4) and higher-order derivatives (§6.5.10).
+  - title: "Baydin et al., Automatic Differentiation in Machine Learning: a Survey (JMLR 2018), §2–3"
+    url: https://arxiv.org/abs/1502.05767
+    kind: paper
+    note: The clearest treatment of AD vs numerical and symbolic differentiation, forward and reverse traces worked on one example, and dual numbers.
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction §13.3 (Backpropagation)"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: The JVP/VJP view, forward vs reverse mode as matrix-chain order, and VJPs for common layers.
+  - title: "Chen, Xu, Zhang & Guestrin, Training Deep Nets with Sublinear Memory Cost (2016), §4"
+    url: https://arxiv.org/abs/1604.06174
+    kind: paper
+    note: The √n checkpointing schedule, "drop cheap ops", and the recursive O(log n) variant.
+  - title: "d2l.ai §5.3 Forward Propagation, Backward Propagation, and Computational Graphs"
+    url: https://d2l.ai/chapter_multilayer-perceptrons/backprop.html
+    kind: course
+    note: A short worked one-hidden-layer example with an L2 penalty, the same fan-out pattern as card 3.

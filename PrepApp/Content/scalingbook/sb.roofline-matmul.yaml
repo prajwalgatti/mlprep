@@ -1,0 +1,422 @@
+id: sb.roofline-matmul
+area: scalingbook
+title: "Rooflines II: Matmuls, Precision and Network Rooflines"
+summary: Derives the arithmetic intensity of a matmul (≈ the token batch size), the B > 240 rule and how precision moves it, why some batched matmuls never become compute-bound, and the first roofline that involves two chips.
+order: 20
+level: core
+tags: [scaling-book, systems, roofline, matmul, quantization]
+prereqs: [sb.roofline-basics]
+
+explainer:
+  - title: The cost of one matmul
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    body: |
+      Almost all of a transformer's FLOPs are matrix multiplies, so the roofline of one matmul is the most useful roofline there is. Take
+
+      $$X[B, D] \cdot Y[D, F] \rightarrow Z[B, F]$$
+
+      in bf16. Think of $X$ as a batch of $B$ token activations of width $D$, and $Y$ as a weight matrix.
+
+      **FLOPs.** Each of the $BF$ outputs is a dot product of length $D$: $D$ multiplies and $D - 1$ adds. That is $BF(2D - 1) \approx 2BDF$ FLOPs.
+
+      **Bytes.** Read $X$ ($2BD$ bytes) and $Y$ ($2DF$), write $Z$ ($2BF$). The matrix unit accumulates in fp32, but the result is usually cast back to bf16 before it is written to HBM. Total: $2BD + 2DF + 2BF$.
+
+      **Worked example** on a TPU v5e, with $B = 512$, $D = 4096$, $F = 16384$:
+
+      - FLOPs $= 2\cdot512\cdot4096\cdot16384 \approx 6.87\times10^{10}$, so $T_\text{math} \approx 349$ µs.
+      - Bytes $\approx 1.55\times10^{8}$, so $T_\text{comms} \approx 189$ µs at $8.2\times10^{11}$ B/s.
+      - $T_\text{math} > T_\text{comms}$: compute-bound, about 349 µs if loads overlap with compute.
+
+      Halve the batch to $B = 256$ and the two times become nearly equal (≈ 174 µs vs ≈ 176 µs). The batch size is doing the deciding, and the next card shows why.
+  - title: "Matmul intensity ≈ batch size"
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication", Question 5
+    body: |
+      Divide FLOPs by bytes:
+
+      $$\begin{aligned} I &= \frac{2BDF}{2BD + 2DF + 2BF} \\ &= \frac{BDF}{BD + DF + BF}. \end{aligned}$$
+
+      In a transformer the per-chip token batch $B$ is usually a few hundred to a thousand, while $D$ and $F$ are several thousand or more. When $B \ll D, F$, the $DF$ term dominates the denominator:
+
+      $$I \approx \frac{BDF}{DF} = B.$$
+
+      **Why.** The bytes are dominated by the weight matrix, which is loaded once whatever the batch. Each weight is then reused for $B$ tokens, 2 FLOPs per use. More tokens means more FLOPs for the same bytes.
+
+      Comparing with the hardware ridge gives the book's most quoted rule. The book says it holds on "most TPUs", but the threshold is the v5e's (lesson 1 showed the ridge varies by chip); for a TPU v5e in bf16:
+
+      $$B > \frac{C}{W_\text{hbm}} = \frac{1.97\times10^{14}}{8.2\times10^{11}} \approx 240.$$
+
+      On an H100 the same calculation gives $9.89\times10^{14}/3.35\times10^{12} \approx 295$. So a bf16 matmul needs a few hundred tokens per chip to keep the matrix unit busy. Below that it is limited by streaming weights out of HBM, which is exactly the situation in small-batch decoding.
+  - title: Tokens, not sequences, per replica
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    body: |
+      Two clarifications make the rule usable.
+
+      **$B$ counts tokens.** A feed-forward matmul treats every token independently, so it does not matter whether 512 tokens come from one sequence or from 512 different ones. "Batch size" here is never the number of sequences.
+
+      **$B$ is per replica.** Suppose we split one copy of the model's weights across several chips (model sharding, chapter 3 onwards). Each chip then holds a fraction of the weights and does the same fraction of the FLOPs. Compute and HBM bandwidth both scale with the chip count, so the ratio, and hence the threshold, is unchanged. The rule applies to the tokens processed by each independent copy of the weights.
+
+      **Worked example.** Training with 512 sequences of 4096 tokens is $512 \times 4096 \approx 2.1$M tokens per step. Spread data-parallel over 2048 chips, each chip (each replica) sees $2^{21}/2048 = 1024$ tokens. That is above 240 (v5e) or 295 (H100), so the matmuls can be compute-bound.
+
+      In decoding, by contrast, each request contributes **one** token per step. Reaching 240 tokens means batching 240 concurrent requests, which is why inference is so often bandwidth-bound (chapter 7).
+  - title: The exact curve
+    source: Scaling Book ch. 1 (Rooflines), Question 3 (adapted to bf16 weights)
+    body: |
+      The "$B > 240$" rule dropped the activation terms $2BD + 2BF$. How much does that matter? Setting $T_\text{math} = T_\text{comms}$ with the exact byte count and solving for $B$ on a v5e:
+
+      - $D = F = 8192$: $B \approx 255$.
+      - $D = F = 4096$: $B \approx 272$.
+      - $D = F = 1024$: $B \approx 450$, nearly double.
+
+      The book poses this exercise (its Question 3) for int8 weights with bf16 activations, the setup of the next card. There the answers are $B \approx 136$ and $\approx 226$. With bf16 weights every crossover exactly doubles, to 272 and 453, because the crossover is proportional to the bytes per weight.
+
+      ![Attainable v5e throughput of a [B,D]×[D,F] matmul against token batch B, for bf16 and int8 weights. Smaller matrices need larger batches; int8 weights halve the batch needed.](sb.roofline-matmul/batch-roofline)
+
+      Small matrices suffer because the activation and output bytes are no longer negligible next to the weights. There is even a ceiling. As $B \to \infty$,
+
+      $$I \to \frac{DF}{D + F},$$
+
+      which is $D/2$ for a square matrix: at most 512 FLOPs/byte when $D = F = 1024$. A small enough matrix can never reach the ridge, however large the batch.
+
+      For the large $D$ and $F$ of real LLMs, the approximation is off by about 5–15% (255 vs 240 at $D = F = 8192$; 272 vs 240 at 4096), which is fine for estimates.
+  - title: Precision moves the threshold
+    source: 'Scaling Book ch. 1 (Rooflines), Questions 1–2; Scaling Book ch. 7 §"Linear operations: what bottlenecks us?"'
+    body: |
+      Lower precision changes both sides of the comparison: weights cost fewer bytes, and low-precision math has a higher peak. On a v5e, int8 runs at $3.94\times10^{14}$ OPs/s, twice bf16. With $B \ll D, F$, the bytes are dominated by the weights.
+
+      **int8 weights, int8 activations, int8 math.** Bytes $\approx DF$, OPs $= 2BDF$, so $I \approx 2B$. The int8 ridge is $3.94\times10^{14}/8.2\times10^{11} \approx 480$:
+
+      $$2B > 480 \iff B > 240.$$
+
+      Unchanged: half the bytes, but twice the speed.
+
+      **int8 weights, bf16 activations and math** (weight-only quantization). Bytes $\approx DF$, FLOPs $2BDF$, bf16 ridge 240:
+
+      $$2B > 240 \iff B > 120.$$
+
+      Half the batch needed. This is a real win for small-batch inference.
+
+      **bf16 weights, int8 or fp8 math.** Bytes $\approx 2DF$, ridge 480, so $B > 480$: the threshold doubles.
+
+      **General rule.** Let $b_w$ be bytes per weight and $C$ the peak at the precision the math runs in. Bytes $\approx b_w DF$, so $I \approx 2B/b_w$, and $2B/b_w > C/W_\text{hbm}$ gives
+
+      $$B_\text{crit} = \frac{C}{W_\text{hbm}} \cdot \frac{b_w}{2}.$$
+
+      Check: $480 \cdot \tfrac12 = 240$, $240 \cdot \tfrac12 = 120$, $480 \cdot 1 = 480$.
+
+      Chapter 7 (lesson 210) writes the same rule as $B_\text{crit} = \beta\,\alpha_\text{hbm}$, with $\beta$ = bits per parameter / bits per activation. That form agrees with ours provided $\alpha_\text{hbm}$ is the **bf16** ridge (240) and low-precision math runs at a peak inversely proportional to its bits. Plugging the int8 ridge (480) into it would give a wrong 480 for int8-everything. Writing $C$ at the math precision avoids the hidden assumption.
+  - title: When batching doesn't help
+    source: Scaling Book ch. 1 (Rooflines), Question 4
+    body: |
+      The intensity grew with $B$ only because every token shared the same weights. Break that, and the rule collapses.
+
+      Suppose each batch element has its own matrix:
+
+      $$\text{int8}[B, D] \cdot_D \text{int8}[B, D, F] \rightarrow \text{int8}[B, F].$$
+
+      - **OPs:** $B$ independent $[D]\times[D, F]$ products, so still $2BDF$.
+      - **Bytes:** $BD + BDF + BF$, now dominated by the $BDF$ matrices.
+
+      $$I = \frac{2BDF}{BD + BDF + BF} \approx 2.$$
+
+      The intensity is a constant: each loaded weight is used for exactly one multiply-add. No batch size makes this compute-bound on any accelerator.
+
+      This is not a contrived case. During decoding, attention reads each sequence's own key-value cache, and every sequence has a different one. That attention step behaves just like this example, which is why chapter 7 finds decode attention always bandwidth-bound.
+  - title: Tiles have rooflines too
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    body: |
+      A large matmul does not fit in the fast on-chip memory (VMEM on TPU, shared memory on GPU), so kernels split it into tiles. With tile sizes $b_m, b_k, b_n$ for an $(m, k)\cdot(k, n)$ product, write $t_m = m/b_m$ and similarly for $t_k$, $t_n$. Each of the $t_m t_n$ output tiles is built by streaming in $t_k$ pairs of input tiles, then written once. In bf16:
+
+      $$\begin{aligned} \text{FLOPs} &= 2\, t_m t_n t_k\, b_m b_n b_k \\ \text{bytes} &\approx 2\, t_m t_n t_k\,(b_m b_k + b_k b_n). \end{aligned}$$
+
+      The second line ignores the output writes. The ratio is
+
+      $$I_\text{tile} = \frac{b_m b_n}{b_m + b_n}.$$
+
+      Same shape as before: an $X$ tile is reused across $b_n$ columns, a $Y$ tile across $b_m$ rows.
+
+      **Worked example.** For square tiles $b_m = b_n = b$, $I_\text{tile} = b/2$. With $b = 128$ that is only 64, well below the v5e's 240 if tiles stream from HBM. Reaching 240 needs $b \ge 480$. So tile sizes, and therefore on-chip memory size, set a ceiling on matmul efficiency. These are VMEM tiles, usually much larger than the 128 × 128 block the matrix unit consumes at a time (next lesson); a 128-wide MXU does not imply 128-wide tiles.
+  - title: A roofline across two chips
+    source: Scaling Book ch. 1 (Rooflines) §"Network communication rooflines"
+    body: |
+      Rooflines also apply to communication between chips. Split $X[B, D]$ and $Y[D, F]$ in half along the contracted dimension $D$, across two TPUs.
+
+      ![Each chip multiplies its halves to get a partial sum of Z, then the chips swap partial sums and add](sb.roofline-matmul/two-chip)
+
+      Each chip computes $Z_i = X_i Y_i$, a full-size $[B, F]$ partial sum, then sends it to the other chip. Take $C = 1.97\times10^{14}$ FLOPs/s per chip and $W = 4.5\times10^{10}$ B/s per direction.
+
+      $$\begin{aligned} T_\text{math} &= \frac{2BDF}{2C} = \frac{BDF}{C} \\ T_\text{comms} &= \frac{2BF}{W}. \end{aligned}$$
+
+      The final add is negligible. Compute-bound iff
+
+      $$\frac{BDF}{2BF} = \frac{D}{2} > \frac{C}{W} \approx 4377 \iff D > 8755.$$
+
+      **The threshold depends on $D$, not $B$.** Both the FLOPs and the bytes sent grow with $B$ (and $F$), so they cancel. What is left is how much contraction each chip does per output element it must ship.
+
+      **Worked example.** $D = 4096$, $B = 1024$, $F = 16384$: $T_\text{math} \approx 349$ µs, $T_\text{comms} \approx 746$ µs. Comms-bound by $8755/4096 \approx 2.1\times$.
+  - title: What interviewers probe
+    source: 'Scaling Book ch. 1 (Rooflines); Scaling Book ch. 7 §"Linear operations: what bottlenecks us?"'
+    body: |
+      - *When is a matmul compute-bound?* When the per-replica token batch exceeds $C/W$: ≈ 240 on v5e, ≈ 295 on H100. Intensity ≈ $B$ because weights dominate the bytes.
+      - *Does sharding the model change that threshold?* No. Compute and bandwidth both scale with chips, so the threshold holds per copy of the weights.
+      - *Why does weight-only int8 help decoding?* It halves weight bytes while math stays bf16, so $B_\text{crit}$ drops to ≈ 120 and memory-bound steps run up to 2× faster.
+      - *And int8 everything?* Bytes halve and peak doubles: $B_\text{crit}$ stays ≈ 240.
+      - *Why is decode attention memory-bound at any batch?* Each sequence has its own KV cache, like a per-example weight matrix: intensity is a constant.
+      - *Why do tile sizes matter?* A tile's intensity is $b_m b_n/(b_m + b_n)$; small tiles can't reach the ridge.
+      - *Two-chip contraction split: what decides compute- vs comms-bound?* The contracted dimension: $D/2 > C/W_\text{link}$, independent of $B$.
+  - title: Key results
+    source: Scaling Book ch. 1 (Rooflines)
+    body: |
+      $$\text{FLOPs} = 2BDF, \qquad \text{bytes} = 2BD + 2DF + 2BF$$
+
+      $$I = \frac{BDF}{BD + DF + BF} \approx B \quad (B \ll D, F)$$
+
+      $$B_\text{crit} = \frac{C}{W_\text{hbm}}\cdot\frac{b_w}{2}$$
+
+      $$I_\text{tile} = \frac{b_m b_n}{b_m + b_n}$$
+
+      - bf16 on v5e: $B > 240$ tokens per replica (H100 ≈ 295). Exact: ≈ 272 for $D = F = 4096$, ≈ 450 for 1024.
+      - int8 weights + bf16 math: $B > 120$. int8 everything: $B > 240$. bf16 weights + int8 math: $B > 480$.
+      - Per-example weights (or per-sequence KV caches): $I \approx$ constant, always bandwidth-bound.
+      - Two chips splitting the contraction: compute-bound iff $D > 2C/W$ ($\approx 8755$ on v5e ICI).
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    prompt: |
+      On a TPU v5e ($1.97\times10^{14}$ FLOPs/s, $8.2\times10^{11}$ B/s), roughly how long does a bf16 matmul $[512, 4096]\times[4096, 16384]$ take, assuming compute and loads overlap?
+    correct: About 350 µs, compute-bound
+    wrong:
+      - About 190 µs, bandwidth-bound
+      - About 540 µs, the sum of compute and load time
+      - About 85 µs, bandwidth-bound
+    explanation: |
+      FLOPs $= 2\cdot512\cdot4096\cdot16384 \approx 6.87\times10^{10}$, so $T_\text{math} \approx 349$ µs. Bytes $= 2(512\cdot4096 + 4096\cdot16384 + 512\cdot16384) \approx 1.55\times10^8$, so $T_\text{comms} \approx 189$ µs. The max is $T_\text{math}$: compute-bound at ≈ 350 µs. 540 µs is the no-overlap upper bound.
+  - id: q2
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    prompt: |
+      Why does the arithmetic intensity of $[B, D]\times[D, F]$ approach $B$ when $B \ll D, F$?
+    correct: Weight bytes dominate, and each weight is reused for all B tokens
+    wrong:
+      - The activations dominate the bytes, and each activation is reused F times
+      - The FLOP count grows quadratically in B while bytes grow linearly
+      - The output matrix dominates the bytes once it is cast to bf16
+    explanation: |
+      Bytes $\approx 2DF$ (the weights) and FLOPs $= 2BDF$, so the ratio is $B$. Each weight costs 2 bytes to load and is used in $B$ multiply-adds. FLOPs grow linearly in $B$, not quadratically; the activations and output are the small terms when $B$ is small.
+  - id: q3
+    source: Scaling Book ch. 1 (Rooflines), Question 2
+    prompt: |
+      Weights are quantized to int8 but activations and math stay in bf16 (`bf16[B, D] · int8[D, F] → bf16[B, F]`) on a TPU v5e. Above roughly what token batch is the matmul compute-bound?
+    correct: About 120
+    wrong:
+      - About 240
+      - About 480
+      - About 60
+    explanation: |
+      Bytes $\approx DF$ (1 byte per weight), FLOPs $= 2BDF$, so $I \approx 2B$. The bf16 ridge is 240, so $2B > 240$ gives $B > 120$. 240 would be right for bf16 weights; weight-only quantization halves the batch needed.
+  - id: q4
+    source: Scaling Book ch. 1 (Rooflines), Question 1
+    prompt: |
+      Now everything is int8: weights, activations and math (the v5e does $3.94\times10^{14}$ int8 OPs/s). What is the critical token batch?
+    correct: About 240, the same as bf16
+    wrong:
+      - About 120, half of bf16
+      - About 480, double bf16
+      - About 60, a quarter of bf16
+    explanation: |
+      Bytes $\approx DF$, OPs $= 2BDF$, so $I \approx 2B$. The int8 ridge is $3.94\times10^{14}/8.2\times10^{11} \approx 480$, so $2B > 480$ and $B > 240$. Halving the bytes and doubling the peak cancel. 120 forgets that int8 math is also twice as fast.
+  - id: q5
+    source: 'Scaling Book ch. 7 §"Linear operations: what bottlenecks us?"; Scaling Book ch. 12 §"Quiz 1 (GPU hardware)"'
+    prompt: |
+      An H100 keeps weights in bf16 but runs the matmul in fp8, whose peak is twice the bf16 peak ($\approx 1.98\times10^{15}$ FLOPs/s; HBM 3.35 TB/s). Roughly what token batch is needed to be compute-bound?
+    correct: About 590
+    wrong:
+      - About 295
+      - About 150
+      - About 1180
+    explanation: |
+      Bytes $\approx 2DF$, FLOPs $= 2BDF$, so $I \approx B$. The fp8 ridge is $1.98\times10^{15}/3.35\times10^{12} \approx 590$, so $B > 590$. Faster math with unchanged weight bytes doubles the batch needed relative to bf16's ≈ 295.
+  - id: q6
+    source: Scaling Book ch. 1 (Rooflines), Question 4
+    prompt: |
+      Each batch element has its own weight matrix: $\text{int8}[B, D]\cdot_D \text{int8}[B, D, F] \rightarrow \text{int8}[B, F]$. How does the arithmetic intensity behave as $B$ grows?
+    correct: It stays near 2, so the op is bandwidth-bound at any batch size
+    wrong:
+      - It grows like 2B, so it becomes compute-bound above B ≈ 240
+      - It grows like B, so it becomes compute-bound above B ≈ 480
+      - It shrinks like 1/B, so larger batches make it slower per token
+    explanation: |
+      OPs are still $2BDF$, but bytes are $BD + BDF + BF \approx BDF$, so $I \approx 2$. Every weight is used once, so batching gives no reuse. Decode attention over per-sequence KV caches has the same structure.
+  - id: q7
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    prompt: |
+      A training step uses 512 sequences of 4096 tokens, spread with pure data parallelism over 2048 chips. What batch size should you compare against the ≈ 240 threshold?
+    correct: 1024 tokens per chip
+    wrong:
+      - 0.25 sequences per chip
+      - 512 sequences
+      - About 2.1M tokens
+    explanation: |
+      The threshold is in tokens per replica. Total tokens $= 512 \times 4096 = 2^{21}$; per chip, $2^{21}/2048 = 1024$. Sequence counts are irrelevant to the matmul roofline, and the global 2.1M tokens is spread over 2048 independent weight copies.
+  - id: q8
+    source: Scaling Book ch. 1 (Rooflines) §"Network communication rooflines"
+    prompt: |
+      Two v5e chips each hold half of $X[B, D]$ and $Y[D, F]$ along $D$, compute partial sums, and swap them over a $4.5\times10^{10}$ B/s link. With $D = 4096$, what happens?
+    correct: Comms-bound by about 2.1×, whatever the batch
+    wrong:
+      - Compute-bound, because the batch is large enough
+      - Comms-bound unless B exceeds about 240
+      - Balanced; math and comms take equal time
+    explanation: |
+      $T_\text{math} = BDF/C$ and $T_\text{comms} = 2BF/W$, so $T_\text{comms}/T_\text{math} = 2C/(DW) = 8755/4096 \approx 2.1$. $B$ cancels, so no batch size fixes it; only a larger $D$ (above 8755) does.
+  - id: q9
+    source: Scaling Book ch. 1 (Rooflines), Question 3 (adapted to bf16 weights)
+    prompt: |
+      Using the **exact** byte count $2BD + 2DF + 2BF$, at roughly what batch does a bf16 matmul with $D = F = 1024$ become compute-bound on a TPU v5e?
+    correct: About 450
+    wrong:
+      - About 240
+      - About 270
+      - It never becomes compute-bound
+    explanation: |
+      Solve $2BDF/C = (2BD + 2DF + 2BF)/W$: $B\,(2DF/C - 4D/W) = 2DF/W$ for $D = F$, giving $B \approx 453$. The activation bytes matter at this small size. It does become compute-bound because the ceiling $DF/(D+F) = 512$ is above 240, but only just.
+  - id: q10
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    prompt: |
+      A matmul kernel streams square $b \times b$ bf16 tiles from HBM on a TPU v5e. What is the smallest $b$ whose tile intensity reaches the ridge of 240?
+    correct: 480
+    wrong:
+      - 240
+      - 128
+      - 960
+    explanation: |
+      $I_\text{tile} = b_m b_n/(b_m + b_n) = b/2$ for square tiles, so $b/2 \ge 240$ needs $b \ge 480$. With 128 × 128 tiles the intensity is only 64. Picking $b = 240$ confuses the tile side with its intensity.
+  - id: q11
+    source: Scaling Book ch. 1 (Rooflines), Question 3 (adapted)
+    prompt: |
+      ![Attainable throughput vs token batch for four matmul configurations](sb.roofline-matmul/batch-roofline)
+
+      Why does the bf16-weight $D = F = 1024$ curve need a much larger batch than the bf16-weight $D = F = 4096$ curve to saturate?
+    correct: Activation and output bytes stop being negligible
+    wrong:
+      - Small matrices run on the vector unit instead of the matrix unit
+      - Small matrices need int8 weights to use the matrix unit
+      - The peak FLOPs/s is lower for small matrices
+    explanation: |
+      The intensity is $BDF/(BD + DF + BF)$. With $D = F = 1024$ the $BD + BF$ terms are comparable to $DF$ at a few hundred tokens, so bytes grow with $B$ and intensity rises slowly, capped at $DF/(D+F) = 512$. The peak is the same 197 TFLOP/s for both curves.
+  - id: q12
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    prompt: |
+      Which statement is **false**?
+    correct: Sharding one weight copy over more chips lowers the per-replica critical batch
+    wrong:
+      - The B > 240 rule counts tokens, regardless of how many sequences they come from
+      - With int8 weights and int8 math, the v5e's critical batch is about the same as with bf16
+      - Making D and F larger brings the exact critical batch closer to C/W
+    explanation: |
+      Sharding the weights over $n$ chips divides both the FLOPs and the weight bytes per chip by $n$, and gives $n$ times the bandwidth, so the threshold per replica is unchanged. The other statements are true: tokens are tokens; int8 halves bytes and doubles peak; larger $D, F$ make the activation terms negligible.
+  - id: q13
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"; Scaling Book ch. 12 §"GPUs vs. TPUs at the chip level"
+    prompt: |
+      During decoding, an H100 ($9.89\times10^{14}$ FLOPs/s, 3.35 TB/s) runs a bf16 $[64, 8192]\times[8192, 8192]$ matmul. Roughly what fraction of peak FLOPs/s does it achieve?
+    correct: About 20%
+    wrong:
+      - About 100%
+      - About 50%
+      - About 2%
+    explanation: |
+      $T_\text{math} = 2\cdot64\cdot8192^2/9.89\times10^{14} \approx 8.7$ µs. Bytes $\approx 2\cdot8192^2 + $ small terms $\approx 1.36\times10^8$, so $T_\text{comms} \approx 41$ µs. The op is bandwidth-bound and uses $8.7/41 \approx 21\%$ of peak, close to $64/295$.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    front: FLOPs and bytes of a bf16 matmul $[B, D]\times[D, F]$?
+    back: |
+      FLOPs $\approx 2BDF$. Bytes $= 2BD + 2DF + 2BF$ (read both inputs, write the bf16 output).
+  - id: f2
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    front: Arithmetic intensity of a matmul, and its small-batch approximation?
+    back: |
+      $$I = \frac{BDF}{BD + DF + BF} \approx B \quad (B \ll D, F)$$
+  - id: f3
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    front: The B > 240 rule. What exactly is B, and on which chip is it 240?
+    back: |
+      $B$ = tokens per replica (per copy of the weights), not sequences. 240 = $C/W_\text{hbm}$ for a TPU v5e in bf16; ≈ 295 for an H100.
+  - id: f4
+    source: 'Scaling Book ch. 1 (Rooflines), Questions 1–2; Scaling Book ch. 7 §"Linear operations: what bottlenecks us?"'
+    front: Critical batch on a v5e for int8-weight/bf16-math, int8 everything, and bf16-weight/int8-math matmuls?
+    back: |
+      120, 240 and 480. In general $B_\text{crit} = (C/W_\text{hbm})\cdot(b_w/2)$, with $C$ the peak at the math precision and $b_w$ bytes per weight.
+  - id: f5
+    source: Scaling Book ch. 1 (Rooflines), Question 3 (adapted)
+    front: What does matmul intensity approach as $B \to \infty$, and why does it matter?
+    back: |
+      $DF/(D + F)$, i.e. $D/2$ for square matrices. Small matrices have a hard ceiling: $D = F = 1024$ tops out at 512 FLOPs/byte.
+  - id: f6
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    front: Intensity of a tiled matmul with tiles $b_m \times b_k$ and $b_k \times b_n$?
+    back: |
+      $$I_\text{tile} \approx \frac{b_m b_n}{b_m + b_n}$$
+
+      $b/2$ for square tiles, so 128 × 128 tiles give only 64.
+  - id: f7
+    source: Scaling Book ch. 1 (Rooflines) §"Network communication rooflines"
+    front: Two chips split a matmul along the contracted dim $D$ and exchange $[B, F]$ partial sums. When is it compute-bound?
+    back: |
+      $D/2 > C/W$, i.e. $D > 2C/W \approx 8755$ for a v5e with $4.5\times10^{10}$ B/s per direction. Independent of $B$.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 1 (Rooflines) §"Matrix multiplication"
+    front: Derive the critical batch size for a bf16 matmul on a TPU v5e, and state the assumptions.
+    back: |
+      - FLOPs $2BDF$; bytes $2BD + 2DF + 2BF$.
+      - $I = BDF/(BD + DF + BF)$. Assume $B \ll D, F$ (per-chip batch ≲ 1k tokens; $D, F$ ≳ 8k): $I \approx B$.
+      - Compute-bound iff $I > C/W = 1.97\times10^{14}/8.2\times10^{11} \approx 240$, so $B > 240$.
+      - Interpretation: weights dominate bytes and each is reused across $B$ tokens.
+      - Caveats: $B$ is tokens per replica; small $D, F$ raise the exact threshold (≈ 450 at 1024); precision changes it ($B_\text{crit} = (C/W)\,b_w/2$).
+  - id: f9
+    type: open
+    source: 'Scaling Book ch. 1 (Rooflines), Question 2; Scaling Book ch. 7 §"Linear operations: what bottlenecks us?"'
+    front: Explain to an interviewer why weight-only int8 quantization speeds up small-batch LLM inference even though the math stays in bf16.
+    back: |
+      - At small batch, matmuls are bandwidth-bound: time ≈ weight bytes / HBM bandwidth.
+      - int8 weights halve those bytes, so memory-bound steps get up to 2× faster.
+      - Intensity becomes $2BDF/DF = 2B$, so $B_\text{crit}$ falls from 240 to 120 on a v5e: compute-bound at half the batch.
+      - The math is unchanged (bf16 FLOPs at bf16 peak), which avoids low-precision-arithmetic accuracy issues; weights are dequantized on the fly.
+      - Contrast: int8 math too keeps $B_\text{crit}$ at 240, since peak doubles as bytes halve.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 1 (Rooflines), Question 4; Scaling Book ch. 7 §"What about attention?"
+    front: Why can't batching make a per-example matmul, such as decode attention over KV caches, compute-bound?
+    back: |
+      - Batching helps only when tokens share operands: one weight load serves $B$ tokens.
+      - With per-example matrices ($[B, D]\cdot[B, D, F]$), bytes $\approx BDF$ and FLOPs $2BDF$: intensity ≈ 2, independent of $B$.
+      - In decode attention each sequence reads its own KV cache, so the same structure holds: intensity ≈ 1 FLOP/byte for MHA.
+      - Bigger batches add proportionally more bytes; the only levers are fewer bytes (GQA/MQA, KV quantization) or faster memory.
+  - id: f11
+    type: open
+    source: Scaling Book ch. 1 (Rooflines) §"Network communication rooflines"
+    front: For the two-chip contraction-split matmul, derive the compute-bound condition and explain why it depends on D but not B.
+    back: |
+      - Each chip does half the FLOPs: $T_\text{math} = 2BDF/(2C) = BDF/C$.
+      - Each sends its $[B, F]$ bf16 partial sum: $T_\text{comms} = 2BF/W$.
+      - Ratio: $T_\text{math}/T_\text{comms} = DW/(2C)$, so compute-bound iff $D > 2C/W \approx 8755$ (v5e, 4.5e10 B/s).
+      - $B$ and $F$ scale both FLOPs and bytes shipped, so they cancel. $D$ measures how much local work goes into each output element that must be sent.
+
+reading:
+  - title: "Scaling Book ch. 1: All About Rooflines"
+    url: https://jax-ml.github.io/scaling-book/roofline/
+    kind: book
+    note: '"Matrix multiplication", "Network communication rooflines" and Problems 1–5, which this lesson works through.'
+  - title: "Scaling Book ch. 7: All About Transformer Inference"
+    url: https://jax-ml.github.io/scaling-book/inference/
+    kind: book
+    note: '"Linear operations: what bottlenecks us?" applies the same matmul roofline to prefill and decode, with quantization.'
+  - title: "JAX Pallas docs: TPU matrix multiplication kernel"
+    url: https://docs.jax.dev/en/latest/pallas/tpu/matmul.html
+    kind: docs
+    note: Shows how tile (block) sizes change a real TPU matmul's performance, matching the tile-intensity argument.
+  - title: "NVIDIA, GPU Performance Background User's Guide"
+    url: https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html
+    kind: docs
+    note: The GPU version of the same arithmetic-intensity reasoning for matmuls and elementwise ops.

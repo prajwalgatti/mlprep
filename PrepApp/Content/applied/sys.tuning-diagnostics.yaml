@@ -1,0 +1,460 @@
+id: sys.tuning-diagnostics
+area: applied
+title: "Tuning Playbook: Diagnosing Training Failures"
+summary: What training curves reveal, why instability caps the learning rate (η < 2/λ_max), and the playbook's protocols for warmup, gradient clipping and architectural fixes.
+order: 350
+level: intermediate
+tags: [tuning, training-instability, warmup, gradient-clipping, tuning-playbook]
+prereqs: [sys.tuning-steps-schedules]
+
+explainer:
+  - title: "Read the curves, not just the final number"
+    body: |
+      ![Four synthetic patterns (validation solid, training dashed). A: problematic overfitting. B: noisy late validation. C: still improving at the end. D: saturated early.](sys.tuning-diagnostics/curve-gallery)
+
+      A study reduces each trial to one number, which hides a lot. The playbook says to always look at the training and validation curves of at least the best few trials, and to ask:
+
+      **Is there problematic overfitting?** This means the validation error starts *rising* during training (panel A). Check at least the best trial for each scientific value. If any of them overfits, add or re-tune regularization (dropout, label smoothing, weight decay are cheap) *before* comparing. Otherwise you'd conclude, say, that more layers is worse, when it was just under-regularized. The exception is when the scientific hyperparameter is itself a regularizer.
+
+      **The selection trap.** Picking the best trial per setting favours configurations that happen to regularize. Anything that hobbles optimisation, such as a too-small LR, can act as a regularizer. So overfitting in *any* trial is a warning that the "best" trials may have been picked for the wrong reasons.
+
+      **High step-to-step variance late in training?** (panel B). Then the final number depends on whether the run ended on a lucky step, which hurts comparisons and reproducibility. Likely causes: batch noise, a small validation set, an LR too high late in training. Remedies: a larger batch, more validation data, LR decay, Polyak averaging.
+
+      **Still improving at the end?** (panel C). The run is compute-bound: train longer or change the schedule.
+
+      **Saturated long before the end?** (panel D). Steps are being wasted, so `max_train_steps` can shrink.
+
+      **Red flags:**
+      - Training loss *increasing* usually means a bug in the pipeline.
+      - Periodic oscillation in validation metrics (with shuffled splits) suggests train/validation overlap or improper shuffling. Evaluating at fixed *step* intervals makes the period visible.
+    source: Tuning Playbook §"Examining the training curves", §"Setting up periodic evaluations"
+
+  - title: "What limits the learning rate: the stability threshold"
+    body: |
+      ![Gradient descent on $\tfrac12\lambda x^2$. The iterate scales by $(1-\eta\lambda)$ each step, so it diverges once $\eta\lambda>2$.](sys.tuning-diagnostics/stability-threshold)
+
+      **Derivation on a quadratic.** Near a minimum, $L(\theta)\approx\tfrac12\theta^\top H\theta$. Gradient descent gives $\theta_{t+1}=(I-\eta H)\theta_t$. Write $\theta$ in the eigenbasis of $H$: if $u_i$ has eigenvalue $\lambda_i$ and $c_i=u_i^\top\theta$, then
+
+      $$c_{i,t+1}=(1-\eta\lambda_i)\,c_{i,t}.$$
+
+      Each component converges iff $|1-\eta\lambda_i|<1$, i.e. $0<\eta\lambda_i<2$. All of them converge iff
+
+      $$\eta<\frac{2}{\lambda_{max}}.$$
+
+      For $1<\eta\lambda_i<2$ the component flips sign every step but shrinks. Past 2 it flips and grows: in the quadratic model, the loss shoots up along the sharpest direction. The top eigenvalue $\lambda_{max}$ is called the **sharpness**. Example: $\lambda_{max}=50$ allows $\eta<0.04$.
+
+      This is the threshold *for plain GD on a quadratic*. The next card covers what changes with a moving Hessian, momentum and Adam.
+
+      **The playbook's framing.** Any workload is unstable at a large enough LR. Instability is only a *problem* when it forces you to use an LR smaller than you would otherwise want. There are two kinds:
+      1. **Early instability**, at initialisation or in the first steps.
+      2. **Sudden mid-training instability**, such as spikes after a long steady decline.
+    source: Tuning Playbook §"Identifying unstable workloads"; Cohen et al. 2021 §2
+
+  - title: "Limits of the quadratic picture"
+    body: |
+      $\eta<2/\lambda_{max}$ is exact only for GD on a fixed quadratic. Three refinements matter in practice.
+
+      **The Hessian moves: the edge of stability.** Cohen et al. (2021) found that under full-batch GD the sharpness tends to *rise* during training (progressive sharpening) until it reaches about $2/\eta$. Then, contrary to the quadratic prediction, training does **not** diverge: the loss keeps falling, non-monotonically over short spans, while the sharpness hovers near $2/\eta$. So $2/\eta$ marks where the *local* quadratic model predicts blow-up; the dynamics push the iterate toward flatter regions instead. Divergence happens when they cannot, which is what Gilmer et al. (2021) saw: runs that diverged had entered regions with $\lambda_1>2/\eta$ early ($\lambda_1$ = top Hessian eigenvalue) and failed to escape, while successful setups avoided or left high-curvature regions. Normalization, good initialisation and warmup all help by keeping early curvature in check.
+
+      **Momentum.** For heavy-ball momentum with coefficient $\beta$, the quadratic stability threshold becomes
+
+      $$\lambda_{max}<\frac{2+2\beta}{\eta},$$
+
+      so $\beta=0.9$ tolerates sharpness up to $3.8/\eta$ (Cohen et al.).
+
+      **Adam.** The relevant quantity is the sharpness of the *preconditioned* Hessian, $\lambda_{max}(D^{-1/2}HD^{-1/2})$, with $D$ Adam's diagonal preconditioner. There is no clean threshold: Gilmer et al. found $2/\eta$ did not fit their Adam-trained Transformers, an empirical $40/\eta$ did, and they leave the adaptive case open. For Adam workloads (like the worked example later), treat the curvature story as qualitative.
+    source: Cohen et al. 2021 §2–3; Gilmer et al. 2021 §1, §3, App. (Adam, p.18)
+
+  - title: "Detecting instability"
+    body: |
+      The playbook gives a systematic check.
+      1. **Sweep the LR** and find the best value, $lr^*$.
+      2. **Plot training-loss curves for LRs just above $lr^*$.**
+      3. If they show loss *going up* during stretches of training, fixing the instability will probably improve results, because it would make those higher LRs usable.
+
+      **Signs in a study:**
+      - **The axis plot.** The best LR sits right at the edge of the infeasible region (all trials above some LR diverge or give abnormally high loss).
+      - **The training curve at 5–10× the best LR.** A sudden rise in loss after a steady decline (e.g. at step ~10k) confirms an optimisation instability, as opposed to a simply-too-large LR that fails from the start.
+
+      **Log the gradient norm.** Record the L2 norm of the full gradient every step. Outlier values reveal spikes that can cause apparently random mid-training instability. The same log sets the clipping threshold later.
+
+      **Early instability can be invisible.** Some models show a burst of instability in the first few hundred steps, then recover into slow but stable training. If you evaluate every 1000 steps, you never see it, and simply get a mediocre model. The check: run an abbreviated job of about **500 steps at $2\times$ the current best LR, evaluating every step.** If the loss spikes early, you have found a stability problem that warmup or initialisation fixes can address.
+
+      **Infeasible fraction.** If many trials in a study diverge (and not just at the top of the LR range), consider a bug, or reparameterise the search space.
+    source: Tuning Playbook §"Identifying unstable workloads", §"When to apply learning rate warmup", §"Identifying bad search space boundaries"
+
+  - title: "Learning-rate warmup: why and how"
+    body: |
+      **Why warmup works.** It ramps the LR from 0 to the peak over the first steps. Three complementary explanations:
+      - *A rapidly changing network* (Goyal et al. 2017): early on, weights move fast, so a large initial LR overshoots.
+      - *Curvature* (Gilmer et al. 2021). Early iterates often sit in sharp regions where $\lambda_1>2/\eta_{peak}$. With a small LR the run stays stable while $\lambda_1$ falls (they observed this during warmup), and then the peak LR is tolerable. Warmup matched normalization and better initialisations as a stabiliser.
+      - *Adam's statistics* (a common hypothesis, e.g. behind RAdam; Liu et al. 2020). Bias correction removes the zero-init bias, but early second-moment estimates rest on few samples, so early steps are poorly scaled.
+
+      **The playbook's protocol.** Suppose an LR, `unstable_base_learning_rate`, is the first one at which the model becomes unstable.
+      1. Target a peak, `base_learning_rate`, **at least one order of magnitude larger**, so 10× by default (100× as a repeat). This is the authors' heuristic, and the 10× peak is a *probe* for finding the shortest stabilising warmup, not the final training LR.
+      2. Ramp linearly from 0 to the peak over `warmup_steps`, then hold it for `post_warmup_steps` (2 × `warmup_steps` is usually fine).
+      3. Sweep `warmup_steps` over orders of magnitude, e.g. $\{10, 10^3, 10^4, 10^5\}$, each ≤10% of `max_train_steps`. Choose the **shortest** that trains stably at the peak.
+      4. *Prepend* it to the existing schedule (10,000 steps + 1,000 warmup = 11,000) and compare with retrospective checkpoint selection.
+      5. If warmup exceeds 5% of `max_train_steps`, increase the budget.
+
+      **Caveats.** Re-tune the peak LR after adding warmup; the best may land well below 10×. In the curvature picture, a 10× peak needs $\lambda_1$ to fall about 10× during warmup, which can fail, and warmup does nothing for mid-training instability. Typical lengths range from ~100 steps to 40k+ for some Transformers. Open questions the playbook flags: how clipping and warmup should interact.
+    source: Tuning Playbook §"Learning rate warmup", §"How to apply learning rate warmup"; Gilmer et al. 2021 §4; Goyal et al. 2017 §2.2
+
+  - title: "Gradient clipping: threshold and limits"
+    body: |
+      ![Synthetic gradient norms. A whole-run 90th-percentile threshold clips 10% of steps by construction: the 25 spikes, but mostly (78% of clips) the elevated first 500 steps. Check how clipping is distributed over time, not just the fraction.](sys.tuning-diagnostics/grad-norm-clipping)
+
+      **The operation.** With threshold $\lambda$ and the full gradient $g$ (one vector over all parameters):
+
+      $$g'=\begin{cases}g & \|g\|\le\lambda\\ \lambda\,g/\|g\| & \|g\|>\lambda\end{cases}$$
+
+      The direction is unchanged, and only the length is capped. So a single SGD step can move at most $\eta\lambda$.
+
+      **When it helps.** Large or outlier gradients: early instability and mid-training spikes. It rescues some bad initialisations warmup cannot, and vice versa.
+
+      **Choosing the threshold** (the playbook's recipe):
+      - Log the *unclipped* norm; plot it against step and as a histogram.
+      - Set the threshold just above the "typical" norm; the **90th percentile** is a good, workload-dependent start.
+      - If the instability persists, clip harder (lower the threshold). Whether the threshold should adapt over training is an open question the playbook flags.
+
+      **When almost every step is clipped (plain SGD).** Every update is $-\eta\lambda\,g/\|g\|$: normalized gradient descent with step length $\eta\lambda$, and an effective LR on the raw gradient of $\eta\lambda/\|g\|$. This isn't bad in itself. Zhang et al. (2020) observed that local smoothness grows with the gradient norm, and proved that clipped or normalized GD can converge faster than any fixed step, *because* its effective LR adapts. The playbook's objection is practical: magnitude information is lost, $\eta$ and $\lambda$ collapse into one product, and the run behaves like a different, untuned optimizer. So it treats **more than 50% of steps clipped** as "extremely aggressive" and prefers lowering the LR.
+
+      **Under Adam** the equivalence doesn't hold. Clipping rescales the inputs to $m$ and $v$, and Adam is roughly invariant to a slowly varying gradient scale, so constant clipping is not a lower LR. The >50% rule then rests on the threshold, rather than the LR, having become the knob that controls the steps.
+    source: Tuning Playbook §"Gradient clipping"; Zhang et al. 2020 §1; PyTorch docs clip_grad_norm_
+
+  - title: "Architecture and optimizer fixes"
+    body: |
+      The playbook's list of fixes for instability, roughly in order of preference:
+      1. **Warmup**: best for early instability.
+      2. **Gradient clipping**: early or mid-training spikes.
+      3. **Try another optimizer.** Adam sometimes handles instabilities that momentum can't. This is an active research area.
+      4. **Use best-practice architecture and initialisation:**
+         - Add **residual connections and normalization** if they're missing.
+         - Put **normalization inside the residual branch**: $x+f(\mathrm{Norm}(x))$ (Pre-LN), not $\mathrm{Norm}(x+f(x))$ (Post-LN).
+         - **Initialise residual branches to zero** (e.g. ReZero).
+      5. **Lower the LR**, as a last resort.
+
+      **Why the norm placement matters.**
+      - In Pre-LN, $x_{l+1}=x_l+f(\mathrm{Norm}(x_l))$, so the residual stream carries an *untouched identity path* from input to output. Gradients reach every layer directly.
+      - In Post-LN, $x_{l+1}=\mathrm{Norm}(x_l+f(x_l))$, so the stream is renormalised after every block, and the identity path passes through every LayerNorm.
+      - Xiong et al. (2020) proved with mean-field theory that at initialisation the Post-LN Transformer has *large* expected gradients for parameters near the output, so a large LR is unstable and warmup becomes essential. Pre-LN gradients are well-behaved, and they trained Pre-LN models without warmup.
+
+      **Why zero-initialised branches help.** With $x_{l+1}=x_l+\alpha_l f(x_l)$ and $\alpha_l=0$ at the start (ReZero), the network begins as the identity map. Early curvature is low, and each block switches on gradually as $\alpha_l$ is learned. Goyal et al.'s trick of initialising the last BatchNorm scale $\gamma=0$ in each residual block has the same effect.
+
+      **Transformer-specific extras** (outside the playbook): qk-layernorm against attention-logit growth, z-loss against output-logit divergence, and smaller Adam $\epsilon$ when gradient RMS gets tiny (Wortsman et al. 2023). These belong to the LLM training-stability lesson.
+    source: Tuning Playbook §"Potential fixes for common instability patterns"; Xiong et al. 2020 §1, §3; Bachlechner et al. 2020 §3; Goyal et al. 2017 §5; Wortsman et al. 2023 §3
+
+  - title: "A worked diagnosis"
+    body: |
+      **Situation.** A Transformer trained with Adam, 100k steps. (For Adam, the curvature thresholds are only qualitative; the playbook's protocol is empirical and still applies.) A quasi-random study over the peak LR (log scale, $10^{-4}$ to $10^{-2}$) finds a best LR of $1.5\times10^{-3}$. Every trial above $2\times10^{-3}$ diverges.
+
+      **Step 1: suspect instability, not a natural optimum.** The best point hugs the infeasible cliff, the playbook's signature of a stability-limited LR.
+
+      **Step 2: confirm it.** Plot the training loss at $5\times$ and $10\times$ the best LR. Both decrease for ~8k steps, then spike. That pattern (steady decline, then a sudden rise) points to mid-training instability. A 500-step run at $3\times10^{-3}$, evaluated every step, also shows a burst in the first 100 steps, so there is early instability too.
+
+      **Step 3: warmup.** Take `unstable_base_learning_rate` $=2\times10^{-3}$ and target a $10\times$ peak of $2\times10^{-2}$. Sweep `warmup_steps` $\in\{10,10^3,10^4\}$; $10^5$ is excluded because it exceeds 10% of the 100k steps. Suppose $10^3$ fails and $10^4$ trains stably. Prepend it, so the run becomes 110k steps. Since $10^4$ is 10% of the budget (>5%), consider raising `max_train_steps`.
+
+      **Step 4: clipping for the mid-training spikes.** The gradient-norm log shows a typical norm near 1 with rare spikes above 10. Set the threshold at the 90th percentile (say 1.8). Then recompute the percentile on the new warmed-up, higher-LR run, because the norm distribution shifts, and check *when* clipping happens (spikes vs a whole phase).
+
+      **Step 5: re-tune.** The fixes changed the pipeline, so rerun the LR study after widening the range to include ~$3\times10^{-2}$. Expect the best LR to move up and to sit *inside* the search space this time, and compare against the baseline (both retrained with several seeds) before adopting.
+
+      If none of this works, check the architecture (Pre-LN, residual zero-init) and only then accept a lower LR.
+    source: Tuning Playbook §"How can optimization failures be debugged and mitigated?"
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Your loss spikes and diverges mid-training. What do you do?"* Check the gradient-norm log for outliers, plot curves just above $lr^*$, then try clipping (90th-percentile threshold), warmup, an optimizer change, and architecture fixes (Pre-LN, residual zero-init). Lower the LR last. Also rule out data issues (a bad batch).
+      - *"Why does warmup help?"* Early in training the network changes fast and the curvature can be high ($\lambda_1>2/\eta$ in the GD picture). A small initial LR stays stable while the dynamics move to flatter regions; plausibly it also lets Adam's second-moment estimates settle.
+      - *"Derive the maximum stable LR for GD on a quadratic."* Each eigencomponent scales by $1-\eta\lambda_i$, so stability needs $\eta<2/\lambda_{max}$. With momentum $\beta$: $\lambda_{max}<(2+2\beta)/\eta$. Real GD hovers at $2/\eta$ without diverging (edge of stability); for Adam no clean threshold is known.
+      - *"How do you pick a clipping threshold?"* Log unclipped norms and take about the 90th percentile. If more than half the steps are clipped, the playbook lowers the LR instead: for SGD, constant clipping is normalized GD with step $\eta\lambda$, an untuned optimizer with the magnitude information thrown away.
+      - *"Pre-LN or Post-LN?"* Pre-LN keeps an identity path, which gives well-behaved gradients at initialisation and needs little or no warmup. Post-LN has large gradients near the output at initialisation (Xiong et al.).
+      - *"Validation loss rises while training loss falls. Do you pick the smaller model?"* Not yet. First add or tune regularization, then compare.
+      - *"How can instability hide?"* Early spikes followed by recovery are missed by sparse evaluation. Run ~500 steps at $2\times$ the best LR with per-step eval.
+    source: Tuning Playbook FAQ "How can optimization failures be debugged and mitigated?"
+
+  - title: "Key results"
+    body: |
+      - Inspect curves for the best trials. Problematic overfitting (validation rising) means regularize, then compare. Late noise comes from batch noise, a small validation set, or a high late LR. Still improving means compute-bound. Saturated early means cut steps. Rising training loss means a bug. Periodic validation means leakage or a shuffling bug.
+      - GD on a quadratic:
+
+      $$c_{t+1}=(1-\eta\lambda_i)c_t\ \Rightarrow\ \eta<\frac{2}{\lambda_{max}}$$
+
+      This is the quadratic/GD threshold. With momentum, $(2+2\beta)/\eta$; real GD hovers at $2/\eta$ without diverging (edge of stability); for Adam, no clean threshold.
+      - Detect: LR sweep, then curves above $lr^*$; an infeasible cliff next to the best LR; spikes after a steady decline; ~500 steps at $2\times lr^*$ with per-step eval.
+      - Warmup protocol (a heuristic probe): peak = 10× the unstable LR, then re-tune the peak; sweep warmup over $10^1$ to $10^5$ (≤10% of steps); post-warmup = 2× warmup; prepend and add the steps; extend the budget if warmup is >5%.
+      - Clipping:
+
+      $$g'=\lambda g/\|g\|\ \text{if}\ \|g\|>\lambda$$
+
+      with threshold ≈ the 90th percentile of unclipped norms (check when clips happen). More than 50% clipped: lower the LR (for SGD it's normalized GD; under Adam it isn't a lower LR).
+      - Fixes in order: warmup, clipping, optimizer, residual + Pre-LN + zero-init branches; lower the LR last.
+    source: Tuning Playbook §"Examining the training curves", FAQ "How can optimization failures be debugged and mitigated?"
+
+quiz:
+  - id: q1
+    prompt: |
+      ![Four synthetic training-curve patterns (validation solid, training dashed).](sys.tuning-diagnostics/curve-gallery-quiz)
+
+      Which panel shows **problematic overfitting**, in the playbook's sense?
+    correct: C
+    wrong:
+      - A
+      - B
+      - D
+    explanation: |
+      Problematic overfitting means the validation error *rises* at some point while training continues to improve (C). A is still improving (compute-bound), B saturates early (steps can be cut), and D shows late step-to-step noise. A train–validation gap alone, as in B, is not problematic overfitting.
+    source: Tuning Playbook §"Examining the training curves"
+
+  - id: q2
+    prompt: |
+      The best 12-layer trial shows validation loss rising in the second half of training, while the best 6-layer trial doesn't. The study's goal is "does depth help?". What should you do first?
+    correct: Add or re-tune regularization, then compare depths again
+    wrong:
+      - Conclude that 6 layers is better and adopt it right away
+      - Stop training the 12-layer model at its best checkpoint and compare
+      - Lower the learning rate for the 12-layer model only
+    explanation: |
+      If a best trial overfits problematically, the comparison partly measures regularization, not depth. Regularizers like dropout, weight decay and label smoothing are cheap to add. Lowering the LR as a regularizer is the selection trap the playbook warns about. Comparing best checkpoints doesn't help either: retrospective selection already does that, and the comparison would still partly measure regularization.
+    source: Tuning Playbook §"Examining the training curves"
+
+  - id: q3
+    prompt: |
+      Gradient descent on a quadratic whose Hessian has largest eigenvalue $\lambda_{max}=50$. What is the largest learning rate for which GD converges?
+    correct: Just under 0.04
+    wrong:
+      - Just under 0.02, since $\eta\lambda$ must stay below 1
+      - Just under 0.1
+      - Just under 0.004
+    explanation: |
+      Each eigencomponent scales by $1-\eta\lambda_i$ per step and converges iff $|1-\eta\lambda_i|<1$, so $\eta<2/50=0.04$. $\eta\lambda<1$ (giving 0.02) is the condition for *monotone*, non-oscillating convergence, not for convergence itself.
+    source: Tuning Playbook §"Identifying unstable workloads"; Cohen et al. 2021 §2
+
+  - id: q4
+    prompt: |
+      Along an eigendirection with $\eta\lambda=1.5$, how does GD's iterate behave?
+    correct: It flips sign each step and shrinks by a factor of 0.5
+    wrong:
+      - It decreases monotonically by a factor of 0.5 per step
+      - It flips sign each step and grows by a factor of 1.5
+      - It stays constant, since $\eta\lambda>1$ cancels the gradient
+    explanation: |
+      The multiplier is $1-\eta\lambda=-0.5$: alternating sign, magnitude halving each step. It converges because $|{-0.5}|<1$. Divergence needs $\eta\lambda>2$.
+    source: Tuning Playbook §"Identifying unstable workloads"
+
+  - id: q5
+    prompt: |
+      In an LR sweep, the best LR is $10^{-3}$, and at $5\times10^{-3}$ the loss decreases steadily for 10k steps, then suddenly jumps up. What does the playbook conclude?
+    correct: The model likely has an optimisation instability worth fixing
+    wrong:
+      - $5\times10^{-3}$ is simply too large, and nothing can be done
+      - The training data must contain a corrupted shard at step 10k
+      - The validation set is too small to evaluate those runs
+    explanation: |
+      A sudden rise after a steady decline at LRs just above the best is the playbook's check for instability. Fixing it (warmup, clipping, architecture) would make higher LRs usable and likely improve results. Any model diverges at a high enough LR, but this pattern means stability, not the LR's natural optimum, is the binding constraint.
+    source: Tuning Playbook §"Identifying unstable workloads", §"When to apply learning rate warmup"
+
+  - id: q6
+    prompt: |
+      Why does the playbook recommend a short run of ~500 steps at $2\times$ the best LR, **evaluating every step**?
+    correct: Early spikes that later recover are missed by sparse evals
+    wrong:
+      - Per-step evaluation regularizes the model during warmup
+      - It measures the final validation error more cheaply
+      - It is the only way to compute the gradient norm
+    explanation: |
+      Some models blow up in the first few hundred steps and then recover into slow, stable training. Evaluating every 1000 steps misses the burst entirely. A short, high-LR, densely evaluated run exposes it.
+    source: Tuning Playbook §"Identifying unstable workloads"
+
+  - id: q7
+    prompt: |
+      A model becomes unstable at LR $10^{-3}$. Following the playbook's warmup protocol, what peak LR do you try first, and how long is the constant phase if warmup is 2,000 steps?
+    correct: '$10^{-2}$, with 4,000 post-warmup steps'
+    wrong:
+      - '$2\times10^{-3}$, with 2,000 post-warmup steps'
+      - '$10^{-3}$, with 4,000 post-warmup steps'
+      - '$10^{-1}$, with 1,000 post-warmup steps'
+    explanation: |
+      The default target is a `base_learning_rate` an order of magnitude above `unstable_base_learning_rate`, so 10×, and `post_warmup_steps = 2 × warmup_steps` is usually fine. The aim is the shortest warmup that allows that higher peak. It is a heuristic probe: after adding the warmup, re-tune the peak LR, which may end up well below 10×.
+    source: Tuning Playbook §"How to apply learning rate warmup"
+
+  - id: q8
+    prompt: |
+      A baseline trains for 20,000 steps. You find that 2,000 warmup steps stabilise a higher peak LR. Per the playbook, how many steps should the new run take, and what else should you consider?
+    correct: 22,000 steps, and maybe a larger budget (warmup is >5%)
+    wrong:
+      - 20,000 steps, with the warmup carved out of the existing budget
+      - 18,000 steps, since a higher peak LR converges faster
+      - 22,000 steps, with no further changes needed at all
+    explanation: |
+      Warmup is *prepended* to the existing schedule, so 20,000 + 2,000. The playbook adds that warmups above 5% of `max_train_steps` (here 10%) may need a larger budget to compensate.
+    source: Tuning Playbook §"How to apply learning rate warmup"
+
+  - id: q9
+    prompt: |
+      Training with plain SGD, you clip at threshold $\lambda$ and 80% of steps are clipped. What is training effectively doing, and what does the playbook advise?
+    correct: Normalized GD with step $\eta\lambda$; lower the LR instead
+    wrong:
+      - Ordinary SGD at LR $\eta$; keep the threshold
+      - Adam with $\epsilon=\lambda$; switch to SGD
+      - Gradient accumulation over $1/\lambda$ steps; raise the threshold
+    explanation: |
+      When clipped, the SGD update is $-\eta\lambda\,g/\|g\|$: fixed length, gradient direction, effective LR $\eta\lambda/\|g\|$. That is a different, untuned optimizer with the gradient magnitude discarded, so the playbook calls more than 50% clipped "extremely aggressive" and prefers to cut the LR. (Under Adam this equivalence doesn't hold.)
+    source: Tuning Playbook §"Gradient clipping"
+
+  - id: q10
+    prompt: |
+      A colleague sets the clipping threshold at the *median* of the logged unclipped gradient norms. What fraction of steps gets clipped, and how does the playbook classify that?
+    correct: About half; right at the edge of "extremely aggressive"
+    wrong:
+      - About 10%; the playbook's recommended starting point
+      - About 90%; the playbook's recommended starting point
+      - None; the median sits below the typical gradient norm
+    explanation: |
+      By definition half the norms exceed the median, so about 50% of steps are clipped. The playbook treats more than 50% as extremely aggressive, so this is borderline. Its starting point is the 90th percentile, which clips about 10% by construction.
+    source: Tuning Playbook §"Gradient clipping"
+
+  - id: q11
+    prompt: |
+      Which statement about Pre-LN vs Post-LN Transformers is **false**?
+    correct: Post-LN keeps an untouched identity path, so it needs no warmup
+    wrong:
+      - Pre-LN computes $x+f(\mathrm{Norm}(x))$ in each residual block
+      - Xiong et al. found large expected gradients near the output at init for Post-LN
+      - The playbook lists normalization inside the residual as a stability fix
+    explanation: |
+      It's the other way round. Pre-LN keeps the identity path ($x_{l+1}=x_l+f(\mathrm{Norm}(x_l))$), while Post-LN renormalises the residual stream after every block. Post-LN's large near-output gradients at initialisation are why it needs warmup.
+    source: Xiong et al. 2020 §1; Tuning Playbook §"Potential fixes for common instability patterns"
+
+  - id: q12
+    prompt: |
+      Why does initialising each residual branch to output zero (e.g. ReZero, or $\gamma=0$ in a block's last BatchNorm) improve stability?
+    correct: The network starts as the identity, with low curvature
+    wrong:
+      - It removes the need for any learning rate schedule
+      - It makes all gradients exactly zero at initialisation
+      - It halves the number of parameters that receive updates
+    explanation: |
+      With $x_{l+1}=x_l+\alpha f(x_l)$ and $\alpha=0$, signals and gradients pass straight through at the start, and the blocks switch on gradually. Gradients are not zero: $\alpha$ (or $\gamma$) and earlier layers still receive gradient, which is how the branches become active.
+    source: Bachlechner et al. 2020 §3; Goyal et al. 2017 §5; Tuning Playbook §"Potential fixes for common instability patterns"
+
+  - id: q13
+    prompt: |
+      Validation accuracy oscillates with a regular period across training, and the train/validation/test split was shuffled. What does the playbook suggest checking?
+    correct: Train/validation overlap, or broken data shuffling
+    wrong:
+      - A learning rate that is still too low late in training
+      - Too few trials in the hyperparameter study
+      - Numerical underflow in the evaluation loop
+    explanation: |
+      Periodicity tied to passes through the data suggests the model is seeing validation examples during training, or that the data order repeats. Evaluating at regular *step* intervals makes such periods easy to spot.
+    source: Tuning Playbook §"Setting up periodic evaluations"
+
+cards:
+  - id: f1
+    front: Four questions the playbook asks of the best trials' training curves.
+    back: |
+      1. Problematic overfitting (validation rising)? Regularize, then compare.
+      2. High step-to-step variance late? Larger batch, more validation data, LR decay, Polyak averaging.
+      3. Still improving at the end? Compute-bound: train longer or change the schedule.
+      4. Saturated early? Cut `max_train_steps`.
+    source: Tuning Playbook §"Examining the training curves"
+
+  - id: f2
+    front: Maximum stable learning rate for GD on a quadratic, and the per-eigendirection update.
+    back: |
+      $$c_{i,t+1}=(1-\eta\lambda_i)\,c_{i,t}$$
+
+      Stable iff $\eta<2/\lambda_{max}$. It oscillates for $1<\eta\lambda<2$ and diverges for $\eta\lambda>2$. Scope: plain GD on a fixed quadratic. Momentum $\beta$: $\lambda_{max}<(2+2\beta)/\eta$. Real GD sits at the edge of stability ($\approx2/\eta$) without diverging; for Adam no clean threshold is known.
+    source: Tuning Playbook §"Identifying unstable workloads"; Cohen et al. 2021 §2
+
+  - id: f3
+    front: The playbook's warmup protocol, in numbers.
+    back: |
+      - Probe peak = 10× `unstable_base_learning_rate` (heuristic; re-tune the peak afterwards).
+      - Linear ramp over `warmup_steps`, then constant for `2 × warmup_steps`.
+      - Sweep `warmup_steps` ∈ {10, 10³, 10⁴, 10⁵}, each ≤ 10% of `max_train_steps`. Take the shortest stable one.
+      - Prepend it to the schedule (add the steps). If >5% of the budget, extend `max_train_steps`.
+    source: Tuning Playbook §"How to apply learning rate warmup"
+
+  - id: f4
+    front: Gradient clipping by norm; the threshold rule; when to stop clipping.
+    back: |
+      If $\|g\|>\lambda$: $g'=\lambda g/\|g\|$ (direction kept).
+
+      Threshold ≈ 90th percentile of the unclipped norms; check when clips occur. If >50% of steps are clipped, the playbook lowers the LR instead. For SGD, constant clipping is normalized GD with step $\eta\lambda$; under Adam it is not a lower LR.
+    source: Tuning Playbook §"Gradient clipping"
+
+  - id: f5
+    front: The playbook's list of fixes for instability, in order.
+    back: |
+      1. LR warmup (early instability).
+      2. Gradient clipping (early or mid spikes).
+      3. Try a new optimizer (Adam can handle what momentum can't).
+      4. Best-practice architecture: residuals + normalization, norm *inside* the residual ($x+f(\mathrm{Norm}(x))$), zero-init residual branches.
+      5. Lower the LR (last resort).
+    source: Tuning Playbook §"Potential fixes for common instability patterns"
+
+  - id: f6
+    front: How to tell whether a model's best LR is limited by instability.
+    back: |
+      The axis plot shows the best LR at the edge of the infeasible region. Training curves at LRs just above the best (5–10×) show loss rising after a steady decline. Also check early instability with ~500 steps at 2× the best LR, evaluating every step.
+    source: Tuning Playbook §"Identifying unstable workloads", §"When to apply learning rate warmup"
+
+  - id: f7
+    front: Why does Pre-LN train more stably than Post-LN?
+    back: |
+      Pre-LN, $x_{l+1}=x_l+f(\mathrm{Norm}(x_l))$, keeps an identity path through the residual stream. Post-LN, $\mathrm{Norm}(x_l+f(x_l))$, renormalises after every block. Xiong et al. proved that Post-LN has large expected gradients near the output at initialisation, so it needs warmup; Pre-LN can drop it.
+    source: Xiong et al. 2020 §1, §3
+
+  - id: f8
+    type: open
+    front: "Explain to an interviewer why learning-rate warmup works."
+    back: |
+      - **Curvature view.** On a quadratic, GD is stable only if $\eta<2/\lambda_{max}$ (with momentum, $(2+2\beta)/\eta$; for Adam the analogue is unclear). At initialisation many networks sit in sharp regions. Gilmer et al. measured $\lambda_1$ and found divergent runs exceed $2/\eta$ early, while warmup keeps $\eta$ small as $\lambda_1$ falls, reaching flatter regions that tolerate the peak LR.
+      - **Linear-scaling view** (Goyal). Large LRs assume gradients change slowly across steps, which fails early when weights move fast.
+      - **Adam view** (hypothesis, e.g. RAdam). Early second-moment estimates are noisy, so early steps are poorly scaled.
+      - **Architecture link.** Post-LN Transformers have large gradients near the output at initialisation (Xiong), which is why they need warmup more than Pre-LN.
+      - **Practice.** Warmup is cheap, transfers well from short runs, and its length is tuned over orders of magnitude (the playbook's protocol, with a 10× probe peak that you re-tune afterwards). It does nothing for mid-training spikes.
+    source: Gilmer et al. 2021 §4; Goyal et al. 2017 §2.2; Xiong et al. 2020; Tuning Playbook §"Learning rate warmup"
+
+  - id: f9
+    type: open
+    front: "Your training loss spikes to NaN at step 30k of 100k. Walk through your debugging."
+    back: |
+      1. **Logs**: gradient-norm history (spikes before the NaN?), loss per batch (a specific bad batch?), LR at that step (still at peak?).
+      2. **Reproduce cheaply**: resume from the last checkpoint and see whether it is deterministic and data-dependent.
+      3. **Classify**: mid-training instability, as opposed to early. Check whether nearby higher LRs also spike after a steady decline (the playbook's check).
+      4. **Fixes in order**: gradient clipping at about the 90th-percentile norm; a lower peak or faster decay if clipping would be constant (>50%); optimizer settings (Adam, lower $\beta_2$, smaller $\epsilon$ for tiny gradient RMS); architecture (Pre-LN, zero-init residuals; for Transformers, qk-layernorm and z-loss).
+      5. **Precision**: rule out fp16 overflow or loss-scaling issues.
+      6. **Re-tune**: after any fix, rerun the LR study. The best LR should now sit inside the search space.
+    source: Tuning Playbook FAQ "How can optimization failures be debugged and mitigated?"; Wortsman et al. 2023 §3
+
+  - id: f10
+    type: open
+    front: "Derive what 'constant gradient clipping' does to SGD and why the playbook says to lower the LR instead."
+    back: |
+      - Clipping: $g'=\lambda g/\|g\|$ when $\|g\|>\lambda$.
+      - If every step is clipped, $\theta_{t+1}=\theta_t-\eta\lambda\,g_t/\|g_t\|$: normalized gradient descent with fixed step length $\eta\lambda$.
+      - In terms of the raw gradient, the effective LR is $\eta\lambda/\|g_t\|$, which shrinks whenever gradients are large. This adaptivity can help (Zhang et al. 2020 show clipped GD can beat any fixed step when smoothness grows with the gradient norm), but it is an implicit LR schedule nobody tuned.
+      - The magnitude information in $\|g\|$ is thrown away, and $\eta$ and $\lambda$ become redundant (only their product matters).
+      - So if >50% of steps clip, the playbook sets the LR directly (lower) and keeps clipping for rare outliers. That is clearer, tunable and reproducible.
+      - Scope: this is SGD. Under Adam, clipping rescales the inputs to $m$ and $v$ and Adam is roughly scale-invariant, so constant clipping is not a lower LR; the threshold has simply become the knob controlling steps.
+    source: Tuning Playbook §"Gradient clipping"; Zhang et al. 2020 §1
+
+reading:
+  - title: "Deep Learning Tuning Playbook: 'How can optimization failures be debugged and mitigated?'"
+    url: https://github.com/google-research/tuning_playbook#how-can-optimization-failures-be-debugged-and-mitigated
+    kind: docs
+    note: Instability detection, the warmup protocol and the clipping rule. This lesson's figures are synthetic illustrations, not redraws of the playbook's.
+  - title: "Gilmer et al. 2021, A Loss Curvature Perspective on Training Instability in Deep Learning"
+    url: https://arxiv.org/abs/2110.04369
+    kind: paper
+    note: Measures λ₁ against 2/η across models and shows how warmup, initialisation and normalization address the same failure.
+  - title: "Cohen et al. 2021, Gradient Descent on Neural Networks Typically Occurs at the Edge of Stability"
+    url: https://arxiv.org/abs/2103.00065
+    kind: paper
+    note: Progressive sharpening and the 2/η threshold for full-batch GD.
+  - title: "Xiong et al. 2020, On Layer Normalization in the Transformer Architecture"
+    url: https://arxiv.org/abs/2002.04745
+    kind: paper
+    note: Why Post-LN needs warmup and Pre-LN does not.

@@ -1,0 +1,494 @@
+id: fund.sgd-momentum
+area: fundamentals
+title: "SGD, Momentum & Learning-Rate Schedules"
+summary: Why minibatch gradients work, why constant-step SGD stalls at a noise floor, how momentum turns κ into √κ, Nesterov and the convention zoo, and the learning-rate schedules used in practice.
+order: 410
+level: core
+tags: [optimization, sgd, momentum, learning-rate, schedules]
+prereqs: [fund.gradient-descent]
+
+explainer:
+  - title: "From GD to SGD: unbiased minibatch gradients"
+    body: |
+      **The problem.** The training loss is an average over $N$ examples,
+
+      $$F(w)=\frac1N\sum_{i=1}^N f_i(w),$$
+
+      where $f_i$ is the loss on example $i$. One exact gradient costs $N$ per-example gradients, and $N$ can be in the billions. Gradient descent would make one step per full pass over the data.
+
+      **Minibatch SGD.** Sample a batch $\mathcal B$ of $B$ indices uniformly at random and step along the batch-average gradient:
+
+      $$g_{\mathcal B}=\frac1B\sum_{i\in\mathcal B}\nabla f_i(w),\qquad w\leftarrow w-\eta\,g_{\mathcal B}$$
+
+      **Unbiased.** For one uniformly drawn index, $\mathbb E[\nabla f_i]=\sum_i\frac1N\nabla f_i=\nabla F$. By linearity of expectation, $\mathbb E[g_{\mathcal B}]=\nabla F$. This holds with or without replacement, because each slot of the batch is uniformly distributed on its own.
+
+      **Variance.** Let $\Sigma$ be the covariance of a single per-example gradient around $\nabla F$. If the $B$ draws are independent (sampling with replacement), the covariance of their average is
+
+      $$\mathrm{Cov}(g_{\mathcal B})=\Sigma/B.$$
+
+      Sampling without replacement multiplies this by $(N-B)/(N-1)$, which is negligible when $B\ll N$.
+
+      **Why SGD wins for large $N$.**
+      - The noise standard deviation falls only like $1/\sqrt B$. 100× more examples per step buys only 10× less noise.
+      - Datasets are redundant: many examples contribute similar gradients.
+      - The cost per step doesn't grow with $N$, so SGD makes progress long before a full pass is done.
+
+      **Terms.** An *epoch* is one pass over the data, $N/B$ steps. "Batch gradient descent" means the full gradient. In deep learning papers, "SGD" usually means minibatch SGD, often with momentum.
+    source: Goodfellow DL §8.1.3, §8.3.1; Bottou et al. 2018 §3.3
+
+  - title: "Constant steps stall; decaying steps converge"
+    body: |
+      Apply the quadratic upper bound of an $L$-smooth $F$ to the random step $w^+=w-\eta g$ and take expectations. With $g$ unbiased, $\mathbb E\|g\|^2=\|\nabla F\|^2+\sigma^2/B$, where $\sigma^2=\mathrm{tr}\,\Sigma$. That gives
+
+      $$\begin{aligned}\mathbb E F(w^+)\le F(w)&-\eta\big(1-\tfrac{L\eta}2\big)\|\nabla F\|^2\\&+\frac{L\eta^2\sigma^2}{2B}\end{aligned}$$
+
+      The first line is GD's descent lemma. The second is a noise penalty that does **not** vanish at the optimum, where $\nabla F=0$.
+
+      **The noise floor.** Assume $F$ is $\mu$-strongly convex, so $\|\nabla F\|^2\ge2\mu(F-F^*)$, and take $\eta\le1/L$. Then the gap $\Delta=\mathbb E F-F^*$ obeys $\Delta^+\le(1-\eta\mu)\Delta+L\eta^2\sigma^2/(2B)$. Its fixed point is
+
+      $$\Delta_\infty=\frac{L\,\eta\,\sigma^2}{2\mu B}.$$
+
+      So constant-step SGD converges linearly, but only to a **floor proportional to $\eta\sigma^2/B$**. The exact one-dimensional version, $\approx\eta\sigma^2/(4B)$, is derived and simulated in sys.tuning-steps-schedules. Three ways to lower the floor: decay $\eta$, increase $B$, or average the iterates.
+
+      ![SGD with noisy gradients on a 2-D quadratic (synthetic). Constant η leaves a cloud around the optimum; a decaying η shrinks it.](fund.sgd-momentum/sgd-noise-ball)
+
+      **Robbins–Monro conditions.** A decreasing schedule converges if
+
+      $$\textstyle\sum_t\eta_t=\infty,\qquad\sum_t\eta_t^2<\infty.$$
+
+      The first lets the iterates travel any distance: with a finite sum of steps and bounded gradients, the total movement is bounded and could stop short of the optimum. The second keeps the total injected noise variance, $\propto\sum\eta_t^2\sigma^2$, finite. $\eta_t=\beta/(\gamma+t)$ satisfies both and gives $\mathbb E\Delta_t=O(1/t)$ for strongly convex $F$. The rate is $O(1/\sqrt t)$ for convex $F$. SGD cannot do better in general, even though GD converges linearly, because each GD step costs $N$ gradients.
+
+      **Polyak averaging** reports $\bar w_k=\frac1k\sum_{i\le k}w_i$, or an exponential moving average, which cancels much of the jitter. **Variance-reduced** methods (SVRG, SAGA) get linear rates on finite sums. But their cost to reach accuracy $\varepsilon$ scales like $(N+\kappa)\log(1/\varepsilon)$, which grows with $N$, while SGD's does not, so they rarely pay off for huge datasets and deep nets.
+    source: Bottou et al. 2018 §4.1 (Lemma 4.2), §4.2 (Thms 4.6–4.7), §5.3.3, §5.4; Goodfellow DL §8.3.1, §8.7.3
+
+  - title: "Batch size and the linear scaling rule"
+    body: |
+      **Steps to reach a target vs batch size.** While gradient noise dominates, doubling $B$ halves the noise variance, which lets you roughly double $\eta$ and halve the number of steps: **perfect scaling**. Once the batch gradient is already accurate, curvature (not noise) caps the step at about $2/\lambda_{max}$, and a bigger batch stops helping. Between the two regimes lies a **critical batch size**, beyond which returns diminish (Shallue et al. 2019; McCandlish et al. 2018). sys.tuning-batch-size derives it from the gradient noise scale.
+
+      **Linear scaling rule** (Goyal et al. 2017): multiply $B$ by $k$, multiply $\eta$ by $k$. The one-line reason: $k$ consecutive steps at $\eta$ on batches of size $B$ move the weights by $-\eta\sum_j g_j$. One step at $k\eta$ on their union (size $kB$) moves them by $-k\eta\cdot\frac1k\sum_jg_j$, the same, **if** the gradient barely changes over those $k$ steps. Goyal et al. went from LR 0.1 at batch 256 to 3.2 at batch 8192 on ImageNet.
+
+      **Where it breaks.**
+      - *Early in training*: the weights change fast, so the "gradient barely changes" assumption fails. Goyal et al. ramp the LR up over 5 epochs (warmup).
+      - *At large $k$*: $k\eta$ eventually exceeds the curvature limit.
+      - *In practice*: Shallue et al. found that the best LR followed neither the linear nor the square-root rule consistently. Re-tune the LR at each batch size.
+
+      **Momentum and batch size.** In the noisy quadratic model, momentum speeds up training only at **large** batch sizes. At small batch sizes, it is roughly interchangeable with a larger LR (Zhang et al. 2019). That is why Shallue et al. compare runs by the effective LR $\eta/(1-\beta)$ (next card).
+    source: Goyal et al. 2017 §2.1–2.2; Shallue et al. 2019 §2.2, §4.7; Zhang et al. 2019 §1; McCandlish et al. 2018 §2.2
+
+  - title: "Momentum: averaging gradients over time"
+    body: |
+      **The problem.** On an ill-conditioned problem, GD bounces across the steep walls of a valley while crawling along its flat floor (fund.gradient-descent). SGD adds jitter on top. Idea: give the iterate a velocity that remembers past gradients.
+
+      **Heavy-ball momentum** (Polyak):
+
+      $$\begin{aligned}v_{k+1}&=\beta v_k-\eta\nabla f(x_k)\\ x_{k+1}&=x_k+v_{k+1}\end{aligned}$$
+
+      with $\beta\in[0,1)$. Equivalently, $x_{k+1}=x_k-\eta\nabla f(x_k)+\beta(x_k-x_{k-1})$: a GD step plus a fraction of the last displacement. Physically, it is a ball rolling with friction ($1-\beta$).
+
+      **Unroll it** (starting from $v_0=0$):
+
+      $$x_{k+1}=x_k-\eta\sum_{j=0}^{k}\beta^{k-j}\nabla f(x_j)$$
+
+      The step is an exponentially weighted sum of past gradients, with a memory of about $1/(1-\beta)$ steps. Two consequences follow from geometric series:
+      - **Consistent gradient $g$** (along the valley floor): the step tends to $\eta g/(1-\beta)$. With $\beta=0.9$ that is a 10× larger effective LR.
+      - **Alternating gradient $\pm g$** (bouncing between walls): $\sum_j(-\beta)^j=1/(1+\beta)$, so the step tends to $\eta g/(1+\beta)\approx0.53\,\eta g$.
+
+      So momentum amplifies persistent directions by $(1+\beta)/(1-\beta)=19$ relative to oscillating ones. It also averages minibatch noise, since components that keep changing sign cancel.
+
+      ![Same η on $f=\tfrac12(x^2+50y^2)$, 40 steps. GD kills the steep direction but crawls along $x$; heavy ball races along the floor but swings across it; Nesterov damps the swing.](fund.sgd-momentum/momentum-ravine)
+    source: Goodfellow DL §8.3.2 (eq. 8.17); Bottou et al. 2018 §7.1; Sutskever et al. 2013 §2
+
+  - title: "Why momentum gets √κ: the quadratic analysis"
+    body: |
+      On $f=\frac12x^\top Ax$, the eigencoordinates decouple as for GD. Along one eigendirection with curvature $\lambda$, the two-step form reads
+
+      $$x_{k+1}=(1+\beta-\eta\lambda)\,x_k-\beta\,x_{k-1}.$$
+
+      This is a linear recurrence. Try $x_k=z^k$:
+
+      $$z^2-(1+\beta-\eta\lambda)\,z+\beta=0.$$
+
+      **The key fact.** The product of the two roots is $\beta$. When they are complex (a conjugate pair), they have equal modulus, so $|z|=\sqrt\beta$ **whatever $\lambda$ is**. The roots are complex when $|1+\beta-\eta\lambda|<2\sqrt\beta$, i.e.
+
+      $$(1-\sqrt\beta)^2<\eta\lambda<(1+\sqrt\beta)^2.$$
+
+      **Tuning.** Pick $\eta,\beta$ so this band exactly covers the spectrum $[\mu,L]$: $\eta\mu=(1-\sqrt\beta)^2$ and $\eta L=(1+\sqrt\beta)^2$. Dividing the two gives $\kappa=\big(\frac{1+\sqrt\beta}{1-\sqrt\beta}\big)^2$, so
+
+      $$\sqrt{\beta^*}=\frac{\sqrt\kappa-1}{\sqrt\kappa+1},\quad\eta^*=\frac{4}{(\sqrt L+\sqrt\mu)^2}$$
+
+      Every eigendirection then contracts by $\sqrt{\beta^*}\approx1-2/\sqrt\kappa$ per step, against GD's best $(\kappa-1)/(\kappa+1)\approx1-2/\kappa$. For $\kappa=100$ that is $9/11\approx0.818$ against $0.980$. A $10^6$-fold reduction takes about 69 steps instead of about 691.
+
+      ![Contraction per step for each curvature, $\mu=1$, $L=100$. Heavy ball contracts every direction in $[\mu,L]$ by the same $\sqrt\beta$; GD's flat directions barely move.](fund.sgd-momentum/momentum-contraction)
+
+      **Stability.** A real root reaches $z=-1$ when $1+(1+\beta-\eta\lambda)+\beta=0$. So heavy ball is stable iff $\eta\lambda<2+2\beta$: with $\beta=0.9$ it tolerates sharpness up to $3.8/\eta$, against GD's $2/\eta$.
+
+      **Scope.** This needs $\mu$ and $L$, and exact gradients. With noisy gradients the asymptotic advantage disappears. Momentum's practical gains come in the early, transient phase, when gradient directions persist across steps.
+    source: Bottou et al. 2018 §7.1 (eq. 7.2); Cohen et al. 2021 §2 (eq. 1); Sutskever et al. 2013 §2
+
+  - title: "Nesterov momentum and the convention zoo"
+    body: |
+      **Nesterov's accelerated gradient**, in Sutskever et al.'s form, evaluates the gradient at the **look-ahead** point $x_k+\beta v_k$:
+
+      $$\begin{aligned}v_{k+1}&=\beta v_k-\eta\nabla f(x_k+\beta v_k)\\ x_{k+1}&=x_k+v_{k+1}\end{aligned}$$
+
+      **Why it helps.** If the momentum part $\beta v$ is about to carry the iterate up a wall, the gradient at the look-ahead point already points back. So the velocity is corrected one step earlier. On a quadratic, $\nabla f(x+\beta v)=\lambda(x+\beta v)$, which gives $v'=\beta(1-\eta\lambda)v-\eta\lambda x$: heavy ball with an **effective momentum $\beta(1-\eta\lambda)$**. High-curvature directions get less momentum and oscillate less, which is the damping in the ravine figure.
+
+      **Caveats.**
+      - Its maximum stable sharpness is *lower* than heavy ball's: $(2+2\beta)/((1+2\beta)\eta)$, about $1.36/\eta$ at $\beta=0.9$, against $3.8/\eta$.
+      - With exact gradients on convex smooth problems, it improves GD's $O(1/k)$ to $O(1/k^2)$. With stochastic gradients it does not improve SGD's rate.
+
+      **Conventions.** The same algorithm is written several ways:
+      - *Classical* (Sutskever, Goodfellow et al.): the LR sits inside the velocity, as above.
+      - *PyTorch, TensorFlow, the Tuning Playbook*: a buffer $u\leftarrow\beta u+g$, then $x\leftarrow x-\eta u$. The Nesterov variant steps $x\leftarrow x-\eta(g+\beta u)$.
+      - At constant $\eta$ they are equivalent, with $v=-\eta u$. The library Nesterov iterate is Sutskever's look-ahead point.
+      - **They differ when $\eta$ changes.** In the buffer form, an LR drop immediately rescales the whole accumulated velocity. In the classical form, the old velocity keeps its old LR and decays over about $1/(1-\beta)$ steps.
+      - Symbols vary: Goodfellow et al. write $\alpha$ for momentum and $\epsilon$ for the LR; the playbook and Shallue et al. write $\gamma$.
+    source: Sutskever et al. 2013 §2, §2.1; Goodfellow DL §8.3.3; Cohen et al. 2021 §2 (eq. 1); Tuning Playbook FAQ "What are the update rules for all the popular optimization algorithms?"
+
+  - title: "Learning-rate schedules"
+    body: |
+      **Why decay at all?** The noise floor scales with $\eta$, and Robbins–Monro needs $\eta_t\to0$. But a small $\eta$ from the start is slow. So start large and decay. Notation: peak $\eta_{max}$, warmup length $w$, total steps $T$, and $\tau=(t-w)/(T-w)$, the fraction of the post-warmup run completed.
+
+      ![Five schedule families after a 500-step linear warmup (from sys.tuning-steps-schedules).](sys.tuning-steps-schedules/schedule-families)
+
+      - **Step decay**: multiply by about 0.1 at fixed milestones (the classic ResNet recipe).
+      - **Exponential** $\eta_0\gamma^t$, and **$1/t$** $\eta_0/(1+t/t_0)$. The latter meets the Robbins–Monro conditions.
+      - **Linear decay** $\eta_{max}(1-\tau)$. Goodfellow et al. suggest decaying linearly to about 1% of the initial value.
+      - **Cosine**:
+
+      $$\eta_t=\eta_{min}+\tfrac12(\eta_{max}-\eta_{min})(1+\cos\pi\tau)$$
+
+      It lingers near the peak, falls fastest mid-run and flattens at the end. **SGDR** restarts it periodically.
+      - **Warmup–stable–decay (WSD)**: warmup, a long constant phase, then a short final decay (a "cooldown"). Because a cooldown can be branched off any checkpoint, the run length need not be fixed in advance. Hägele et al. (2024) found it matches cosine.
+      - **Linear warmup** from 0 to $\eta_{max}$ over $w$ steps, before any of the above. Three reasons: early on the weights change fast and the curvature can exceed $2/\eta_{max}$; large-batch linear scaling needs it; and Adam's early second-moment estimates are noisy (fund.adam). sys.tuning-diagnostics covers this in detail.
+
+      **Choosing.** Linear and cosine both depend on $T$, so a schedule tuned for one run length doesn't transfer to another. The Tuning Playbook's default is linear or cosine decay. It calls the best family an open question, but is confident that *some* decay, tuned, matters (sys.tuning-steps-schedules). For the initial LR, Goodfellow et al. advise watching the first iterations and choosing a value somewhat above the one that looks best early on, but below the point of severe instability. An *LR range test* (a short run with the LR raised geometrically) automates that search.
+    source: Goodfellow DL §8.3.1; Loshchilov & Hutter 2017 §3; Hägele et al. 2024 §3; Goyal et al. 2017 §2.2; Tuning Playbook FAQ "Which learning rate decay should I use as a default?"
+
+  - title: "Practical knobs and pitfalls"
+    body: |
+      - **Effective LR.** With momentum, the step along a consistent direction is $\eta/(1-\beta)$. Raising $\beta$ from 0.9 to 0.99 at fixed $\eta$ multiplies it by 10. Compare optimizer settings at matched effective LR, or you confound momentum with step size.
+      - **LR and batch size trade off.** In the noise-dominated regime, what matters is the noise scale, roughly $\eta/B$. Smith et al. (2018) used this to replace LR decay with batch-size growth ("don't decay the learning rate, increase the batch size"), reaching similar accuracy in fewer parameter updates.
+      - **Weight decay couples to the LR.** For SGD, an L2 coefficient $\lambda'$ shrinks the weights by a factor $1-\eta\lambda'$ per step, so a decaying schedule also decays the regularization (fund.adam).
+      - **Gradient clipping by global norm.** $g\leftarrow g\cdot\min(1,c/\|g\|)$, with $\|g\|$ taken over *all* parameters, keeps the direction and caps the step length. It protects against cliffs and outlier batches. Clipping each tensor separately would change the direction. Thresholds and diagnostics: sys.tuning-diagnostics.
+      - **Gradient accumulation.** Averaging the gradients of $k$ micro-batches of size $b$ before stepping reproduces a batch of size $kb$, when the loss is a per-example mean. It is not exact with BatchNorm, whose statistics are computed per micro-batch.
+      - **Porting hyperparameters.** Check the momentum convention, check whether the loss is summed or averaged (summing multiplies the effective LR by $B$), and remember that schedules are tied to $T$.
+      - **"SGD"** in a paper usually means minibatch SGD with (often Nesterov) momentum.
+    source: Shallue et al. 2019 §2.2; Smith et al. 2018 §2; Loshchilov & Hutter 2019 §2 (Prop. 1); Goodfellow DL §8.2.4
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Why is the minibatch gradient a valid direction?"* It is unbiased: each sampled index is uniform. Its covariance is $\Sigma/B$ for independent draws.
+      - *"Why does constant-LR SGD not converge?"* The expected-descent bound has a term $L\eta^2\sigma^2/(2B)$ that doesn't vanish at the optimum, so iterates hover at a floor $\propto\eta\sigma^2/B$. Fix it with decay, a larger batch or averaging.
+      - *"State the Robbins–Monro conditions and explain them."* $\sum\eta_t=\infty$ (can reach anywhere) and $\sum\eta_t^2<\infty$ (finite total noise).
+      - *"GD converges linearly; SGD only at $O(1/t)$. Why use SGD?"* Its cost per step doesn't depend on $N$, the data are redundant, and test error can't fall faster than $O(1/k)$ in the number of examples $k$ anyway, so faster optimization buys little.
+      - *"What does momentum do?"* EMA of gradients: about $1/(1-\beta)$ amplification along consistent directions, $1/(1+\beta)$ damping of oscillations. On quadratics the optimal $\beta$ gives $(\sqrt\kappa-1)/(\sqrt\kappa+1)$; derive it from the characteristic equation.
+      - *"Nesterov vs heavy ball?"* Gradient at the look-ahead point; it acts like reduced momentum in stiff directions; $O(1/k^2)$ deterministically, no gain stochastically; a lower stability limit.
+      - *"Why warmup?"* Early instability (fast-changing weights, high curvature), large-batch scaling, Adam's noisy early statistics.
+      - *"Linear scaling rule?"* $\eta\propto B$, because $k$ small steps ≈ one big step when gradients change slowly. It breaks early in training and past the critical batch size.
+    source: Bottou et al. 2018 §4, §7; Goodfellow DL §8.1.3, §8.3; Goyal et al. 2017 §2
+
+  - title: "Key results"
+    body: |
+      - $\mathbb E g_{\mathcal B}=\nabla F$, $\mathrm{Cov}=\Sigma/B$ (independent draws; times $(N-B)/(N-1)$ without replacement).
+      - Expected descent:
+
+      $$\mathbb EF^+\le F-\eta(1-\tfrac{L\eta}2)\|\nabla F\|^2+\tfrac{L\eta^2\sigma^2}{2B}$$
+
+      Constant $\eta$ gives a floor $L\eta\sigma^2/(2\mu B)$ (1-D: $\approx\eta\sigma^2/(4B)$).
+      - Robbins–Monro: $\sum\eta_t=\infty$, $\sum\eta_t^2<\infty$. SGD rates: $O(1/t)$ strongly convex, $O(1/\sqrt t)$ convex.
+      - Linear scaling: $B\times k\Rightarrow\eta\times k$, with warmup; it fails past the critical batch size.
+      - Heavy ball: $v\leftarrow\beta v-\eta g$, $x\leftarrow x+v$. Consistent direction ×$1/(1-\beta)$, oscillation ×$1/(1+\beta)$.
+      - Quadratic optimum:
+
+      $$\sqrt{\beta^*}=\frac{\sqrt\kappa-1}{\sqrt\kappa+1},\ \eta^*=\frac{4}{(\sqrt L+\sqrt\mu)^2}$$
+
+      Stability $\eta\lambda<2+2\beta$ (Nesterov: $(2+2\beta)/(1+2\beta)$).
+      - Nesterov: gradient at $x+\beta v$; effective momentum $\beta(1-\eta\lambda)$; $O(1/k^2)$ deterministic only.
+      - Cosine: $\eta_{min}+\frac12(\eta_{max}-\eta_{min})(1+\cos\pi\tau)$. WSD = warmup, constant, short cooldown. The playbook's default is linear or cosine.
+    source: Bottou et al. 2018 §4, §7; Cohen et al. 2021 §2; Goyal et al. 2017; Loshchilov & Hutter 2017
+
+quiz:
+  - id: q1
+    prompt: |
+      Heavy-ball momentum with $\beta=0.9$ and learning rate $\eta$. The gradient alternates $+g,-g,+g,\dots$ for many steps. What is the steady-state step magnitude?
+    correct: About $0.53\,\eta g$
+    wrong:
+      - About $10\,\eta g$
+      - Exactly $\eta g$, as with no momentum
+      - About $0.1\,\eta g$
+    explanation: |
+      The step is $\eta\sum_j\beta^j(\pm g)$ with alternating signs: $\eta g\sum_j(-\beta)^j=\eta g/(1+\beta)=\eta g/1.9\approx0.53\,\eta g$. The $10\,\eta g$ figure, $1/(1-\beta)$, applies to a *consistent* gradient. Momentum damps oscillating components and amplifies persistent ones.
+    source: Goodfellow DL §8.3.2; Bottou et al. 2018 §7.1
+
+  - id: q2
+    prompt: |
+      A quadratic with $\kappa=100$. Compare GD at its best fixed step with heavy-ball momentum at its best $(\eta,\beta)$. To shrink the error $10^6$-fold, roughly how do the step counts compare?
+    correct: Momentum needs about 10× fewer steps (≈69 vs ≈691)
+    wrong:
+      - Momentum needs about 100× fewer steps (≈7 vs ≈691)
+      - Momentum needs about 2× fewer steps (≈345 vs ≈691)
+      - Both need about the same number of steps
+    explanation: |
+      GD contracts by $99/101$ per step and heavy ball by $(\sqrt{100}-1)/(\sqrt{100}+1)=9/11$. Then $\ln10^{-6}/\ln(99/101)\approx691$ and $\ln10^{-6}/\ln(9/11)\approx69$. The step count goes from $\propto\kappa$ to $\propto\sqrt\kappa$, a $\sqrt{100}=10$-fold saving, not 100-fold.
+    source: Bottou et al. 2018 §7.1 (eq. 7.2)
+
+  - id: q3
+    prompt: |
+      Along one eigendirection, heavy ball satisfies $z^2-(1+\beta-\eta\lambda)z+\beta=0$. When the two roots are complex, what is the per-step contraction $|z|$?
+    correct: '$\sqrt\beta$, the same for every $\lambda$ in that band'
+    wrong:
+      - '$\beta$, since that is the constant term'
+      - '$|1-\eta\lambda|$, exactly as for plain gradient descent'
+      - '$\beta\,|1-\eta\lambda|$, shrinking as $\lambda$ grows'
+    explanation: |
+      The product of the roots equals the constant term, $\beta$. Complex roots are a conjugate pair with equal modulus, so $|z|^2=\beta$ and $|z|=\sqrt\beta$, independent of $\lambda$. That is why tuning $\beta$ so the band covers $[\mu,L]$ gives one uniform rate. Reading off $\beta$ forgets the square root.
+    source: Bottou et al. 2018 §7.1
+
+  - id: q4
+    prompt: |
+      Which step-size schedule satisfies **both** Robbins–Monro conditions, $\sum_t\eta_t=\infty$ and $\sum_t\eta_t^2<\infty$?
+    correct: '$\eta_t=\eta_0/(t+1)$'
+    wrong:
+      - '$\eta_t=\eta_0/(t+1)^2$'
+      - '$\eta_t=\eta_0/\sqrt{t+1}$'
+      - '$\eta_t=\eta_0$ (constant)'
+    explanation: |
+      $\sum1/t$ diverges (harmonic series) while $\sum1/t^2$ converges. With $1/t^2$ the steps themselves are summable, so the iterates can stall short of the optimum. With $1/\sqrt t$ the steps sum to infinity, but $\sum\eta_t^2=\sum1/t$ diverges too, so the noise never averages out. (It is still used in convex analyses together with iterate averaging.) A constant step fails the second condition and leaves a noise floor.
+    source: Goodfellow DL §8.3.1 (eqs. 8.12–8.13); Bottou et al. 2018 §4.2
+
+  - id: q5
+    prompt: |
+      The minibatch gradient is unbiased under uniform sampling. Which **additional** assumption does the formula $\mathrm{Cov}(g_{\mathcal B})=\Sigma/B$ need?
+    correct: The $B$ indices are drawn independently (with replacement)
+    wrong:
+      - Each per-example loss $f_i$ is a convex function of $w$
+      - The full gradient $\nabla F(w)$ equals zero at the current $w$
+      - The batch size $B$ divides the dataset size $N$ exactly
+    explanation: |
+      Unbiasedness needs only that each slot is marginally uniform (linearity of expectation). The $1/B$ variance needs the draws to be uncorrelated. Sampling without replacement makes them slightly negatively correlated, giving $\frac{\Sigma}{B}\cdot\frac{N-B}{N-1}$. Convexity plays no role in either property.
+    source: Goodfellow DL §8.1.3
+
+  - id: q6
+    prompt: |
+      ![Four learning-rate schedules over a 10k-step run, each starting with a linear warmup.](fund.sgd-momentum/schedules-quiz)
+
+      Which panel shows **cosine decay** after the warmup?
+    correct: C
+    wrong:
+      - A
+      - B
+      - D
+    explanation: |
+      Cosine decay stays near the peak at first, falls fastest mid-run and flattens near zero at the end (C). A falls at a constant slope (linear decay). B holds the peak and then drops in a short final phase (warmup–stable–decay). D drops in discrete jumps (step decay).
+    source: Loshchilov & Hutter 2017 §3; Hägele et al. 2024 §3
+
+  - id: q7
+    prompt: |
+      Which statement about Nesterov momentum is **false**?
+    correct: It improves SGD's $O(1/t)$ rate on strongly convex stochastic problems
+    wrong:
+      - It evaluates the gradient at the look-ahead point $x+\beta v$
+      - On a quadratic it acts like heavy ball with momentum $\beta(1-\eta\lambda)$
+      - With exact gradients on convex smooth problems it achieves $O(1/k^2)$
+    explanation: |
+      Acceleration is a deterministic result. With stochastic gradients, Nesterov (like heavy ball) can improve constants and the transient phase, but not the asymptotic rate. The effective-momentum statement follows from $\nabla f(x+\beta v)=\lambda(x+\beta v)$ on a quadratic.
+    source: Goodfellow DL §8.3.3; Sutskever et al. 2013 §2
+
+  - id: q8
+    prompt: |
+      Momentum $\beta=0.9$, in PyTorch's form ($u\leftarrow\beta u+g$, $x\leftarrow x-\eta u$). At step $t$ you cut $\eta$ by 10×. Compared with the classical form ($v\leftarrow\beta v-\eta g$, $x\leftarrow x+v$), what happens to the **next** update?
+    correct: PyTorch's shrinks 10× at once; the classical one keeps its old velocity
+    wrong:
+      - Both shrink about 10× at once, because the two forms are always equivalent
+      - Neither changes for about 10 steps, until the old momentum has decayed away
+      - The classical one shrinks 10× at once, while PyTorch's keeps its old velocity
+    explanation: |
+      In the buffer form, the whole accumulated $u$ is multiplied by the new $\eta$, so the step drops immediately. In the classical form, $v$ already contains the old LR, and only the new gradient term is scaled down. The old velocity then decays by $\beta$ per step. The forms are equivalent only at constant $\eta$.
+    source: Tuning Playbook FAQ "What are the update rules for all the popular optimization algorithms?"; Sutskever et al. 2013 §2
+
+  - id: q9
+    prompt: |
+      Which statement about batch size is **false**?
+    correct: Doubling the batch size always halves the steps needed to reach a target
+    wrong:
+      - The minibatch gradient's variance falls in proportion to $1/B$ for independent draws
+      - The linear scaling rule needs warmup early in training
+      - Past a critical batch size, larger batches give diminishing returns in steps
+    explanation: |
+      Perfect scaling (half the steps per doubling) holds only while gradient noise is the bottleneck. Once the batch gradient is accurate, curvature limits the step, and extra examples per step are largely wasted. The other three statements are standard.
+    source: Shallue et al. 2019 §4; Goyal et al. 2017 §2.2
+
+  - id: q10
+    prompt: |
+      Which is the **most defensible** reason to use a linear learning-rate warmup?
+    correct: Fast-changing weights and high early curvature make the peak LR unstable
+    wrong:
+      - It acts as a regularizer that improves the final test accuracy of the model
+      - It lets the weights move far away from their initialization very quickly
+      - It is needed for SGD to satisfy the Robbins–Monro convergence conditions
+    explanation: |
+      Early in training the network changes rapidly, and the curvature can exceed $2/\eta_{max}$. A small LR keeps the run stable until it reaches flatter regions; for large batches and Adam there are extra reasons. Warmup does the opposite of moving the weights fast, and Robbins–Monro concerns decay, not ramp-up. Any regularization effect is a side note, not the mechanism.
+    source: Goyal et al. 2017 §2.2; Gilmer et al. 2021 §4
+
+  - id: q11
+    prompt: |
+      Constant-step SGD with unbiased noisy gradients on a smooth, strongly convex objective, with $\eta\le1/L$. What does $\mathbb E[F(w_k)]-F^*$ do as $k\to\infty$?
+    correct: Falls linearly at first, then levels off at a floor $\propto\eta\sigma^2/B$
+    wrong:
+      - Falls linearly all the way to zero, at the same rate as gradient descent
+      - Falls to zero at rate $O(1/k)$, the same as with a decaying step schedule
+      - Grows without bound, because the gradient noise keeps accumulating forever
+    explanation: |
+      The expected-descent bound has a GD-like contraction $(1-\eta\mu)$ plus a constant noise term $L\eta^2\sigma^2/(2B)$. The recursion converges geometrically to the fixed point $L\eta\sigma^2/(2\mu B)$, not to zero. The noise doesn't accumulate without bound, because the contraction keeps pulling the iterate back.
+    source: Bottou et al. 2018 §4.2 (Thm 4.6)
+
+  - id: q12
+    prompt: |
+      Full-batch heavy-ball momentum with $\eta=0.01$ and $\beta=0.9$ on a quadratic. What is the largest top-eigenvalue $\lambda_{max}$ for which it is stable?
+    correct: '$380$'
+    wrong:
+      - '$200$'
+      - '$136$'
+      - '$2000$'
+    explanation: |
+      The real root reaches $-1$ at $\eta\lambda=2+2\beta=3.8$, so $\lambda_{max}<380$. 200 is plain GD's $2/\eta$. About 136 is the Nesterov limit $(2+2\beta)/((1+2\beta)\eta)$. 2000 comes from wrongly scaling GD's limit by the effective-LR factor $1/(1-\beta)$.
+    source: Cohen et al. 2021 §2 (eq. 1)
+
+  - id: q13
+    prompt: |
+      SVRG and SAGA converge linearly on finite sums, while SGD converges sublinearly. Why are they rarely used to train large networks on huge datasets?
+    correct: Their cost to reach ε grows with N, while SGD's cost does not
+    wrong:
+      - They require the loss to be convex, so they fail on any network
+      - They need second-order information, which is too expensive
+      - Their iterates are biased, so they converge to the wrong point
+    explanation: |
+      Their work scales like $(N+\kappa)\log(1/\varepsilon)$, because they need periodic full-gradient passes or stored per-example gradients. SGD's work scales like $\kappa^2/\varepsilon$, independent of $N$. For very large $N$ they behave like batch methods. Nonconvex variants exist, so convexity isn't the blocker, and they use only first-order information.
+    source: Bottou et al. 2018 §5.3.3
+
+cards:
+  - id: f1
+    front: Show that the minibatch gradient is unbiased and give its covariance.
+    back: |
+      For one uniform index, $\mathbb E\nabla f_i=\frac1N\sum_i\nabla f_i=\nabla F$. By linearity, $\mathbb E g_{\mathcal B}=\nabla F$, with or without replacement.
+
+      With independent draws, $\mathrm{Cov}(g_{\mathcal B})=\Sigma/B$, where $\Sigma$ is the per-example covariance. Without replacement, multiply by $(N-B)/(N-1)$. The standard error scales as $1/\sqrt B$.
+    source: Goodfellow DL §8.1.3
+
+  - id: f2
+    front: State the Robbins–Monro conditions and why each is needed.
+    back: |
+      $$\textstyle\sum_t\eta_t=\infty,\qquad\sum_t\eta_t^2<\infty$$
+
+      The first lets the iterates travel arbitrarily far; otherwise the total movement is bounded. The second makes the total injected noise variance finite, so the iterates settle. Example: $\eta_t=\eta_0/(1+t/t_0)$.
+    source: Goodfellow DL §8.3.1; Bottou et al. 2018 §4.2
+
+  - id: f3
+    front: Constant-step SGD on a smooth, μ-strongly convex objective. What happens, and what are SGD's rates with decaying steps?
+    back: |
+      Linear convergence to a floor $\mathbb EF-F^*\to L\eta\sigma^2/(2\mu B)$, proportional to $\eta/B$ (1-D exact: $\approx\eta\sigma^2/(4B)$). To lower it: decay $\eta$, raise $B$, or average iterates.
+
+      With decaying steps: $O(1/t)$ for strongly convex and $O(1/\sqrt t)$ for convex objectives, against GD's linear rate (but each GD step costs $N$ gradients).
+    source: Bottou et al. 2018 §4.2; Goodfellow DL §8.3.1
+
+  - id: f4
+    front: Write heavy-ball momentum, its unrolled form, and its gain along consistent vs oscillating directions.
+    back: |
+      $$\begin{aligned}v_{k+1}&=\beta v_k-\eta\nabla f(x_k)\\x_{k+1}&=x_k+v_{k+1}\end{aligned}$$
+
+      Unrolled: $x_{k+1}=x_k-\eta\sum_j\beta^{k-j}\nabla f(x_j)$, an exponentially weighted sum of past gradients. A constant gradient gives a step of $\eta g/(1-\beta)$ (×10 at $\beta=0.9$). An alternating gradient gives $\eta g/(1+\beta)$ (×0.53).
+    source: Goodfellow DL §8.3.2; Bottou et al. 2018 §7.1
+
+  - id: f5
+    front: Optimal heavy-ball parameters on a quadratic with spectrum $[\mu,L]$, the resulting rate, and its stability limit.
+    back: |
+      $$\sqrt{\beta^*}=\frac{\sqrt\kappa-1}{\sqrt\kappa+1},\quad\eta^*=\frac{4}{(\sqrt L+\sqrt\mu)^2}$$
+
+      Every eigendirection contracts by $\sqrt{\beta^*}\approx1-2/\sqrt\kappa$ (GD: $\approx1-2/\kappa$). Stable iff $\eta\lambda_{max}<2+2\beta$.
+    source: Bottou et al. 2018 §7.1; Cohen et al. 2021 §2
+
+  - id: f6
+    front: Write Nesterov momentum (Sutskever form) and say how it differs from heavy ball on a quadratic.
+    back: |
+      $$\begin{aligned}v_{k+1}&=\beta v_k-\eta\nabla f(x_k+\beta v_k)\\x_{k+1}&=x_k+v_{k+1}\end{aligned}$$
+
+      On a quadratic it equals heavy ball with momentum $\beta(1-\eta\lambda)$ per eigendirection, so stiff directions get less momentum and oscillate less. Its stability limit is lower, $\eta\lambda<(2+2\beta)/(1+2\beta)$. It reaches $O(1/k^2)$ on convex problems only with exact gradients. Library form: $u\leftarrow\beta u+g$, $x\leftarrow x-\eta(g+\beta u)$.
+    source: Sutskever et al. 2013 §2; Cohen et al. 2021 §2; Tuning Playbook FAQ "What are the update rules for all the popular optimization algorithms?"
+
+  - id: f7
+    front: Give the cosine schedule and describe WSD and linear warmup.
+    back: |
+      $$\eta_t=\eta_{min}+\tfrac12(\eta_{max}-\eta_{min})(1+\cos\pi\tau)$$
+
+      Here $\tau$ is the fraction of the post-warmup run. **WSD**: warmup, a long constant phase, then a short cooldown to about 0. The cooldown can branch from any checkpoint, so $T$ needn't be fixed. **Linear warmup**: $\eta_t=\eta_{max}t/w$ for $t<w$. The playbook's default decay is linear or cosine.
+    source: Loshchilov & Hutter 2017 §3; Hägele et al. 2024 §3
+
+  - id: f8
+    type: open
+    front: Derive why heavy-ball momentum converges at rate $(\sqrt\kappa-1)/(\sqrt\kappa+1)$ on a quadratic.
+    back: |
+      1. The eigencoordinates decouple. With curvature $\lambda$: $x_{k+1}=(1+\beta-\eta\lambda)x_k-\beta x_{k-1}$.
+      2. Characteristic equation: $z^2-(1+\beta-\eta\lambda)z+\beta=0$. The product of the roots is $\beta$.
+      3. If the roots are complex, they have equal modulus, so $|z|=\sqrt\beta$ for every such $\lambda$. This happens when $(1-\sqrt\beta)^2<\eta\lambda<(1+\sqrt\beta)^2$.
+      4. Make the band equal $[\mu,L]$: $\eta\mu=(1-\sqrt\beta)^2$, $\eta L=(1+\sqrt\beta)^2$. The ratio gives $\sqrt\kappa=(1+\sqrt\beta)/(1-\sqrt\beta)$, so $\sqrt\beta=(\sqrt\kappa-1)/(\sqrt\kappa+1)$ and $\eta=4/(\sqrt L+\sqrt\mu)^2$.
+      5. Compare GD's $(\kappa-1)/(\kappa+1)$: steps go from $\propto\kappa$ to $\propto\sqrt\kappa$ (≈691 vs ≈69 for $\kappa=100$ and $10^{-6}$).
+      6. Bonus: a root at $z=-1$ gives the stability limit $\eta\lambda=2+2\beta$.
+
+      Caveat: this needs exact gradients and known $\mu,L$; with noise the asymptotic gain disappears.
+    source: Bottou et al. 2018 §7.1; Cohen et al. 2021 §2
+
+  - id: f9
+    type: open
+    front: Explain why constant-learning-rate SGD stalls, and why learning-rate schedules decay.
+    back: |
+      - Smoothness gives $\mathbb EF(w^+)\le F-\eta(1-\frac{L\eta}2)\|\nabla F\|^2+\frac{L\eta^2}{2}\cdot\frac{\sigma^2}{B}$.
+      - The noise term stays positive even at the optimum. With strong convexity, the gap obeys $\Delta^+\le(1-\eta\mu)\Delta+L\eta^2\sigma^2/(2B)$, with fixed point $L\eta\sigma^2/(2\mu B)$.
+      - **Tradeoff**: a large $\eta$ removes the initial error fast but has a high floor; a small $\eta$ has a low floor but is slow. So start large and decay.
+      - Robbins–Monro: $\sum\eta_t=\infty$, $\sum\eta_t^2<\infty$, e.g. $1/t$, giving $O(1/t)$.
+      - Alternatives that also lower the floor: a larger batch (noise $\propto\eta/B$, Smith et al.) and Polyak averaging.
+      - In practice: warmup, then cosine, linear or WSD decay, with the family itself an open question (Tuning Playbook).
+    source: Bottou et al. 2018 §4.2, §5.4; Smith et al. 2018 §2; Tuning Playbook FAQ "What is the best learning rate decay schedule family?"
+
+  - id: f10
+    type: open
+    front: Derive the linear scaling rule and say when it breaks.
+    back: |
+      - $k$ SGD steps at LR $\eta$ on batches $\mathcal B_1..\mathcal B_k$ of size $B$: $w_{t+k}=w_t-\frac\eta B\sum_j\sum_{x\in\mathcal B_j}\nabla\ell(x,w_{t+j})$.
+      - One step at LR $\hat\eta$ on the union (size $kB$): $w_t-\frac{\hat\eta}{kB}\sum_j\sum_{x}\nabla\ell(x,w_t)$.
+      - If $\nabla\ell(x,w_{t+j})\approx\nabla\ell(x,w_t)$, they match for $\hat\eta=k\eta$. The gradient noise added per example seen also matches.
+      - **Breaks**: (1) early in training, when weights change fast, so use warmup (Goyal et al.: 5 epochs, LR 0.1 at batch 256 → 3.2 at 8192); (2) when $k\eta$ approaches the curvature limit about $2/\lambda_{max}$, past the critical batch size; (3) empirically the best LR follows no simple rule (Shallue et al.), so re-tune. Details: sys.tuning-batch-size.
+    source: Goyal et al. 2017 §2.1–2.2; Shallue et al. 2019 §4.7
+
+  - id: f11
+    type: open
+    front: GD converges linearly on strongly convex problems and SGD only at O(1/t). Explain to an interviewer why we still train with SGD.
+    back: |
+      - **Cost per step**: a GD step costs $N$ gradients; an SGD step costs $B$, independent of $N$. Measured in total computation, not steps, SGD wins for large $N$. Bottou et al.: SGD's work to reach $\varepsilon$ is about $\kappa^2/\varepsilon$, independent of $N$.
+      - **Redundancy**: many examples give similar gradients, so a small batch is nearly as informative as the full set.
+      - **Statistics**: generalization error cannot decrease faster than $O(1/k)$ in the number of examples $k$ (Goodfellow et al., citing Bottou & Bousquet). An optimizer that converges faster than that buys little test-error improvement.
+      - **Transient phase**: SGD makes rapid early progress before a single full pass.
+      - **Caveats**: noise requires decaying LRs or larger batches late in training. Variance-reduced methods get linear rates but cost $(N+\kappa)\log(1/\varepsilon)$, so they lose for huge $N$.
+    source: Bottou et al. 2018 §4.4, §5.3.3; Goodfellow DL §8.1.3, §8.3.1
+
+reading:
+  - title: "Goodfellow, Bengio & Courville, Deep Learning, §8.1.3 and §8.3"
+    url: https://www.deeplearningbook.org/contents/optimization.html
+    kind: book
+    note: Minibatch statistics, SGD's convergence conditions and practical LR advice, momentum and Nesterov.
+  - title: "Bottou, Curtis & Nocedal 2018, Optimization Methods for Large-Scale Machine Learning, §4–5 and §7.1–7.2"
+    url: https://arxiv.org/abs/1606.04838
+    kind: paper
+    note: The fixed-step noise floor (Thm 4.6), diminishing steps, averaging, variance reduction, and heavy-ball and accelerated rates.
+  - title: "Sutskever, Martens, Dahl & Hinton 2013, On the Importance of Initialization and Momentum in Deep Learning"
+    url: https://proceedings.mlr.press/v28/sutskever13.html
+    kind: paper
+    note: Nesterov momentum as look-ahead momentum, and its effective-momentum interpretation on quadratics.
+  - title: "Goyal et al. 2017, Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour"
+    url: https://arxiv.org/abs/1706.02677
+    kind: paper
+    note: The linear scaling rule, its derivation and gradual warmup.
+  - title: "Hägele et al. 2024, Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations"
+    url: https://arxiv.org/abs/2405.18392
+    kind: paper
+    note: Constant LR plus cooldown (WSD) as an alternative to cosine.

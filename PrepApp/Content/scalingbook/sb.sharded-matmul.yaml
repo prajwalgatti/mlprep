@@ -1,0 +1,368 @@
+id: sb.sharded-matmul
+area: scalingbook
+title: "Sharded Matmuls: The Four Cases"
+summary: What communication a sharded matrix multiply needs, decided by how its contracted dimension is sharded. Introduces AllGather, AllReduce and ReduceScatter by what they do, the "unreduced" notation, and when gathering inputs beats reducing outputs.
+order: 60
+level: core
+tags: [scaling-book, sharding, collectives, parallelism]
+prereqs: [sb.sharding-notation]
+
+explainer:
+  - title: Four cases, one question
+    source: Scaling Book ch. 3 (Sharding) §"Computation With Sharded Arrays"
+    body: |
+      Case 1 (previous lesson) needed no communication because every device held the whole contracted dimension $J$. When $J$ is split, each device sees only some terms of each dot product, and data must move. The book reduces every situation to four cases:
+
+      1. **Neither** input is sharded along $J$: multiply locally, no communication.
+      2. **One** input is sharded along $J$ (or the two are sharded along it on different mesh axes): **AllGather** that input first.
+      3. **Both** inputs are sharded along $J$ the same way: multiply locally into partial sums, then **AllReduce** or **ReduceScatter**.
+      4. The two inputs shard **non-contracted** dimensions over the **same** mesh axis: **AllGather** one of them first.
+
+      ![Which case applies, and which collective it calls for](sb.sharded-matmul/four-cases)
+
+      These rules name three of the four **collectives** (communication operations in which every device on a mesh axis takes part) that the rest of the book uses. This lesson defines them by what they do to a sharding. The next lesson derives how long they take, using one result now: an AllGather or ReduceScatter of an array of $V$ bytes takes about $V/W$, and an AllReduce about $2V/W$. Here $W$ is the bidirectional link bandwidth.
+  - title: "Case 2: AllGather the sharded input"
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    body: |
+      Take $A[I, J_X]\cdot B[J, K] \rightarrow C[I, K]$. Device $x$ has only the $x$-th slice of $A$'s columns, so it cannot form a full dot product over $J$. The standard fix: give every device all of $A$ first, then multiply locally.
+
+      $$\begin{aligned} \textbf{AllGather}_X\!: A[I, J_X] &\rightarrow A[I, J] \\ A[I, J]\cdot B[J, K] &\rightarrow C[I, K]. \end{aligned}$$
+
+      **AllGather** removes a subscript: each device ends up with every shard along that mesh axis. It can remove just one of several subscripts, for example $A[I_{XY}, J] \rightarrow A[I_Y, J]$ gathers over $X$ only.
+
+      AllGathers also appear when we want an output **less** sharded than Case 1 would give. For $A[I_X, J]\cdot B[J, K] \rightarrow C[I, K]$ we can either gather $A$ first, or multiply locally to get $C[I_X, K]$ and gather $C$ afterwards. Both work. The cheaper choice gathers the smaller array, since gather time scales with the bytes gathered: $|I||J|$ elements for $A$ against $|I||K|$ for $C$.
+
+      **Worked example.** With $|J| = 8192$ and $|K| = 1024$, gathering $C$ moves 8× fewer bytes than gathering $A$.
+  - title: "Case 3: partial sums and the unreduced state"
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    body: |
+      Now both inputs are sharded the same way along $J$: $A[I, J_X]\cdot B[J_X, K]$. Device $x$ holds columns $J_x$ of $A$ and the matching rows $J_x$ of $B$, so it **can** multiply them. The result is not $C$ but one piece of it.
+
+      The reason is the outer-product form of matrix multiplication:
+
+      $$A B = \sum_{j} A_{:, j}\, B_{j, :}.$$
+
+      Each term is a full-size $|I|\times|K|$ matrix. Splitting the sum by blocks of $j$, device $x$ computes $C^{(x)} = \sum_{j \in J_x} A_{:,j} B_{j,:}$, and $C = \sum_x C^{(x)}$.
+
+      ![Case 3 on two devices: each device's slice of the contracted dimension produces a full-size partial sum of C](sb.sharded-matmul/partial-sums)
+
+      **Worked example.** $A = \begin{pmatrix}1 & 2\\ 3 & 4\end{pmatrix}$, $B = \begin{pmatrix}5 & 6\\ 7 & 8\end{pmatrix}$, contracted dimension split over 2 devices. Device 0 computes $\begin{pmatrix}1\\3\end{pmatrix}(5\;6) = \begin{pmatrix}5 & 6\\ 15 & 18\end{pmatrix}$. Device 1 computes $\begin{pmatrix}2\\4\end{pmatrix}(7\;8) = \begin{pmatrix}14 & 16\\ 28 & 32\end{pmatrix}$. Their sum, $\begin{pmatrix}19 & 22\\ 43 & 50\end{pmatrix}$, is $AB$.
+
+      The book writes this state with a suffix: $C[I, K]\{U_X\}$, read "**unreduced** along $X$". Each device along $X$ holds a different partial sum, and the true value is their sum.
+  - title: 'Finishing Case 3: AllReduce or ReduceScatter'
+    source: Scaling Book ch. 3 (Sharding) §"Case 3", §"More about the ReduceScatter"
+    body: |
+      Two collectives finish an unreduced array.
+
+      **AllReduce** sums the partial results and leaves the full sum on every device. It removes the $\{U_X\}$ suffix and changes nothing else:
+
+      $$\textbf{AllReduce}_X\!: C[I, K]\{U_X\} \rightarrow C[I, K].$$
+
+      **ReduceScatter** also sums, but leaves each device with only one shard of the result, so it **adds** a subscript to a dimension of our choice:
+
+      $$\textbf{ReduceScatter}_{X,K}\!: C[I, K]\{U_X\} \rightarrow C[I, K_X].$$
+
+      We could have scattered $I$ instead; the subscript $K$ in $\text{ReduceScatter}_{X,K}$ records the choice, which is usually dictated by what the next operation needs.
+
+      The two are related: an AllReduce **is** a ReduceScatter followed by an AllGather,
+
+      $$C\{U_X\} \xrightarrow{\ \text{RS}\ } C[I, K_X] \xrightarrow{\ \text{AG}\ } C[I, K].$$
+
+      That is why an AllReduce costs about twice an AllGather. It also suggests a saving. If the next operation can work on $C[I, K_X]$, stop after the ReduceScatter and pay half. Lesson 80 returns to this "deferred AllGather".
+  - title: "Case 4: two dimensions on the same mesh axis"
+    source: Scaling Book ch. 3 (Sharding) §"Case 4"
+    body: |
+      Following Case 1 blindly can produce an illegal sharding:
+
+      $$A[I_X, J]\cdot B[J, K_X] \rightarrow C[I_X, K_X]\ (\text{illegal}).$$
+
+      **Why it fails.** Device $x$ holds row block $x$ of $A$ and column block $x$ of $B$. From those it can form only $C_{xx}$, the $x$-th **diagonal** block of $C$. No device holds row block 0 of $A$ together with column block 1 of $B$, so the off-diagonal blocks are computed nowhere.
+
+      ![Case 4 on two devices: only the diagonal blocks of C can be formed](sb.sharded-matmul/case4-diagonal)
+
+      **Fix.** AllGather one input along $X$, which turns the problem into Case 1:
+
+      $$\begin{aligned} \text{gather } A:\; A[I, J]\cdot B[J, K_X] &\rightarrow C[I, K_X] \\ \text{gather } B:\; A[I_X, J]\cdot B[J, K] &\rightarrow C[I_X, K]. \end{aligned}$$
+
+      Both outputs mention $X$ once. Choose by cost (gather the smaller input) and by which output sharding the next operation wants.
+
+      Case 2's second variant, $J$ sharded on **different** axes in the two inputs (say $A[I, J_X]$ and $B[J_Y, K]$), is handled the same way: gather until the contracted shardings match or disappear.
+  - title: "Gather inputs or reduce outputs?"
+    source: Scaling Book ch. 3 (Sharding), Questions 4 and 9
+    body: |
+      Take activations $\text{In}[B, D]$, replicated, and weights $W[D_X, F]$ sharded on the contracted dim. (The book's Q4 calls these matrices $X$ and $Y$; we rename them because $X$ and $Y$ are mesh axes everywhere else.) Let $C$ be FLOPs/s per chip and $W_\text{ici}$ the bidirectional ICI bandwidth.
+
+      **S1, gather $W$ (Case 2).** AllGather $2DF$ bytes, then every chip does the full matmul.
+
+      $$T_1 = \max\Big(\frac{2BDF}{C},\ \frac{2DF}{W_\text{ici}}\Big)$$
+
+      **S2, shard the compute (Case 3).** Each chip slices its own part of $D$ from the replicated $\text{In}$, giving $\text{Out}[B, F]\{U_X\}$, then AllReduces $2BF$ bytes.
+
+      $$T_2 = \max\Big(\frac{2BDF}{|X|\,C},\ \frac{4BF}{W_\text{ici}}\Big)$$
+
+      On TPU v5p, $C/W_\text{ici} = 2550$.
+
+      - S1 is comms-bound when $B < 2550$; S2 almost always is (it needs $D > 2|X|\cdot2550$).
+      - Both comms-bound: S2 wins iff $4BF < 2DF$, i.e. $D > 2B$.
+      - $B > 2550$: S2 still wins if $D > 5100$.
+
+      **Worked example.** $B = 512$, $D = 8192$, $F = 32768$, $|X| = 4$. S1: 0.6 ms math, 3.0 ms gather, so ≈ 3.0 ms. S2: 0.15 ms math, 0.37 ms AllReduce, so ≈ 0.37 ms, 8× faster.
+
+      **The ReduceScatter version** (book Q9). If a sharded output is acceptable, replace S2's AllReduce by a ReduceScatter. For $A[N, M_X]\cdot B[M, K]$ the gather moves $\propto NM$ and the ReduceScatter $\propto NK$: ratio $M/K$.
+
+      **Why rare in practice.** S2 needs $W$ sharded on an axis that $\text{In}$ is not. Under FSDP (fully-sharded data parallelism, lesson 140: weights sharded along the batch axis), activations use that same axis, which forces the gather.
+  - title: Counting work per device
+    source: Scaling Book ch. 4 (Transformers), Question 2; Scaling Book ch. 3 (Sharding) §"Case 3"
+    body: |
+      Communication is half the story; the other half is how the FLOPs divide. The rule: **a sharded matmul's FLOPs divide by every mesh axis that splits one of its dimensions, and are repeated along every axis that splits none.**
+
+      **Worked example** (book ch. 4 Q2). $A[B_X, D_Y]\cdot_D W[D_Y, F]$ on mesh $\{X{:}\,4, Y{:}\,8, Z{:}\,4\}$, 128 devices.
+
+      - $X$ splits the batch and $Y$ splits the contracted dimension (Case 3, with a $\{U_Y\}$ result), so each device does $2BDF/(4\cdot8) = 2BDF/32$ FLOPs.
+      - Nothing is split over $Z$, so the 4 devices along $Z$ repeat the same work. The cluster performs $128 \times 2BDF/32 = 4\times 2BDF$ FLOPs, four times the useful amount.
+
+      Redundant FLOPs are not always a mistake: replicating a small computation can be cheaper than the communication needed to avoid it. But they should be a choice. This bookkeeping, FLOPs per device next to bytes communicated per device, is exactly what the training and inference chapters do for every parallelism scheme.
+  - title: What interviewers probe
+    source: Scaling Book ch. 3 (Sharding) §"What Have We Learned?"
+    body: |
+      - *What communication does a sharded matmul need?* Depends on the contracted dim. Unsharded: none. One side sharded: AllGather it. Both sharded alike: local partial sums, then AllReduce or ReduceScatter. Same mesh axis on two output dims: AllGather one input.
+      - *What does $\{U_X\}$ mean?* Each device along $X$ holds a different partial sum; the true value is their sum.
+      - *AllReduce vs ReduceScatter?* Both sum. AllReduce leaves the whole result everywhere; ReduceScatter leaves one shard each and costs half. AllReduce = ReduceScatter + AllGather.
+      - *Why is $A[I_X, J]\cdot B[J, K_X]$ invalid?* Device $x$ can only form the diagonal block $C_{xx}$.
+      - *Gather the weights or reduce the outputs?* Compare bytes: gather $2DF$ vs AllReduce $4BF$. Reducing wins when $D > 2B$ (both comms-bound), but needs the weights sharded on an axis the activations aren't.
+      - *How many FLOPs per device?* Total divided by the axes that split a dimension; repeated along unused axes.
+  - title: Key results
+    source: Scaling Book ch. 3 (Sharding)
+    body: |
+      $$A[I, J_X]\cdot B[J, K]: \text{ AllGather } A \text{ first}$$
+
+      $$A[I, J_X]\cdot B[J_X, K] \rightarrow C[I, K]\{U_X\}$$
+
+      $$\text{AllReduce} = \text{ReduceScatter} + \text{AllGather}$$
+
+      $$A[I_X, J]\cdot B[J, K_X]: \text{ AllGather one input}$$
+
+      - AllGather: $[A_X, B]\to[A, B]$. ReduceScatter: $[A, B]\{U_X\}\to[A_X, B]$. AllReduce: $\{U_X\}\to$ removed.
+      - Costs (next lesson): AllGather ≈ ReduceScatter ≈ $V/W$; AllReduce ≈ $2V/W$.
+      - Gather-then-multiply vs multiply-then-reduce: compare gathered bytes with reduced bytes ($2DF$ vs $4BF$; ratio $M/K$ in the RS variant).
+      - FLOPs per device = total / (sizes of axes that split some dim); replicated along unused axes.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    prompt: |
+      What happens in $A[I, J_X]\cdot B[J_X, K]$ if we want the output replicated?
+    correct: Local matmuls give $C\{U_X\}$, then an AllReduce over X
+    wrong:
+      - An AllGather of A over X, then one local matmul
+      - Nothing; the output is already complete on each device
+      - An AllToAll over X, then a local matmul per device
+    explanation: |
+      Both inputs split the contracted dim the same way, so each device can multiply its slices, but gets only a partial sum (Case 3). An AllReduce over $X$ sums them. Gathering $A$ alone would leave $B$ sharded on $J$, so the multiply still couldn't happen locally.
+  - id: q2
+    source: Scaling Book ch. 3 (Sharding) §"Case 4"
+    prompt: |
+      Which communication does $A[I_X, J]\cdot B[J, K_X]$ require before it can be computed?
+    correct: AllGather one of the two inputs along X
+    wrong:
+      - AllReduce the output over X afterwards
+      - None; the output is $C[I_X, K_X]$
+      - ReduceScatter A along its J dimension first
+    explanation: |
+      Both inputs use $X$ on non-contracted dims (Case 4). Device $x$ holds only row block $x$ and column block $x$, so it can form only the diagonal block $C_{xx}$; $C[I_X, K_X]$ is not even a legal sharding. Gathering either input along $X$ reduces it to Case 1.
+  - id: q3
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    prompt: |
+      For $A[I, J_X]\cdot B[J, K] \rightarrow C[I, K]$, what is the standard approach?
+    correct: AllGather A over X, then multiply locally
+    wrong:
+      - Multiply locally, then AllGather C over X
+      - ReduceScatter B over X, then multiply locally
+      - Multiply locally; no communication is needed
+    explanation: |
+      Only $A$ is split along the contracted dim (Case 2). Each device lacks some of the terms in every dot product, so we gather $A$. Multiplying first would need $B$ sliced to match and would leave partial sums, which an AllGather can't combine.
+  - id: q4
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    prompt: |
+      After local multiplies give $C[I, K]\{U_X\}$, we apply $\textbf{ReduceScatter}_{X,K}$. What is the result?
+    correct: $C[I, K_X]$
+    wrong:
+      - $C[I_X, K]$
+      - $C[I, K]$
+      - $C[I_X, K_X]$
+    explanation: |
+      A ReduceScatter sums the partial results and shards one dimension over the same mesh axis; the subscript in $\text{ReduceScatter}_{X,K}$ says that dimension is $K$. $C[I, K]$ would be an AllReduce, and $C[I_X, K_X]$ uses $X$ twice.
+  - id: q5
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    prompt: |
+      $A = \begin{pmatrix}1 & 2\\ 3 & 4\end{pmatrix}$ and $B = \begin{pmatrix}5 & 6\\ 7 & 8\end{pmatrix}$ are sharded $A[I, J_X]$ and $B[J_X, K]$ over 2 devices. What partial sum does device 1 hold before the reduction?
+    correct: $\begin{pmatrix}14 & 16\\ 28 & 32\end{pmatrix}$
+    wrong:
+      - $\begin{pmatrix}5 & 6\\ 15 & 18\end{pmatrix}$
+      - $\begin{pmatrix}19 & 22\\ 43 & 50\end{pmatrix}$
+      - $\begin{pmatrix}7 & 8\\ 28 & 32\end{pmatrix}$
+    explanation: |
+      Device 1 holds column 1 of $A$, $(2, 4)^\top$, and row 1 of $B$, $(7, 8)$. Their outer product is $\begin{pmatrix}14 & 16\\ 28 & 32\end{pmatrix}$. Device 0's partial is $\begin{pmatrix}5 & 6\\ 15 & 18\end{pmatrix}$, and their sum is the full product.
+  - id: q6
+    source: Scaling Book ch. 3 (Sharding), Question 4
+    prompt: |
+      On TPU v5p ($C = 4.59\times10^{14}$, $W = 1.8\times10^{11}$ B/s bidirectional), compute $\text{In}[B, D]\cdot W[D_X, F]$ with $B = 1024$, $D = 8192$, $F = 32768$, $|X| = 4$, bf16. Which is faster: gathering $W$ first, or local partial matmuls plus an AllReduce of the output?
+    correct: Partial matmuls + AllReduce, about 0.75 ms vs 3.0 ms
+    wrong:
+      - Gathering W, about 1.2 ms vs 3.0 ms
+      - They tie, because both move the same bytes
+      - Gathering W, because AllReduce costs twice an AllGather
+    explanation: |
+      Gather: AllGather $2DF \approx 5.4\times10^8$ bytes takes ≈ 3.0 ms, more than the 1.2 ms of math. Reduce: math drops to 0.3 ms and the AllReduce of $2BF$ bytes costs $4BF/W \approx 0.75$ ms. AllReduce is 2× per byte, but here it moves 4× fewer bytes ($D = 8192 > 2B$).
+  - id: q7
+    source: Scaling Book ch. 3 (Sharding), Question 4
+    prompt: |
+      Same two strategies on TPU v5p, but now $B = 8192$, $D = 4096$, $F = 16384$, $|X| = 4$. Which is faster?
+    correct: Gathering W, about 2.4 ms vs 3.0 ms
+    wrong:
+      - Partial matmuls + AllReduce, about 0.6 ms vs 2.4 ms
+      - Partial matmuls + AllReduce, about 0.75 ms vs 2.4 ms
+      - They tie at about 2.4 ms
+    explanation: |
+      Gather: AllGather ≈ 0.75 ms, hidden under 2.4 ms of math, so ≈ 2.4 ms (compute-bound). Reduce: math 0.6 ms, but the AllReduce costs $4BF/W \approx 3.0$ ms. With $B > 2550$, reducing wins only if $D > 5100$, and here $D = 4096$.
+  - id: q9
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    prompt: |
+      Which statement about a matrix $C[I, K]\{U_X\}$ is correct?
+    correct: Devices along X hold different partial sums of C
+    wrong:
+      - Devices along X hold different blocks of C's rows
+      - Devices along X hold identical full copies of C
+      - Each device along X holds C scaled by $1/|X|$
+    explanation: |
+      $\{U_X\}$ means "unreduced along $X$": each device's array is full-size, but only a partial sum; the true $C$ is the sum over $X$. Different row blocks would be $C[I_X, K]$, and identical copies would be plain $C[I, K]$.
+  - id: q12
+    source: Scaling Book ch. 3 (Sharding) §"Case 2", §"Case 3"
+    prompt: |
+      Which statement is **false**?
+    correct: An AllGather must remove every subscript on a dimension at once
+    wrong:
+      - An AllReduce equals a ReduceScatter followed by an AllGather
+      - A ReduceScatter lets us choose which dimension to shard
+      - Case 4 can be fixed by gathering either one of the inputs
+    explanation: |
+      An AllGather can remove a single mesh axis, e.g. $A[I_{XY}, J]\to A[I_Y, J]$ gathers over $X$ only. The other three statements are the lesson's rules.
+
+  - id: q13
+    source: Scaling Book ch. 3 (Sharding), Question 9
+    prompt: |
+      For $A[N, M_X]\cdot B[M, K]$ with $N = 2048$, $M = 4096$, $K = 16384$, compare gathering $A$ then multiplying with multiplying locally then ReduceScattering the output. Which moves fewer bytes, and by what factor?
+    correct: The AllGather of A, by a factor of 4
+    wrong:
+      - The ReduceScatter of the output, by a factor of 4
+      - The AllGather of A, by a factor of 8
+      - They move the same number of bytes
+    explanation: |
+      Per byte of the full array the two collectives cost about the same, so compare sizes: gathering $A$ moves $\propto NM \approx 8.4$M elements, reduce-scattering $O[N, K]$ moves $\propto NK \approx 33.6$M. The ratio $M/K = 1/4$ favours the gather here: reducing pays off only when the output is smaller than the sharded input.
+  - id: q14
+    source: Scaling Book ch. 4 (Transformers), Question 2
+    prompt: |
+      $A[B_X, D_Y]\cdot_D W[D_Y, F]$ runs on mesh $\{X{:}\,2, Y{:}\,4, Z{:}\,8\}$. Summed over all 64 devices, how many FLOPs are performed, compared with the $2BDF$ of the unsharded matmul?
+    correct: $8\times 2BDF$
+    wrong:
+      - $2BDF$
+      - $4\times 2BDF$
+      - $64\times 2BDF$
+    explanation: |
+      $X$ and $Y$ split dimensions, so each device does $2BDF/8$. Nothing is split over $Z$, so its 8 devices repeat the work: $64\cdot2BDF/8 = 8\cdot2BDF$. $4\times$ would follow from treating the $X\cdot Y$ product as 16.
+  - id: q15
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    prompt: |
+      $A[I_X, J]\cdot B[J, K]$ must produce a **replicated** $C[I, K]$, with $|I| = 2048$, $|J| = 1024$, $|K| = 4096$. Which plan moves fewer bytes?
+    correct: AllGather A first, then multiply locally
+    wrong:
+      - Multiply to $C[I_X, K]$, then AllGather C
+      - Multiply locally, then AllReduce C over X
+      - Either order; both move exactly the same bytes
+    explanation: |
+      Gather time scales with bytes gathered: $A$ has $|I||J| \approx 2.1$M elements, $C$ has $|I||K| \approx 8.4$M, 4× more. Gather the smaller one. $C$ is not a partial sum ($J$ wasn't split), so an AllReduce would be wrong as well as costly.
+cards:
+  - id: f1
+    source: Scaling Book ch. 3 (Sharding) §"What Have We Learned?"
+    front: List the four cases of sharded matmuls and the communication each needs.
+    back: |
+      1. Contracted dim unsharded: none. 2. One input sharded on it: AllGather that input. 3. Both sharded alike on it: local partial sums, then AllReduce/ReduceScatter. 4. Same mesh axis on two non-contracted dims: AllGather one input.
+  - id: f2
+    source: Scaling Book ch. 3 (Sharding) §"Case 2"
+    front: What does an AllGather do to a sharding?
+    back: |
+      Removes a subscript (one mesh axis): $\text{AllGather}_X\!: A[I, J_X]\to A[I, J]$; also $A[I_{XY}, J]\to A[I_Y, J]$.
+  - id: f3
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    front: What do AllReduce and ReduceScatter do to $C[I, K]\{U_X\}$?
+    back: |
+      AllReduce: $\to C[I, K]$ (summed, replicated). $\text{ReduceScatter}_{X,K}$: $\to C[I, K_X]$ (summed, sharded). AllReduce = ReduceScatter + AllGather.
+  - id: f4
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    front: What identity explains Case 3's partial sums?
+    back: |
+      $$AB = \sum_j A_{:,j}\,B_{j,:}$$
+
+      Each device sums the outer products for its slice of $j$; the device results add to $AB$.
+  - id: f5
+    source: Scaling Book ch. 3 (Sharding) §"Case 4"
+    front: Why is $A[I_X, J]\cdot B[J, K_X] \to C[I_X, K_X]$ invalid, and how is it fixed?
+    back: |
+      Device $x$ holds only row block $x$ and column block $x$, so it can form only $C_{xx}$. AllGather one input over $X$ (choose by size and downstream sharding).
+  - id: f6
+    source: Scaling Book ch. 3 (Sharding), Question 4
+    front: For $\text{In}[B, D]\cdot W[D_X, F]$, when does "local matmul + AllReduce" beat "AllGather W first"?
+    back: |
+      Gather costs $2DF/W$, AllReduce $4BF/W$. If both are comms-bound ($B < C/W$), reducing wins iff $D > 2B$. If $B > C/W$, reducing wins iff $D > 2C/W$ (5100 on v5p).
+  - id: f7
+    source: Scaling Book ch. 4 (Transformers), Question 2
+    front: How many FLOPs does each device do in a sharded matmul?
+    back: |
+      The total ($2\times$ product of dims) divided by the sizes of the mesh axes that split some dimension; the work is repeated along axes that split none.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"Case 3"
+    front: Walk an interviewer through Case 3, $A[I, J_X]\cdot B[J_X, K]$, from the outer-product identity to the final collective.
+    back: |
+      - $AB = \sum_j A_{:,j}B_{j,:}$: a sum of full-size outer products.
+      - Device $x$ owns the columns $J_x$ of $A$ and rows $J_x$ of $B$, so it can sum those terms: $C^{(x)}$.
+      - The result is full-size but partial: $C[I, K]\{U_X\}$.
+      - AllReduce over $X$ gives $C$ everywhere (cost ≈ $2V/W$); ReduceScatter gives $C[I, K_X]$ for half the cost if a sharded output is fine.
+      - FLOPs per device drop by $|X|$; the price is communicating an output-sized array.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 3 (Sharding), Questions 4 and 9
+    front: Compare "gather the sharded input then multiply" with "multiply locally then reduce the output". When would you pick each?
+    back: |
+      - Gather: moves the sharded input ($2DF$ for weights $W[D_X, F]$), then every chip does all the FLOPs: $\max(2BDF/C, 2DF/W)$.
+      - Reduce: shards the FLOPs by $|X|$ but AllReduces the output ($4BF/W$), or half with a ReduceScatter: $\max(2BDF/(|X|C), 4BF/W)$.
+      - Rule: compare bytes. Output smaller than the input (small batch, big $D$): reduce. Large batch: gather, hidden under compute.
+      - v5p numbers: B = 1024, D = 8192, F = 32768 → reduce ≈ 0.75 ms vs gather ≈ 3 ms; B = 8192, D = 4096 → gather ≈ 2.4 ms vs reduce ≈ 3 ms.
+      - In practice the choice is often forced: e.g. FSDP shards activations on the same axis, so you gather.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"Case 4"
+    front: Explain why sharding two non-contracted dimensions on the same mesh axis breaks a matmul, and how you choose the fix.
+    back: |
+      - $A[I_X, J]\cdot B[J, K_X]$: device $x$ holds row block $x$ and column block $x$.
+      - Output block $(r, c)$ needs row block $r$ and column block $c$ together; only $r = c$ exists anywhere, so the off-diagonal blocks can't be computed.
+      - Fix: AllGather one input over $X$: gather $A$ → $C[I, K_X]$; gather $B$ → $C[I_X, K]$.
+      - Choose the cheaper gather (smaller array) and the output sharding the next op needs.
+
+reading:
+  - title: "Scaling Book ch. 3: Sharded Matrices and How to Multiply Them"
+    url: https://jax-ml.github.io/scaling-book/sharding/
+    kind: book
+    note: Cases 1–4 with block-matrix intuition, plus Problems 4 and 9 on gather-vs-reduce strategies.
+  - title: "Scaling Book ch. 4: All the Transformer Math You Need to Know"
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    kind: book
+    note: Question 2 counts FLOPs per device for a sharded matmul with a replicated mesh axis.
+  - title: "Shoeybi et al. (2019), Megatron-LM"
+    url: https://arxiv.org/abs/1909.08053
+    kind: paper
+    note: A practical instance of Cases 2 and 3; column- then row-parallel matmuls need one reduction per MLP block.
+  - title: "Aleksa Gordić, The Anatomy of Collective Communication"
+    url: https://www.aleksagordic.com/blog/collective-operations
+    kind: blog
+    note: Visual walkthrough of AllGather, ReduceScatter and AllReduce semantics on GPUs and TPUs.

@@ -1,0 +1,505 @@
+id: fund.logistic-regression
+area: fundamentals
+title: "Logistic & Softmax Regression"
+summary: Classification by modelling the log-odds as linear. Where the sigmoid comes from (Gaussian class-conditionals, LDA vs QDA), the cross-entropy gradient and Hessian, convexity and Newton/IRLS, why separable data has no MLE, softmax regression and its Jacobian, log-sum-exp numerics, and decision thresholds.
+order: 230
+level: core
+tags: [logistic-regression, softmax, cross-entropy, classification, classical-ml]
+prereqs: [fund.mle, fund.information-theory]
+
+explainer:
+  - title: "The problem: probabilities from a linear score"
+    body: |
+      We have inputs $x_i \in \mathbb{R}^d$ and binary labels $y_i \in \{0, 1\}$, and we want $P(y = 1 \mid x)$, not just a hard decision.
+
+      **Why not linear regression on 0/1 targets?** Its output $w^\top x$ is unbounded, so it isn't a probability. Squared error also punishes points that are *correctly* classified with a large score: a positive example far on the right side pulls the line toward itself and can move the decision boundary the wrong way.
+
+      **The fix: model the log-odds as linear.** The odds of an event with probability $p$ are $p/(1-p) \in (0, \infty)$, and the log-odds (the **logit**) range over all of $\mathbb{R}$. A linear function can match that range:
+
+      $$\log\frac{p}{1-p} = w^\top x.$$
+
+      Solving for $p$ gives the **sigmoid** (logistic function):
+
+      $$p = \sigma(w^\top x), \qquad \sigma(a) = \frac{1}{1 + e^{-a}}.$$
+
+      As before, $x$ includes a leading 1 so $w$ contains the intercept. Call $a = w^\top x$ the **logit** and $\mu = \sigma(a)$ the predicted probability.
+
+      **Sigmoid facts** you'll use constantly:
+      - **Symmetry**: $\sigma(-a) = 1 - \sigma(a)$. Multiply the numerator and denominator of $\sigma(-a) = 1/(1 + e^{a})$ by $e^{-a}$.
+      - **Derivative**: $\sigma'(a) = e^{-a}/(1 + e^{-a})^2 = \sigma(a)(1 - \sigma(a))$. Its maximum is $1/4$, at $a = 0$.
+      - **Inverse**: $\sigma^{-1}(p) = \log\frac{p}{1-p}$, the logit.
+
+      **Reading coefficients.** Increasing $x_j$ by one unit adds $w_j$ to the log-odds, so it **multiplies the odds by $e^{w_j}$**. $w_j = 0.693$ doubles the odds. Doubling the odds is not doubling the probability: from $p = 0.2$ (odds 0.25) to odds 0.5 gives $p = 1/3$.
+
+      **Decision boundary.** Predicting $y = 1$ when $\mu > 1/2$ means $w^\top x > 0$: a hyperplane. Logistic regression is a **linear classifier** that also outputs probabilities.
+
+      ![Synthetic two-class data and a fitted logistic regression. The contours of $p(y{=}1 \mid x)$ are parallel lines perpendicular to $w$; probability changes only along $w$.](fund.logistic-regression/sigmoid-boundary)
+    source: "Murphy PML1 §2.4.2, §10.2.1; CS229 notes §2.1; ESL §4.4"
+
+  - title: "Where the sigmoid comes from: Gaussian class-conditionals"
+    body: |
+      The sigmoid isn't arbitrary. Start from a **generative** model: class priors $\pi_k = P(y = k)$ and class-conditional densities $p(x \mid y = k)$. Bayes' rule gives
+
+      $$\begin{aligned} P(y{=}1 \mid x) &= \frac{p(x|1)\pi_1}{p(x|1)\pi_1 + p(x|0)\pi_0} \\ &= \sigma(a), \ \ a = \log\frac{p(x|1)\pi_1}{p(x|0)\pi_0}. \end{aligned}$$
+
+      (Divide the numerator and denominator by $p(x|1)\pi_1$.) So the posterior is *always* a sigmoid of the log-ratio. The question is when $a$ is linear in $x$.
+
+      **Shared-covariance Gaussians.** Let $p(x \mid k) = \mathcal{N}(x \mid \mu_k, \Sigma)$ with the same $\Sigma$ for both classes. The normalizing constants are equal and cancel. In the quadratic forms, the $x^\top \Sigma^{-1} x$ terms cancel too:
+
+      $$\begin{aligned} a &= -\tfrac12 (x-\mu_1)^\top \Sigma^{-1}(x-\mu_1) \\ &\quad + \tfrac12 (x-\mu_0)^\top \Sigma^{-1}(x-\mu_0) + \log\tfrac{\pi_1}{\pi_0} \\ &= w^\top x + w_0, \end{aligned}$$
+
+      with
+
+      $$\begin{aligned} w &= \Sigma^{-1}(\mu_1 - \mu_0), \\ w_0 &= -\tfrac12\mu_1^\top\Sigma^{-1}\mu_1 + \tfrac12\mu_0^\top\Sigma^{-1}\mu_0 \\ &\quad + \log(\pi_1/\pi_0). \end{aligned}$$
+
+      This generative classifier is **Gaussian discriminant analysis** with a shared covariance, i.e. **LDA**. The prior only shifts $w_0$. Example in 1-D: $\mu_1 = 2$, $\mu_0 = 0$, $\sigma^2 = 1$. Equal priors put the boundary at $x = 1$. With $\pi_1 = 0.2$, $w_0$ drops by $\log 4$ and the boundary moves to $x = 1 + \tfrac{\log 4}{2} = 1.69$.
+
+      **QDA.** With class-specific $\Sigma_k$, the term $-\tfrac12 x^\top(\Sigma_1^{-1} - \Sigma_0^{-1})x$ survives, so the boundary is **quadratic**.
+
+      **LDA vs logistic regression.** They have the same functional form, $\sigma(w^\top x + w_0)$, but different fitting:
+      - LDA maximizes the **joint** likelihood $p(x, y)$, plugging in class means, a pooled covariance and priors. If the Gaussian assumption holds it is more data-efficient: ESL quotes about a 30% asymptotic efficiency loss in error rate for logistic regression (Efron 1975).
+      - Logistic regression maximizes the **conditional** likelihood $p(y \mid x)$ and ignores how $x$ is distributed. It stays sensible when the class-conditionals aren't Gaussian, and isn't dragged by far-away outliers that distort LDA's covariance.
+      - On separable data the logistic MLE doesn't exist (card 5), while LDA's estimates stay finite.
+    source: "Bishop PRML §4.2.1 (eqs. 4.57, 4.65–4.67); Murphy PML1 §9.2.1–9.2.3; ESL §4.4.5; CS229 notes §4.1"
+
+  - title: "Maximum likelihood is cross-entropy, and its gradient"
+    body: |
+      Each label is a Bernoulli draw with mean $\mu_i = \sigma(w^\top x_i)$: $p(y_i \mid x_i) = \mu_i^{y_i}(1 - \mu_i)^{1 - y_i}$. The negative log-likelihood is the **binary cross-entropy**:
+
+      $$\mathrm{NLL}(w) = -\sum_{i=1}^N \big[y_i \log \mu_i + (1-y_i)\log(1-\mu_i)\big].$$
+
+      Each term is $H(\mathrm{Ber}(y_i), \mathrm{Ber}(\mu_i))$, the cross-entropy from the data label to the model (`fund.information-theory`).
+
+      **Gradient.** By the chain rule and $\sigma' = \sigma(1-\sigma)$:
+
+      $$\nabla_w \mu_i = \mu_i(1-\mu_i)\,x_i.$$
+
+      So $\nabla_w \log\mu_i = (1-\mu_i)x_i$ and $\nabla_w \log(1-\mu_i) = -\mu_i x_i$. Substitute:
+
+      $$\begin{aligned} \nabla_w \mathrm{NLL} &= -\sum_i \big[y_i(1-\mu_i) - (1-y_i)\mu_i\big]x_i \\ &= \sum_i (\mu_i - y_i)\,x_i = X^\top(\mu - y). \end{aligned}$$
+
+      **"Prediction minus label."** This is exactly the form of the least-squares gradient $X^\top(Xw - y)$, with $\mu$ in place of $Xw$. It is no coincidence: the Bernoulli is an exponential family and the logit is its **canonical link**, which always gives this form (`fund.mle`). Each point pushes $w$ along $x_i$ with weight equal to its error. A confidently correct point contributes almost nothing.
+
+      **Labels $\pm1$.** With $s_i \in \{-1, +1\}$, $\sigma(-a) = 1 - \sigma(a)$ lets you write both cases as $P(s_i \mid x_i) = \sigma(s_i w^\top x_i)$. Then
+
+      $$\mathrm{NLL} = \sum_i \log\big(1 + e^{-s_i w^\top x_i}\big).$$
+
+      This is the same loss, written as a function of the margin $s_i w^\top x_i$ (ESL and the SVM literature use this form).
+
+      **Worked SGD step.** Take $x = (1, 2)$ (the 1 is the intercept input), $y = 1$, $w = (0, 0.5)$, step size $\eta = 1$.
+      - $a = 1$, so $\mu = \sigma(1) = 0.731$.
+      - The gradient is $(\mu - y)x = (-0.269, -0.538)$, so $w \leftarrow (0.269, 1.038)$.
+      - The new logit is $2.345$ and $\mu = 0.913$: the step raised the probability of the true label.
+    source: "Murphy PML1 §10.2.3.1–10.2.3.3, §10.2.4; CS229 notes §2.1; Bishop PRML §4.3.2"
+
+  - title: "Hessian, convexity, and Newton / IRLS"
+    body: |
+      Differentiate the gradient $\sum_i(\mu_i - y_i)x_i$ once more, using $\nabla_w\mu_i = \mu_i(1-\mu_i)x_i$:
+
+      $$H = \sum_i \mu_i(1-\mu_i)\,x_i x_i^\top = X^\top S X,$$
+
+      where $S = \mathrm{diag}(\mu_i(1-\mu_i))$. Note that $H$ does not depend on the labels $y$.
+
+      **Convex.** For any $v$,
+
+      $$v^\top H v = \sum_i \mu_i(1-\mu_i)\,(x_i^\top v)^2 \ge 0,$$
+
+      a nonnegatively weighted sum of squares. So the NLL is convex and every stationary point is a global minimum. It is strictly convex if $X$ has full column rank, because every $\mu_i \in (0,1)$ makes the weights positive. Convex does not mean a minimizer exists, though (card 5).
+
+      **No closed form.** Setting $X^\top(\sigma(Xw) - y) = 0$ gives equations that are nonlinear in $w$, so we iterate.
+      - **Gradient descent.** Since $\mu(1-\mu) \le 1/4$, $H \preceq \tfrac14 X^\top X$, so the loss is $L$-smooth with $L = \lambda_{\max}(X^\top X)/4$. Any fixed step $\eta < 2/L$ decreases the loss at every step.
+      - **SGD**: $w \leftarrow w - \eta(\mu_i - y_i)x_i$, one example at a time.
+      - **Newton's method** (`fund.newton`): $w \leftarrow w - H^{-1}\nabla\mathrm{NLL}$. Substituting $H = X^\top SX$ and rearranging gives
+
+      $$\begin{aligned} w_{\text{new}} &= (X^\top S X)^{-1} X^\top S z, \\ z &= Xw + S^{-1}(y - \mu). \end{aligned}$$
+
+        Each Newton step is a **weighted least-squares** fit to a "working response" $z$, with weights $\mu_i(1-\mu_i)$ that change every iteration. Hence the name **iteratively reweighted least squares** (IRLS). It converges in a handful of iterations for moderate $p$, but each step costs $O(Np^2 + p^3)$.
+
+      **Near-singular Hessian.** If many $\mu_i$ get close to 0 or 1, $S \approx 0$ and $H$ is nearly singular. That happens on (nearly) separable data, and an L2 penalty $\tfrac\lambda2\|w\|^2$ fixes it by adding $\lambda I$ to $H$.
+    source: "Murphy PML1 §10.2.3.4, §10.2.6 (Alg. 10.1); Bishop PRML §4.3.3; ESL §4.4.1"
+
+  - title: "Separable data: the MLE does not exist"
+    body: |
+      Suppose some $u$ separates the training set perfectly: $s_i u^\top x_i > 0$ for every $i$ (labels $\pm1$). Look at the loss along the ray $w = c\,u$:
+
+      $$\mathrm{NLL}(cu) = \sum_i \log\big(1 + e^{-c\, s_i u^\top x_i}\big).$$
+
+      Every margin $s_i u^\top x_i$ is positive, so each term strictly decreases in $c$ and tends to 0 as $c \to \infty$. Hence $\inf_w \mathrm{NLL} = 0$. But every term is strictly positive at any finite $w$, so the value 0 is never reached. **No finite minimizer exists**, even though the loss is convex.
+
+      Geometrically, the sigmoid becomes a step function and every training point gets probability 1 for its class. Many separating directions achieve this, and plain maximum likelihood can't choose among them. This happens however large $N$ is, as long as the data are separable. With $N \le p$ points in general position it is guaranteed, whatever the labels.
+
+      **What gradient descent does.** $\|w_t\|$ grows without bound (asymptotically like $\log t$) and the loss goes to 0. Soudry et al. (2018, not in the cache, so stated as a claim) showed that the *direction* $w_t/\|w_t\|$ converges to the **hard-margin SVM** direction, very slowly. The next SVM lesson derives that solution.
+
+      ![Synthetic separable data, no intercept. Left: without a penalty $\|w_t\|$ keeps growing; with L2 it levels off. Right: the angle between $w_t$ and the max-margin direction shrinks, but very slowly.](fund.logistic-regression/separable-divergence)
+
+      **Fixes.**
+      - **L2 penalty / MAP** with a Gaussian prior: $\mathrm{NLL} + \tfrac\lambda2\|w\|^2$ is strictly convex and coercive, so a unique finite minimizer exists (`fund.mle-map`).
+      - **Early stopping** caps $\|w\|$ implicitly.
+      - Remember that the software may report "converged" with huge coefficients and huge standard errors. That is the symptom.
+    source: "Bishop PRML §4.3.2; ESL §4.4.5 (Ex. 4.5); Murphy PML1 §10.2.7"
+
+  - title: "Softmax regression: K classes"
+    body: |
+      For $y \in \{1, \dots, K\}$, give each class a weight vector $w_k$ and logit $z_k = w_k^\top x$. The **softmax** turns logits into probabilities:
+
+      $$p_k = \frac{e^{z_k}}{\sum_{j=1}^K e^{z_j}}.$$
+
+      **Shift invariance.** Adding the same constant to every logit leaves $p$ unchanged, so the parameters are redundant: you can fix $w_K = 0$. With $K = 2$, $p_1 = \sigma(z_1 - z_2)$ and we recover logistic regression. **Temperature** $T$ divides the logits, $p \propto e^{z/T}$: $T > 1$ flattens the distribution and $T \to 0$ approaches a one-hot argmax. Ratios between classes depend only on logit differences, $p_j/p_k = e^{(z_j - z_k)/T}$.
+
+      ![Softmax over logits $(z_1, 1, 0)$ as $z_1$ varies, at $T = 1$ and $T = 3$. Higher temperature flattens every curve.](fund.logistic-regression/softmax-temperature)
+
+      **Loss and gradient.** With the label $y$ as a one-hot vector $e_y$, the cross-entropy is
+
+      $$L = -\log p_y = -z_y + \log\sum_j e^{z_j}.$$
+
+      The gradient of $\log\sum_j e^{z_j}$ with respect to $z_k$ is $e^{z_k}/\sum_j e^{z_j} = p_k$. So
+
+      $$\frac{\partial L}{\partial z} = p - e_y, \qquad \nabla_{w_k} L = (p_k - [y{=}k])\,x.$$
+
+      Prediction minus label again. The longer route goes through the **softmax Jacobian**: $\partial p_k/\partial z_j = p_k(\delta_{kj} - p_j)$, i.e. $\mathrm{diag}(p) - pp^\top$. Combining it with $\partial L/\partial p_k = -[y{=}k]/p_k$ gives the same result. The Jacobian is also the Hessian of $L$ in $z$, and it is PSD ($v^\top(\mathrm{diag}(p) - pp^\top)v$ is the variance of $v$ under $p$), so softmax regression is convex in $W$.
+
+      **Worked example.** Logits $(2, 1, 0)$ with true class 1 (the first).
+      - $p = (0.665, 0.245, 0.090)$ and the loss is $-\log 0.665 = 0.408$ nats.
+      - $\partial L/\partial z = (-0.335, 0.245, 0.090)$, which sums to 0 because shifting all logits changes nothing.
+      - Had the label been class 3, the loss would be $2.408$ and the gradient $(0.665, 0.245, -0.910)$.
+
+      **Multi-class vs multi-label.** Softmax assumes exactly one true class. For tags that can co-occur, use $K$ independent sigmoids, each with its own binary cross-entropy.
+    source: "Murphy PML1 §2.5.2, §10.3, §10.3.2.3 (eq. 10.60); Bishop PRML §4.3.4; d2l §4.1"
+
+  - title: "Numerics: log-sum-exp and fused losses"
+    body: |
+      **The problem.** $e^{z}$ overflows to `inf` above $z \approx 709.8$ in float64 and $z \approx 88.7$ in float32. Very negative logits underflow to 0, and then $\log 0 = -\infty$. Large logits are routine in deep nets, so a naive softmax returns `nan` (from `inf/inf`) or a log of zero.
+
+      **The log-sum-exp trick.** For any constant $m$,
+
+      $$\log\sum_j e^{z_j} = m + \log\sum_j e^{z_j - m}.$$
+
+      Choose $m = \max_j z_j$. The largest exponent becomes $e^0 = 1$, so the sum lies in $[1, K]$: nothing overflows, and the log never sees 0. Small terms may underflow to 0, but harmlessly. Softmax itself is computed the same way, $p_k = e^{z_k - m}/\sum_j e^{z_j - m}$, which is exact because of shift invariance.
+
+      Example: logits $(1000, 1001, 1002)$. The naive softmax gives `nan` in float64. The stable version gives $(0.090, 0.245, 0.665)$, the same as for $(0, 1, 2)$, and $\log\sum e^{z} = 1002.408$.
+
+      **Fuse log and softmax.** Compute the log-probabilities directly as $\log p_k = z_k - \mathrm{LSE}(z)$ rather than $\log(\mathrm{softmax}(z))$. Rounding a small $p_k$ to 0 and then taking the log gives $-\infty$. For the binary case, $\log\sigma(a) = -\log(1 + e^{-a})$, computed stably as $-\mathrm{softplus}(-a)$.
+
+      **Framework conventions.**
+      - PyTorch `CrossEntropyLoss` and `BCEWithLogitsLoss` take **logits** and fuse the log-softmax (or log-sigmoid) internally.
+      - Passing softmax *outputs* to `CrossEntropyLoss` is a silent bug. It applies softmax again to numbers in $[0, 1]$, whose differences are at most 1. Predictions are squashed toward uniform, the loss can't approach 0, and gradients shrink, but training still runs.
+    source: "Murphy PML1 §2.5.4; Goodfellow DL §4.1, §6.2.2.3; d2l §4.1"
+
+  - title: "Variants, thresholds and connections"
+    body: |
+      **Perceptron.** Replace $\sigma$ with a hard step and update only on mistakes: $w \leftarrow w + s_i x_i$ when $s_i w^\top x_i \le 0$. This is the logistic SGD step with the probability $\mu_i$ replaced by the hard prediction. It produces no probabilities, and it converges only if the data are linearly separable. Logistic SGD (with a decaying step) converges to the MLE whether or not the data are separable, provided the MLE exists.
+
+      **Probit regression.** Replace $\sigma$ with the Gaussian CDF $\Phi$. Its tails decay like $e^{-a^2/2}$ rather than $e^{-a}$, so it reacts more strongly to badly misclassified points. In the bulk the two fits are usually very close after rescaling $w$.
+
+      **Standardization.** Rescaling a feature only rescales its coefficient in the unpenalized MLE. But it changes the conditioning of $X^\top S X$ and so the speed of gradient methods, and with an L2 penalty it changes the solution itself. Standardize before penalizing.
+
+      **Thresholds and costs.** The model outputs $\mu = P(y{=}1 \mid x)$, and the decision is separate. Let a false negative cost $c_{FN}$ and a false positive $c_{FP}$. Predicting 1 has expected cost $(1 - \mu)c_{FP}$, and predicting 0 has $\mu\, c_{FN}$. Predict 1 when
+
+      $$\mu > t^* = \frac{c_{FP}}{c_{FP} + c_{FN}}.$$
+
+      If missing a positive is 4 times as costly as a false alarm, $t^* = 0.2$. Sweeping $t$ traces the ROC and PR curves (`fund.classification-metrics`). The 0.5 rule is only right for equal costs and calibrated probabilities.
+
+      **Where it shows up in deep learning.** The last layer of every classifier is softmax regression on learned features. The loss is the same cross-entropy and the gradient at the logits is the same $p - e_y$. Everything above (convexity aside) carries over to the output layer.
+
+      **Label conventions.** Bishop, PML1 and CS229 use $y \in \{0, 1\}$, while ESL's boosting and SVM chapters and UML use $\{-1, +1\}$. The losses look different but are identical (card 3).
+    source: "Murphy PML1 §10.2.5, §10.2.8; Bishop PRML §4.3.5, §1.5.2; CS229 notes §2.2"
+
+  - title: "Pitfalls and what interviewers probe"
+    body: |
+      **Pitfalls.**
+      - **Calling logistic regression non-linear** because of the sigmoid. Its decision boundary is linear in $x$.
+      - **Reading coefficients as changes in probability.** They are changes in log-odds. The effect on $p$ depends on where you start: it is largest near $p = 0.5$, where $\sigma' = 1/4$.
+      - **Trusting huge coefficients.** They usually mean (quasi-)separation. Add a penalty.
+      - **Feeding probabilities to a loss that expects logits**, or computing $\log(\mathrm{softmax}(z))$ naively.
+      - **Using softmax for multi-label tasks.**
+
+      **What interviewers probe** (question → short answer).
+      - *Why not use MSE with a sigmoid?* → Composed with $\sigma$, squared error is non-convex in $w$, and its gradient carries an extra factor $\sigma'(a)$ that vanishes when the model is confidently wrong. Cross-entropy is the Bernoulli MLE, convex, and gives the clean $\mu - y$ gradient.
+      - *Derive the gradient and Hessian.* → $X^\top(\mu - y)$ and $X^\top SX$ with $S = \mathrm{diag}(\mu(1-\mu))$, which is PSD.
+      - *Is there a closed form?* → No. Use GD, SGD or Newton/IRLS.
+      - *What happens on separable data?* → No finite MLE, $\|w\| \to \infty$, and the GD direction tends to max-margin. Fix with L2.
+      - *Softmax gradient?* → $p - e_y$ at the logits, via log-sum-exp.
+      - *Why subtract the max in softmax?* → To avoid overflow, and it is exact by shift invariance.
+      - *Logistic regression vs LDA?* → Same linear form. LDA is more efficient if the classes really are Gaussian with a shared covariance; logistic regression is more robust otherwise. QDA gives quadratic boundaries.
+      - *How do you pick a threshold?* → From the costs, $t^* = c_{FP}/(c_{FP} + c_{FN})$, or from an operating point on a validation PR/ROC curve.
+    source: "Murphy PML1 §10.2, §10.3; ESL §4.4; Goodfellow DL §6.2.2.2"
+
+  - title: "Key results"
+    body: |
+      - $P(y{=}1 \mid x) = \sigma(w^\top x)$. Log-odds are linear, the boundary $w^\top x = 0$ is a hyperplane, and $e^{w_j}$ is an odds ratio.
+      - $\sigma(-a) = 1 - \sigma(a)$, $\sigma' = \sigma(1-\sigma) \le 1/4$.
+      - Shared-covariance Gaussians give a linear logit: $w = \Sigma^{-1}(\mu_1 - \mu_0)$ (LDA). Separate covariances give a quadratic one (QDA).
+      - NLL = binary cross-entropy, gradient $X^\top(\mu - y)$:
+
+      $$H = X^\top S X, \quad S = \mathrm{diag}(\mu_i(1-\mu_i)) \succeq 0$$
+
+      - Convex, no closed form. Newton = IRLS, $w = (X^\top SX)^{-1}X^\top Sz$.
+      - Separable data: no finite MLE; $\|w\| \to \infty$ and the GD direction tends to max-margin. Fix with L2.
+      - Softmax: $p_k \propto e^{z_k}$, shift-invariant. $\partial(-\log p_y)/\partial z = p - e_y$. Jacobian $\mathrm{diag}(p) - pp^\top$.
+      - $\log\sum e^{z} = m + \log\sum e^{z - m}$ with $m = \max z$.
+      - Cost-optimal threshold $t^* = c_{FP}/(c_{FP} + c_{FN})$.
+    source: "Murphy PML1 §2.4–2.5, §9.2, §10.2–10.3; Bishop PRML §4.2–4.3"
+
+quiz:
+  - id: q1
+    prompt: |
+      A 3-class softmax classifier outputs logits $z = (2, 1, 0)$ and the true class is the first. What is $\partial L/\partial z$ for the cross-entropy loss $L = -\log p_1$?
+    correct: "$(-0.335,\\ 0.245,\\ 0.090)$"
+    wrong:
+      - "$(0.665,\\ 0.245,\\ 0.090)$"
+      - "$(0.335,\\ -0.245,\\ -0.090)$"
+      - "$(-0.335,\\ -0.245,\\ -0.090)$"
+    explanation: |
+      $p = (0.665, 0.245, 0.090)$ and $\partial L/\partial z = p - e_1 = (-0.335, 0.245, 0.090)$. The first distractor is $p$ itself (the one-hot was forgotten). The second is the negative gradient, the direction a descent step moves $z$. The last can't be a softmax gradient: those always sum to 0, because shifting every logit doesn't change the loss.
+    source: "Murphy PML1 §10.3.2.3"
+
+  - id: q2
+    prompt: |
+      A logistic regression predicts $p = 0.2$ for a customer. One feature has coefficient $w_j = \ln 2 \approx 0.693$, and that feature increases by one unit. What is the new predicted probability?
+    correct: "0.333"
+    wrong:
+      - "0.400"
+      - "0.250"
+      - "0.500"
+    explanation: |
+      The coefficient adds $\ln 2$ to the log-odds, so it doubles the odds: $0.2/0.8 = 0.25$ becomes $0.5$, and $p = 0.5/1.5 = 1/3$. Answering 0.4 doubles the *probability*, which logistic regression never does in general. Answering 0.5 sets the odds rather than the probability to 0.5.
+    source: "Murphy PML1 §10.2.1; ESL §4.4.2"
+
+  - id: q3
+    prompt: |
+      You run full-batch gradient descent with a fixed small step on **unregularized** logistic regression, and the training data are linearly separable. What happens as the number of steps grows?
+    correct: "$\\|w\\|$ grows without bound, the training loss tends to 0, and the direction slowly settles"
+    wrong:
+      - "$w$ converges to a finite MLE, as it would on any convex problem"
+      - "The loss plateaus at a positive value set by the closest points"
+      - "$w$ shrinks toward 0, because every sigmoid output saturates"
+    explanation: |
+      Along a separating direction $u$, $\mathrm{NLL}(cu) \to 0$ as $c \to \infty$ but is positive for every finite $c$, so there is no finite minimizer. GD keeps scaling $w$ up. Convexity guarantees that any minimizer is global, not that one exists. The direction converges (slowly) to the max-margin separator, as Soudry et al. (2018) showed.
+    source: "Bishop PRML §4.3.2; ESL §4.4.5"
+
+  - id: q4
+    prompt: |
+      Which statement about the binary logistic-regression NLL is **false**?
+    correct: "It has a unique finite minimizer for any dataset"
+    wrong:
+      - "Its Hessian $X^\\top S X$ is positive semidefinite at every $w$"
+      - "Its Hessian does not depend on the labels $y$"
+      - "With an added penalty $\\tfrac\\lambda2\\|w\\|^2$, $\\lambda > 0$, its minimizer is unique and finite"
+    explanation: |
+      On separable data the infimum (0) isn't attained, so no minimizer exists at all. With duplicated columns, any minimizer that does exist isn't unique. The other three statements are true: $S = \mathrm{diag}(\mu_i(1-\mu_i))$ has nonnegative entries and depends only on $w$ and $X$, and the L2 term makes the objective strictly convex and coercive.
+    source: "Murphy PML1 §10.2.3.4, §10.2.7; Bishop PRML §4.3.2"
+
+  - id: q5
+    prompt: |
+      Why is the logistic NLL convex in $w$?
+    correct: "$v^\\top H v = \\sum_i \\mu_i(1-\\mu_i)(x_i^\\top v)^2$, a nonnegatively weighted sum of squares"
+    wrong:
+      - "The sigmoid is convex, and a sum of convex functions is convex"
+      - "The gradient $X^\\top(\\mu - y)$ is linear in $w$"
+      - "Binary labels satisfy $y_i^2 = y_i$, which cancels the cross terms"
+    explanation: |
+      The Hessian is $\sum_i \mu_i(1-\mu_i)x_ix_i^\top$, and each weight lies in $[0, 1/4]$, so every quadratic form is nonnegative. The sigmoid is *not* convex: it is convex for $a < 0$ and concave for $a > 0$. What is convex is $-\log\sigma(a) = \log(1 + e^{-a})$. The gradient is nonlinear in $w$ through $\mu = \sigma(Xw)$, which is why there's no closed form.
+    source: "Murphy PML1 §10.2.3.4"
+
+  - id: q6
+    prompt: |
+      Each image can carry any subset of 20 tags (e.g. "beach" and "sunset" together). Which output layer and loss fit this?
+    correct: "20 independent sigmoids, each with its own binary cross-entropy"
+    wrong:
+      - "A 20-way softmax with cross-entropy against the normalized tag vector"
+      - "A 20-way softmax, predicting every tag whose probability exceeds 0.5"
+      - "A 20-way softmax at temperature $T > 1$, so several tags can be high"
+    explanation: |
+      Softmax probabilities sum to 1, which encodes "exactly one class". With two true tags, at most one can exceed 0.5, and a normalized target makes co-occurring tags compete for mass. Temperature only reshapes the same constrained distribution. Independent sigmoids model each $P(\text{tag}_k \mid x)$ separately: this is multi-label classification.
+    source: "Murphy PML1 §10.3 (eq. 10.56)"
+
+  - id: q7
+    prompt: |
+      Two classes have heavy-tailed, clearly non-Gaussian class-conditional distributions with occasional gross outliers, and $N$ is large. You want a linear classifier with reliable probabilities. Which is the best choice?
+    correct: "Logistic regression, because it models only $p(y \\mid x)$"
+    wrong:
+      - "LDA, because it is more data-efficient than logistic regression"
+      - "QDA, because separate covariances absorb the heavy tails"
+      - "Any of them, since LDA and logistic regression share the same form"
+    explanation: |
+      LDA's efficiency advantage holds only when the shared-covariance Gaussian model is true. Here it isn't, and outliers distort LDA's pooled covariance and so its $w = \Sigma^{-1}(\mu_1 - \mu_0)$. Logistic regression fits the conditional likelihood and leaves $p(x)$ unmodelled. QDA is still a Gaussian model, with even more parameters to corrupt, and gives a quadratic boundary. "Same form" doesn't mean the same estimates.
+    source: "ESL §4.4.5; Murphy PML1 §9.2.3"
+
+  - id: q8
+    prompt: |
+      1-D LDA: class 1 is $\mathcal{N}(2, 1)$, class 0 is $\mathcal{N}(0, 1)$, and the prior is $P(y{=}1) = 0.2$. Where is the decision boundary $P(y{=}1 \mid x) = 0.5$?
+    correct: "$x \\approx 1.69$"
+    wrong:
+      - "$x = 1.00$"
+      - "$x \\approx 0.31$"
+      - "$x \\approx 1.35$"
+    explanation: |
+      $a = 2x - 2 + \ln(0.2/0.8)$. Setting $a = 0$ gives $x = 1 + \ln 4/2 = 1.69$. The rarer class needs more evidence, so the boundary moves *toward* its mean. The value 1.00 ignores the prior, 0.31 moves it the wrong way, and 1.35 divides $\ln 4$ by 4 instead of by the slope $w = 2$.
+    source: "Bishop PRML §4.2.1 (eqs. 4.66–4.67); Murphy PML1 §9.2.2"
+
+  - id: q9
+    prompt: |
+      The figure shows softmax probabilities over logits $(z_1, 1, 0)$ as $z_1$ varies. In the $T = 1$ panel, what is the ratio of curve B to curve C at any $z_1$?
+
+      ![Softmax over logits $(z_1, 1, 0)$ at $T = 1$ and $T = 3$.](fund.logistic-regression/softmax-temperature)
+    correct: "$e \\approx 2.72$, the same for every $z_1$"
+    wrong:
+      - "$e^{1/3} \\approx 1.40$, the same for every $z_1$"
+      - "It grows as $z_1$ increases, because $z_1$ takes mass from C first"
+      - "It equals 1 once $z_1$ is large, because both tend to 0"
+    explanation: |
+      B and C are the classes with logits 1 and 0. Their ratio is $e^{(1-0)/T}$, and the shared normalizer cancels, so $z_1$ has no effect. That is why the two falling curves keep the same proportion. At $T = 1$ the ratio is $e$. The value $e^{1/3}$ is the $T = 3$ panel. Both curves tend to 0, but their *ratio* stays fixed.
+    source: "Murphy PML1 §2.5.2"
+
+  - id: q10
+    prompt: |
+      In float64 you compute `np.exp(z) / np.exp(z).sum()` for logits $z = (1000, 1001, 1002)$. What do you get?
+    correct: "nan in every entry, because each exponential overflows to inf"
+    wrong:
+      - "$(0.090, 0.245, 0.665)$, because float64 has ample range"
+      - "$(0, 0, 1)$, because the largest term swamps the others"
+      - "$(1/3, 1/3, 1/3)$, because the logits round to equal values"
+    explanation: |
+      $e^{1000}$ exceeds float64's maximum (about $e^{709.8}$), so every term is `inf`, and `inf/inf` is `nan`. Subtracting $\max z$ first gives the logits $(-2, -1, 0)$ and the correct $(0.090, 0.245, 0.665)$. The answer is exact because of shift invariance. Float64 resolves 1000 vs 1001 without trouble; the problem is overflow, not rounding.
+    source: "Murphy PML1 §2.5.4"
+
+  - id: q11
+    prompt: |
+      A PyTorch model ends in `softmax`, and its outputs are passed to `nn.CrossEntropyLoss`. What happens?
+    correct: "Training runs, but softmax is applied twice: outputs are squashed and gradients shrink"
+    wrong:
+      - "PyTorch raises an error, because the inputs don't look like logits"
+      - "Results are identical, because softmax applied twice equals softmax"
+      - "The loss turns negative, because the log of a probability is negative"
+    explanation: |
+      `CrossEntropyLoss` applies log-softmax to its input. Probabilities in $[0, 1]$ differ by at most 1 when used as logits, so the second softmax is close to uniform. The loss can't approach 0 and gradients are small, but nothing errors. Softmax is not idempotent. The cross-entropy $-\log p_y$ is always nonnegative.
+    source: "Murphy PML1 §2.5.4; d2l §4.1"
+
+  - id: q12
+    prompt: |
+      A screening model outputs calibrated probabilities $\mu = P(\text{disease} \mid x)$. Missing a sick patient costs 4 times as much as a false alarm. Above what $\mu$ should you flag a patient?
+    correct: "0.20"
+    wrong:
+      - "0.80"
+      - "0.50"
+      - "0.25"
+    explanation: |
+      Flagging costs $(1-\mu)c_{FP}$ in expectation and not flagging costs $\mu\, c_{FN} = 4\mu\, c_{FP}$. Flag when $4\mu > 1 - \mu$, i.e. $\mu > 1/5$. The value 0.25 is $c_{FP}/c_{FN}$ instead of $c_{FP}/(c_{FP} + c_{FN})$. The value 0.80 has the costs swapped.
+    source: "Bishop PRML §1.5.2"
+
+  - id: q13
+    prompt: |
+      One SGD step on the logistic loss with $\eta = 1$: input $x = (1, 2)$ (first entry is the intercept input), label $y = 1$, current $w = (0, 0.5)$. What is the new $w$? ($\sigma(1) \approx 0.731$.)
+    correct: "$(0.269,\\ 1.038)$"
+    wrong:
+      - "$(0.731,\\ 1.962)$"
+      - "$(-0.269,\\ -0.038)$"
+      - "$(0,\\ 0.5)$"
+    explanation: |
+      $\mu = \sigma(w^\top x) = \sigma(1) = 0.731$ and $w \leftarrow w - (\mu - y)x = (0, 0.5) + 0.269\,(1, 2)$. The second distractor uses $\mu$ instead of $y - \mu$ as the error. The third steps up the gradient. The last is the perceptron's rule: the point is already classified correctly, so the perceptron wouldn't update, but logistic regression still pushes $\mu$ toward 1.
+    source: "Murphy PML1 §10.2.4–10.2.5"
+
+cards:
+  - id: f1
+    front: Give the sigmoid's symmetry, derivative and inverse.
+    back: |
+      $\sigma(-a) = 1 - \sigma(a)$. $\sigma'(a) = \sigma(a)(1 - \sigma(a))$, at most $1/4$ (at $a = 0$). $\sigma^{-1}(p) = \log\frac{p}{1-p}$ (the logit).
+    source: "Murphy PML1 §2.4.2"
+  - id: f2
+    front: Binary logistic regression - write the NLL, its gradient and its Hessian.
+    back: |
+      $\mathrm{NLL} = -\sum_i[y_i\log\mu_i + (1-y_i)\log(1-\mu_i)]$, $\mu_i = \sigma(w^\top x_i)$. Gradient $X^\top(\mu - y)$. Hessian $X^\top SX$, $S = \mathrm{diag}(\mu_i(1-\mu_i))$, which is PSD, so the NLL is convex.
+    source: "Murphy PML1 §10.2.3"
+  - id: f3
+    front: Write the logistic loss with labels $s_i \in \{-1, +1\}$.
+    back: |
+      $\sum_i \log(1 + e^{-s_iw^\top x_i})$, a function of the margin $s_i w^\top x_i$. It is the same loss as the $\{0, 1\}$ binary cross-entropy.
+    source: "Murphy PML1 §10.2.3.1 (eq. 10.13)"
+  - id: f4
+    front: Give the softmax Jacobian and the gradient of $-\log p_y$ with respect to the logits.
+    back: |
+      $\partial p_k/\partial z_j = p_k(\delta_{kj} - p_j)$, i.e. $\mathrm{diag}(p) - pp^\top$. $\partial(-\log p_y)/\partial z = p - e_y$. For weights: $\nabla_{w_k} = (p_k - [y{=}k])\,x$.
+    source: "Murphy PML1 §10.3.2.3"
+  - id: f5
+    front: State the log-sum-exp trick and why it works.
+    back: |
+      $\log\sum_j e^{z_j} = m + \log\sum_j e^{z_j - m}$, $m = \max_j z_j$. The largest term becomes $e^0 = 1$, so the sum lies in $[1, K]$: no overflow and no $\log 0$. The trick is exact because softmax is shift-invariant.
+    source: "Murphy PML1 §2.5.4"
+  - id: f6
+    front: For shared-covariance Gaussian classes, what are $w$ and $w_0$ in $P(y{=}1 \mid x) = \sigma(w^\top x + w_0)$?
+    back: |
+      $w = \Sigma^{-1}(\mu_1 - \mu_0)$, $w_0 = -\tfrac12\mu_1^\top\Sigma^{-1}\mu_1 + \tfrac12\mu_0^\top\Sigma^{-1}\mu_0 + \log(\pi_1/\pi_0)$. With class-specific covariances a quadratic term survives (QDA).
+    source: "Bishop PRML §4.2.1 (eqs. 4.66–4.67)"
+  - id: f7
+    front: Write the IRLS (Newton) update for logistic regression.
+    back: |
+      $w_{\text{new}} = (X^\top SX)^{-1}X^\top Sz$, with working response $z = Xw + S^{-1}(y - \mu)$ and $S = \mathrm{diag}(\mu_i(1-\mu_i))$: a weighted least-squares fit whose weights are recomputed each iteration.
+    source: "Murphy PML1 §10.2.6 (eqs. 10.36–10.42)"
+  - id: f8
+    front: How do you interpret a logistic-regression coefficient $w_j$?
+    back: |
+      A one-unit increase in $x_j$, holding the others fixed, adds $w_j$ to the log-odds, i.e. multiplies the odds by $e^{w_j}$ ($w_j = 0.693$ doubles them). The change in probability depends on the starting $p$ and is largest near $p = 0.5$.
+    source: "Murphy PML1 §10.2.1; ESL §4.4.2"
+  - id: f9
+    type: open
+    front: Derive the gradient and Hessian of the logistic-regression NLL, and show it is convex.
+    back: |
+      1. $p(y_i \mid x_i) = \mu_i^{y_i}(1-\mu_i)^{1-y_i}$, $\mu_i = \sigma(a_i)$, $a_i = w^\top x_i$. The NLL is binary cross-entropy.
+      2. $\sigma' = \sigma(1-\sigma)$ gives $\nabla\mu_i = \mu_i(1-\mu_i)x_i$, hence $\nabla\log\mu_i = (1-\mu_i)x_i$ and $\nabla\log(1-\mu_i) = -\mu_ix_i$.
+      3. Gradient: $-\sum[y_i(1-\mu_i) - (1-y_i)\mu_i]x_i = \sum(\mu_i - y_i)x_i = X^\top(\mu - y)$.
+      4. Hessian: $\sum\mu_i(1-\mu_i)x_ix_i^\top = X^\top SX$.
+      5. $v^\top Hv = \sum\mu_i(1-\mu_i)(x_i^\top v)^2 \ge 0$, so convex; strictly convex with full column rank.
+      6. Remarks: "prediction minus label" comes from the canonical link (same form as least squares). No closed form, so use GD, SGD or Newton/IRLS. Convexity doesn't guarantee a minimizer exists (separable data).
+    source: "Murphy PML1 §10.2.3; Bishop PRML §4.3.2–4.3.3"
+  - id: f10
+    type: open
+    front: Explain to an interviewer what goes wrong with logistic regression on linearly separable data, and how to fix it.
+    back: |
+      - Let $u$ separate the data: $s_iu^\top x_i > 0$ for all $i$. Then $\mathrm{NLL}(cu) = \sum\log(1 + e^{-c\,s_iu^\top x_i})$ decreases strictly to 0 as $c \to \infty$.
+      - Every term is positive at finite $w$, so the infimum 0 is not attained: there is no finite MLE, despite convexity.
+      - In practice: $\|w\|$ diverges, predicted probabilities go to 0/1, standard errors explode, and the Hessian becomes near-singular as $S \to 0$.
+      - Any separating hyperplane achieves the same limit, so ML can't choose. GD picks one implicitly: its direction converges (slowly, like $1/\log t$) to the hard-margin SVM direction (Soudry et al. 2018).
+      - Fixes: L2 penalty / Gaussian prior (unique finite MAP), early stopping, or Bayesian averaging. LDA's estimates stay finite here because they also use $p(x)$.
+    source: "Bishop PRML §4.3.2; ESL §4.4.5"
+  - id: f11
+    type: open
+    front: Compare LDA, QDA and logistic regression.
+    back: |
+      - **Shared origin**: Bayes' rule gives $P(y{=}1 \mid x) = \sigma(a)$ with $a$ the log of the likelihood ratio times the prior ratio.
+      - **LDA**: Gaussian classes with a shared $\Sigma$. Quadratic terms cancel, so $a = w^\top x + w_0$ with $w = \Sigma^{-1}(\mu_1 - \mu_0)$. Fit by the joint likelihood (class means, pooled covariance, priors). Closed form, no iterations.
+      - **QDA**: class-specific $\Sigma_k$, quadratic boundary, $O(Kd^2)$ covariance parameters, so higher variance.
+      - **Logistic regression**: the same linear form as LDA, but fitted by the conditional likelihood and makes no assumption on $p(x)$. Robust to non-Gaussian classes and outliers. Iterative fitting; undefined on separable data unless regularized.
+      - **Trade-off**: if the LDA model holds, LDA is more efficient (ESL: about 30% asymptotic efficiency loss for logistic regression, Efron 1975) and can use unlabelled data. If it doesn't, logistic regression is safer. With large $N$, logistic regression is the usual default.
+    source: "ESL §4.4.5; Murphy PML1 §9.2; Bishop PRML §4.2"
+  - id: f12
+    type: open
+    front: Derive the softmax cross-entropy gradient two ways, and explain why it sums to zero.
+    back: |
+      - **Via log-sum-exp**: $L = -z_y + \log\sum_je^{z_j}$. $\partial/\partial z_k$ of the second term is $e^{z_k}/\sum e^{z_j} = p_k$, so $\partial L/\partial z = p - e_y$.
+      - **Via the Jacobian**: $\partial p_k/\partial z_j = p_k(\delta_{kj} - p_j)$ (quotient rule). $\partial L/\partial p_k = -[k{=}y]/p_k$. Chain rule: $\partial L/\partial z_j = -\frac{1}{p_y}p_y(\delta_{yj} - p_j) = p_j - \delta_{yj}$.
+      - **Sums to zero**: $\sum_j(p_j - \delta_{yj}) = 1 - 1 = 0$. Equivalently, adding a constant to all logits leaves $L$ unchanged (shift invariance), so the gradient is orthogonal to $\mathbf 1$.
+      - **Convexity**: the Hessian in $z$ is $\mathrm{diag}(p) - pp^\top$, the covariance of the one-hot vector under $p$, hence PSD. So softmax regression is convex in $W$.
+      - **Weights**: $\nabla_{W} L = (p - e_y)x^\top$.
+    source: "Murphy PML1 §10.3.2.3–10.3.2.4"
+
+reading:
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, ch. 10 (Logistic Regression)"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: The cleanest full derivations of the gradient, Hessian, IRLS, perceptron and the multinomial case (§10.2–10.3). §9.2 covers GDA, LDA and QDA, and §2.5.4 the log-sum-exp trick.
+  - title: "Bishop, Pattern Recognition and Machine Learning, §4.2–4.3"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: How the sigmoid falls out of Gaussian class-conditionals, plus IRLS, probit and canonical links. Read §4.3.2 for the separable-data degeneracy.
+  - title: "The Elements of Statistical Learning, §4.4 (Logistic Regression), esp. §4.4.5"
+    url: https://hastie.su.domains/ElemStatLearn/
+    kind: book
+    note: The classic "logistic regression or LDA?" discussion (conditional vs joint likelihood, efficiency, robustness).
+  - title: "CS229 Lecture Notes, ch. 2 and §4.1"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: Gentle derivations of logistic regression, the perceptron, softmax and Newton's method, plus the GDA-vs-logistic discussion.
+  - title: "Dive into Deep Learning, §4.1 Softmax Regression"
+    url: https://d2l.ai/chapter_linear-classification/softmax-regression.html
+    kind: book
+    note: Softmax regression as the last layer of a network, the cross-entropy loss and the numerical-stability details.

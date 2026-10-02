@@ -1,0 +1,426 @@
+id: sb.alltoall-overlap
+area: scalingbook
+title: "Collectives II: AllToAll, Transposes and Overlap"
+summary: The fourth collective (AllToAll) and why it costs a quarter of an AllGather. Why AllGather and ReduceScatter are each other's gradients, how deferring an AllGather saves half an AllReduce, how collective matmuls hide communication, and two worked sharding problems.
+order: 80
+level: core
+tags: [scaling-book, collectives, alltoall, moe, communication]
+prereqs: [sb.collective-costs]
+
+explainer:
+  - title: "AllToAll: moving a subscript"
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll"'
+    body: |
+      Matmuls need AllGather, ReduceScatter and AllReduce. A fourth collective comes up constantly in practice: the **AllToAll**, a sharded transpose.
+
+      $$\textbf{AllToAll}_{X, J}\!: A[I_X, J] \rightarrow A[I, J_X]$$
+
+      It moves the subscript from one dimension to another. Before, device $d$ holds row block $d$ (all columns). After, it holds column block $d$ (all rows). Cut each device's row block into $N$ pieces by column: piece $j$ must go to device $j$, and device $d$ keeps piece $d$.
+
+      ![AllToAll on 4 devices: block (i, j) moves from device i to device j; the diagonal stays put](sb.alltoall-overlap/alltoall-blocks)
+
+      **Where it shows up.**
+
+      - **Mixture-of-experts (MoE)** layers: tokens sharded by batch must be sent to the devices holding their chosen experts, and the results sent back. That is two AllToAlls per MoE layer (lesson 110).
+      - **Switching layouts** between parts of a model that want different shardings, for example sequence-sharded vs head-sharded attention, or batch-sharded KV caches in inference (lesson 240).
+
+      Unlike an AllGather, nothing is replicated: every byte ends on exactly one device, so total data is conserved. That is why it can be much cheaper.
+  - title: "Why AllToAll is cheap: counting hops"
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll", Question 10'
+    body: |
+      Measure cost by the load on the busiest link, in units of the full array size $V$. Each device holds $V/N$, cut into $N$ pieces of $V/N^2$.
+
+      **AllGather, one direction.** Every shard must pass through every link: load $(N-1)V/N \to V$.
+
+      **AllToAll, one direction.** A piece bound for a device $k$ steps away travels $k$ hops, so device 0's pieces travel $1 + 2 + \dots + (N-1) = N(N-1)/2$ piece-hops. By symmetry each link carries that much:
+
+      $$\frac{V}{N^2}\cdot\frac{N(N-1)}{2} \to \frac{V}{2}.$$
+
+      Half, because each piece stops at its destination instead of going all the way round.
+
+      **Both directions.** The AllGather halves its per-direction load, to $V/2$. The AllToAll does better: every piece takes the short way, at most $N/2$ hops, and the hops split across two directions. With the antipodal piece split, the busiest direction carries $N^2/8$ piece-hops: $V/8$. Equivalently, the average distance on a ring is $N/4$.
+
+      ![Busiest-link load for AllGather and AllToAll on a ring of N devices, one way and both ways](sb.alltoall-overlap/chunk-hops)
+
+      The ratio of bidirectional costs is $\tfrac12 / \tfrac18 = 4$:
+
+      $$T_\text{AllToAll} \approx \frac{V}{4W}.$$
+
+      This counts the shard opposite each device (the antipodal piece) as split across both directions. Then the busiest direction carries exactly $N^2/8$ piece-hops for every even $N$, and the ratio to the book's AllGather time $V/W$ is exactly 4. Sending the antipodal piece one way instead gives slightly more for small $N$, approaching the same ¼.
+  - title: AllToAll on a multi-dimensional mesh
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll"'
+    body: |
+      On an $A\times B\times C$ torus with $N = ABC$ devices, the book gives
+
+      $$T_\text{AllToAll} = \frac{V\cdot\max(A, B, C, \dots)}{4N\,W}.$$
+
+      For a 1D ring ($N = A$) this is $V/(4W)$, as derived.
+
+      **Why the max axis.** A bisection argument. In an AllToAll, each half of the mesh must send half its data, $V/4$ bytes, to the other half. The narrowest cut through a torus runs perpendicular to its longest axis. Because of the wraparound it crosses two planes, each of $N/\max$ links, giving one-way capacity $N W_1\cdot2/\max = N W/\max$. Dividing $V/4$ by that gives the formula. Strictly, bisection gives a lower bound; counting link loads (an average of $A/4$ hops along the longest axis) shows the bound is achieved. It needs wraparound on every axis, which v5e slices shorter than 16 lack.
+
+      **Worked example.** AllToAll of $V$ bytes over 256 chips:
+
+      - as a 1D ring of 256: $V/(4W)$;
+      - as a $16\times16$ torus: $V\cdot16/(4\cdot256\,W) = V/(64W)$, which is **16× cheaper**.
+
+      In 2D the cost falls with the size of the *shorter* axis. A squarer mesh has a wider bisection.
+
+      This is one reason expert parallelism (placing different experts on different devices) is attractive on TPU tori: the AllToAlls it needs get cheaper as the mesh grows in more dimensions. (Lesson 350 shows GPUs behave differently once an AllToAll leaves the 8-GPU NVLink node.)
+  - title: AllGather and ReduceScatter are each other's gradients
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    body: |
+      ReduceScatter is more fundamental than it looks: it is the **reverse-mode derivative** of AllGather, and vice versa.
+
+      **Why.** Both are linear maps. For a linear map $y = Mx$, backpropagation computes $\partial L/\partial x = M^\top\,\partial L/\partial y$. So the backward of a collective is its **transpose**.
+
+      Over $p$ devices, broadcasting a vector $x\in\mathbb{R}^n$ to every device is the matrix $u \otimes I_n$, with $u = (1,\dots,1)\in\mathbb{R}^p$. Summing $p$ vectors is $u^\top \otimes I_n$. Since $(A\otimes B)^\top = A^\top\otimes B^\top$, **reduce = broadcast$^\top$**. An AllGather is a broadcast applied shard by shard, and a ReduceScatter is a reduce applied shard by shard, so
+
+      $$\text{AllGather}^\top = \text{ReduceScatter}.$$
+
+      ![AllGather and ReduceScatter for 2 devices with one value per shard, written as matrices: each is the other's transpose](sb.alltoall-overlap/transpose-matrices)
+
+      **Tiny check.** With $p = 2$, $n = 1$: broadcast sends $7 \mapsto (7, 7)$ via the column $(1, 1)^\top$. Its transpose, the row $(1\;1)$, sends $(8, 9)\mapsto 17$: a sum.
+
+      **Consequence.** If the forward pass does $\text{AllGather}_X(A[I_X]) \to A[I]$, the backward pass must do $\text{ReduceScatter}_X(A'[I]\{U_X\}) \to A'[I_X]$ on the gradients, which in general differ across devices. This is exactly the pattern of FSDP (fully-sharded data parallelism, lesson 140), which shards each weight matrix across the data-parallel devices: gather weights going forward, reduce-scatter weight gradients coming back. The reverse also holds: a forward ReduceScatter means a backward AllGather.
+  - title: "Deferring the AllGather"
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    body: |
+      Since AllReduce = ReduceScatter + AllGather, we can stop half-way. In Case 3, instead of
+
+      $$A[I, J_X]\cdot B[J_X, K] \rightarrow C[I, K]\{U_X\} \xrightarrow{\text{AR}} C[I, K]$$
+
+      at cost $2V/W$, do
+
+      $$C[I, K]\{U_X\} \xrightarrow{\text{RS}_{X,K}} C[I, K_X]$$
+
+      at cost $V/W$. Then pay the AllGather later, only if and when a full copy is needed.
+
+      Often it never is. Lesson 150 shows a pattern in tensor parallelism. The first matmul of a transformer MLP produces activations sharded over $F$. The second produces partial sums, which are **reduce-scattered** back to a sharded layout ready for the next layer. That replaces two AllReduces with one AllGather plus one ReduceScatter.
+
+      **Choosing the axis.** A ReduceScatter introduces a new subscript, and we may put it on either output dimension ($C[I_X, K]$ or $C[I, K_X]$). The choice is usually forced by what the next operation needs. Choosing to match it avoids a later re-layout (often an AllToAll).
+
+      **Worked example.** With $V = 2$ GB of gradients on a v5p ring, an AllReduce costs ≈ 22 ms; a ReduceScatter alone costs ≈ 11 ms.
+  - title: Overlapping communication with compute
+    source: Scaling Book ch. 3 (Sharding) §"How to overlap matmul communication with compute"; Scaling Book ch. 10 §"Manual sharding mode via shard_map"
+    body: |
+      The roofline assumed communication overlaps with computation, giving $\max$ instead of sum. For sharded matmuls this has to be engineered, because the collective produces the very data the matmul needs.
+
+      The technique is the **collective matmul** (Wang et al., 2023). For $A[B_X, D_Y]\cdot W[D, F_Y]$ the naive plan AllGathers $A$ over $Y$, then multiplies. The overlapped plan splits the work by chunks of $D$:
+
+      1. Multiply the local chunk of $A$ by the matching rows of $W$; add to an accumulator.
+      2. **Simultaneously** pass the local $A$ chunk to the next device on the ring (a `ppermute` in JAX).
+      3. Repeat $|Y|$ times, until every chunk has visited every device.
+
+      Each ring step hides under one chunk's matmul. The matmul still does all its FLOPs; it just never waits for the whole gather.
+
+      ![Schematic: blocking gather then matmul vs a collective matmul that hides each ring shift under a chunk of compute. The 87/224 µs split is inferred as 311 − 224 µs.](sb.alltoall-overlap/collective-matmul)
+
+      **Measured (book ch. 10, TPU v5e 8-chip slice).** Blocking AllGather + matmul: 311 µs. Collective matmul: 244 µs. The same matmul with no sharded contraction: 224 µs. So overlap recovered most of the gather. The book reports only the three totals; the figure's split of 311 µs into an 87 µs gather plus a 224 µs matmul is our inference (311 − 224).
+
+      The same idea works for ReduceScatter: permute and accumulate partial outputs while computing the next chunk.
+  - title: "Worked problems: minimum latency (Q5) and three layouts (Q6)"
+    source: Scaling Book ch. 3 (Sharding), Questions 5 and 6
+    body: |
+      **Book Q5.** Compute $A[I, J]\cdot B[J, K]$ on a TPU v4p $4\times4\times4$ cube (wraparound on all 3 axes, $W = 9\times10^{10}$ B/s) as fast as possible, with $C$ **replicated** at the end. Take $I = J = K = 8192$, bf16.
+
+      - **Shard $I$ (or $K$) over all 64 chips**, multiply locally, AllGather $C$ ($V = 2IK$) over 3 axes: $V/(3W) \approx 0.50$ ms, with $2IJK/64$ FLOPs per chip ≈ 0.06 ms.
+      - **Shard $J$**: partial sums, then AllReduce $C$: $2V/(3W) \approx 1.0$ ms.
+      - **Replicate everything**: no communication, but $2IJK$ FLOPs per chip ≈ 4.0 ms.
+
+      The book's answer: sharding $I$ or $K$ is best, and the two tie.
+
+      **Book Q6, timed.** A TPU v5e $4\times4$ (axes are lines of 4: no wraparound), $|I| = |J| = |K| = 8192$, bf16. Every layout does $2IJK/16 \approx 6.9\times10^{10}$ FLOPs per chip ≈ 349 µs.
+
+      - $A[I_X, J_Y]\cdot B[J_Y, K]\to C[I_X, K]$ (Case 3): AllReduce $C\{U_Y\}$ of 33.5 MB along a line, ≈ $1.5\,V/W_1 \approx 1.1$ ms. **Comms-bound**, 3.2×.
+      - $A[I_X, J]\cdot B[J_X, K_Y]\to C[I_X, K_Y]$, the usual training layout: data parallelism on $X$, tensor parallelism on $Y$, and the weights also split over $X$ (ZeRO-style: weights and optimizer state sharded across data-parallel devices). AllGather $B$ over $X$ (33.5 MB): ≈ $0.75\,V/W_1 \approx 0.56$ ms. **Comms-bound**, 1.6×; a larger batch $I$ fixes it.
+      - $A[I_X, J]\cdot B[J, K_Y]\to C[I_X, K_Y]$, the usual inference layout: Case 1, no communication, 349 µs.
+  - title: "Worked problem: an MLP on a 2×2 (Q7)"
+    source: Scaling Book ch. 3 (Sharding), Question 7; Scaling Book ch. 1 §"Matrix multiplication"
+    body: |
+      **Book Q7** (the book leaves the arithmetic as an exercise; ours follows). An MLP $\text{In}[B, D]\cdot W_\text{in}[D, F]\cdot W_\text{out}[F, D]$ with $D = 8192$, $F = 32768$, $B = 128$, bf16, on a TPU v5e $2\times2$ where each chip has only 300 MB free. Each weight is $2DF \approx 537$ MB, so they must be sharded.
+
+      **FSDP** (shard weights, gather per layer) fails: a gathered 537 MB matrix doesn't fit in 300 MB, and moving ≈ 1 GB per layer would take ≈ 9 ms.
+
+      **Tensor parallel:** $\text{In}[B, D_{XY}]$, $W_\text{in}[D, F_{XY}]$, $W_\text{out}[F_{XY}, D]$, $\text{Out}[B, D_{XY}]$.
+
+      - Weights: $2\times537/4 \approx 268$ MB per chip, which fits.
+      - Comms: AllGather In and ReduceScatter Out, 2.1 MB each. Each chip receives 3/4 of 2.1 MB through its 2 links (one per axis) at $W_1$: ≈ 17.5 µs each, ≈ 35 µs total. The multi-axis formula $V/(W N_\text{axes})$ would give 11.6 µs, but it assumes two links per axis; an axis of length 2 has one neighbour, hence one link.
+      - FLOPs: $4BDF/4 \approx 3.4\times10^{10}$ per chip, ≈ 174 µs.
+      - **HBM:** streaming the 268 MB of weight shards takes $2.68\times10^8/8.2\times10^{11} \approx 327$ µs.
+
+      So communication is well hidden, but the layer is **HBM-bound** (≈ 330 µs), not compute-bound. That is expected: with $B = 128$ tokens the matmul intensity is ≈ 128, below the v5e ridge of 240 (lesson 20).
+  - title: What interviewers probe
+    source: Scaling Book ch. 3 (Sharding)
+    body: |
+      - *What is an AllToAll, and where is it used?* A sharded transpose, $[I_X, J]\to[I, J_X]$. Used for MoE token routing (two per layer) and layout changes.
+      - *Why is it cheaper than an AllGather?* Each piece goes only to its destination, ≈ $N/4$ hops on average on a bidirectional ring. Cost ≈ $V/(4W)$ vs $V/W$; on a 2D torus it shrinks further with the smaller axis.
+      - *What's the backward of an AllGather?* A ReduceScatter of the gradients (and vice versa). Collectives are linear maps; backward applies the transpose, and reduce = broadcast$^\top$.
+      - *When would you ReduceScatter instead of AllReduce?* When the next op can use a sharded result: half the cost, with the AllGather deferred or avoided.
+      - *How do you hide collective latency in a sharded matmul?* Collective matmul: chunk the contraction and ring-pass chunks while computing (ppermute + accumulate).
+      - *What assumptions do the cost formulas need?* Bandwidth-bound messages, full rings, TPU-style torus; sharding on other axes reduces $V$.
+  - title: Key results
+    source: Scaling Book ch. 3 (Sharding)
+    body: |
+      $$\textbf{AllToAll}_{X,J}\!: A[I_X, J] \to A[I, J_X]$$
+
+      $$T_\text{AllToAll}^\text{ring} \approx \frac{V}{4W}$$
+
+      $$T_\text{AllToAll}^\text{torus} \approx \frac{V\max(A, B, \dots)}{4NW}$$
+
+      $$\text{AllGather}^\top = \text{ReduceScatter}$$
+
+      $$\text{AR} = \text{RS} + \text{AG} \;\Rightarrow\; \text{RS now, AG later}$$
+
+      - The four collectives (ring, bandwidth-bound): AllGather and ReduceScatter $V/W$; AllReduce $2V/W$; AllToAll $V/(4W)$.
+      - The AllToAll's ¼: pieces stop at their destination (½), and both directions halve the distance again (with the antipodal piece split).
+      - Forward AllGather ⇒ backward ReduceScatter (FSDP); and vice versa.
+      - Collective matmul hides ring steps under chunk matmuls (v5e: 311 → 244 µs vs 224 µs ideal).
+      - Assumptions: bandwidth-bound messages (else ≈ hops × 1 µs), full rings (lines cost up to 2×), TPU torus; axes of length 2 have one link.
+      - Low-batch layers can be HBM-bound even when comms are hidden (Q7: B = 128 < 240).
+
+quiz:
+  - id: q1
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll"'
+    prompt: |
+      What does $\textbf{AllToAll}_{X, J}$ do to $A[I_X, J]$?
+    correct: Produces $A[I, J_X]$
+    wrong:
+      - Produces $A[I, J]$
+      - Produces $A[I_X, J_X]$
+      - Produces $A[I_X, J]\{U_X\}$
+    explanation: |
+      An AllToAll moves the subscript from one dimension to another: rows split over $X$ become columns split over $X$. $A[I, J]$ would be an AllGather; $A[I_X, J_X]$ is illegal (axis used twice); an unreduced suffix comes from local matmuls, not AllToAll.
+  - id: q2
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll"'
+    prompt: |
+      On a TPU v5p mesh axis with wraparound ($W = 1.8\times10^{11}$ B/s bidirectional), roughly how long does an AllToAll of a 1 GB array take, compared with an AllGather of it?
+    correct: ≈ 1.4 ms, vs ≈ 5.6 ms for the AllGather
+    wrong:
+      - ≈ 5.6 ms, the same as the AllGather
+      - ≈ 2.8 ms, vs ≈ 5.6 ms for the AllGather
+      - ≈ 11 ms, twice the AllGather
+    explanation: |
+      AllGather ≈ $V/W = 5.6$ ms; AllToAll ≈ $V/(4W) \approx 1.4$ ms. Half (2.8 ms) is the one-direction ratio. Twice is the AllReduce, not the AllToAll.
+  - id: q3
+    source: Scaling Book ch. 3 (Sharding), Question 10
+    prompt: |
+      On a **unidirectional** ring of $N$ devices (large $N$), how does an AllToAll's busiest-link load compare with an AllGather's?
+    correct: About half
+    wrong:
+      - About a quarter
+      - About the same
+      - About twice
+    explanation: |
+      AllGather: every shard crosses every link, ≈ $V$ per link. AllToAll: pieces of $V/N^2$ travel $1, 2, \dots, N-1$ hops, summing to $V(N-1)/(2N) \approx V/2$. The quarter appears only with bidirectional links, where the AllToAll gains a further 2× on top of the AllGather's.
+  - id: q4
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll"'
+    prompt: |
+      An AllToAll of $V$ bytes runs over 256 TPU chips. Compare a 1D ring of 256 with a $16\times16$ 2D torus.
+    correct: The 2D torus is about 16× cheaper
+    wrong:
+      - The 2D torus is about 2× cheaper
+      - They cost the same, about V/(4W)
+      - The 1D ring is about 16× cheaper
+    explanation: |
+      $T = V\max(A, B)/(4NW)$. Ring: $V\cdot256/(4\cdot256\,W) = V/(4W)$. Torus: $V\cdot16/(4\cdot256\,W) = V/(64W)$, 16× less. The torus's bisection is much wider than the ring's.
+  - id: q5
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    prompt: |
+      Under FSDP, the forward pass AllGathers each weight matrix along the data axis. What collective must the backward pass apply to the weight gradients?
+    correct: A ReduceScatter along the data axis
+    wrong:
+      - An AllGather along the data axis
+      - An AllToAll along the data axis
+      - No collective; gradients stay local
+    explanation: |
+      Collectives are linear maps and backprop applies the transpose; $\text{AllGather}^\top = \text{ReduceScatter}$. Each device computes a different full-size gradient (it saw different data), so the gradients must be summed and re-sharded to match the sharded weights.
+  - id: q6
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    prompt: |
+      Broadcasting over 2 devices is the matrix $u\otimes I_n$ with $u = (1, 1)^\top$. For $n = 1$, what does its transpose do to the input $(8, 9)$?
+    correct: Returns 17, a sum
+    wrong:
+      - Returns (8, 9) unchanged
+      - Returns (17, 17), a sum copied to both devices
+      - Returns 8.5, a mean
+    explanation: |
+      For $n = 1$ the broadcast matrix is the column $(1, 1)^\top$, so its transpose is the row $(1\;1)$: $(8, 9)\mapsto 17$. "Reduce = broadcast$^\top$" is why the gradient of a gather is a reduce. $(17, 17)$ would be an AllReduce: a reduce followed by a broadcast.
+  - id: q14
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    prompt: |
+      Local matmuls leave $C[I, K]\{U_X\}$ of 600 MB on a TPU v5p ring ($W = 1.8\times10^{11}$ B/s), and the next layer can use $C$ sharded along $K$. What is the cheapest correct finish, and its cost?
+    correct: $\text{ReduceScatter}_{X,K}$, about 3.3 ms
+    wrong:
+      - AllReduce, then keep one K shard, ≈ 6.7 ms
+      - AllGather over X along K, about 3.3 ms
+      - AllToAll moving X from I to K, ≈ 0.8 ms
+    explanation: |
+      A ReduceScatter both sums the partials and leaves $C[I, K_X]$, at $V/W \approx 3.3$ ms. AllReduce-then-slice is correct but pays for an unneeded gather (6.7 ms). An AllGather or AllToAll cannot add up partial sums, so neither gives a correct result.
+  - id: q8
+    source: Scaling Book ch. 10 (JAX) §"Manual sharding mode via shard_map"; Scaling Book ch. 3 §"How to overlap matmul communication with compute"
+    prompt: |
+      A sharded matmul takes 311 µs with a blocking AllGather; the same local matmul alone takes 224 µs, so the gather costs about 87 µs (a split inferred from the two totals). With a perfect collective matmul, what is the best achievable time?
+    correct: About 224 µs
+    wrong:
+      - About 311 µs
+      - About 137 µs
+      - About 87 µs
+    explanation: |
+      Overlap turns sum into max: $\max(87, 224) = 224$ µs. The FLOPs don't shrink, so you can't go below the compute time. The book measures 244 µs: most, not all, of the gather is hidden.
+  - id: q9
+    source: Scaling Book ch. 3 (Sharding), Question 6
+    prompt: |
+      On a mesh $\{X, Y\}$, what communication does $A[I_X, J_Y]\cdot B[J_Y, K]\rightarrow C[I_X, K]$ need?
+    correct: Local matmuls, then an AllReduce of C over Y
+    wrong:
+      - An AllGather of A over Y before the matmul
+      - None; it is the communication-free case
+      - An AllGather of B over X before the matmul
+    explanation: |
+      Both inputs split the contracted dim $J$ over the same axis $Y$ (Case 3), so each device computes a partial sum $C[I_X, K]\{U_Y\}$; an AllReduce over $Y$ finishes it. Gathering $A$ over $Y$ alone would leave $B[J_Y, K]$ sharded on the contraction (Case 2), so a second collective would still be needed.
+  - id: q10
+    source: Scaling Book ch. 3 (Sharding), Question 6
+    prompt: |
+      In the common training layout $A[I_X, J]\cdot B[J_X, K_Y]\rightarrow C[I_X, K_Y]$, which collective is required?
+    correct: AllGather B over X before the matmul
+    wrong:
+      - AllReduce C over X after the matmul
+      - AllGather A over Y before the matmul
+      - No collective; it is Case 1
+    explanation: |
+      $B$ is split on the contracted dim over $X$, while $A$ uses $X$ for its rows, so the contraction can't be done locally and partial sums along $X$ would mix different rows. Gathering $B$ over $X$ (FSDP's weight gather) leaves Case 1: $A[I_X, J]\cdot B[J, K_Y]$.
+  - id: q11
+    source: Scaling Book ch. 3 (Sharding), Question 7
+    prompt: |
+      An MLP with $D = 8192$, $F = 32768$ (bf16) runs on a TPU v5e $2\times2$ where each chip has 300 MB free. Which sharding fits in memory and keeps communication small?
+    correct: Shard F over all 4 chips (tensor parallel)
+    wrong:
+      - Replicate the weights and shard the batch
+      - Shard the weights over D and gather each per layer
+      - Shard only $W_\text{in}$ and replicate $W_\text{out}$
+    explanation: |
+      Each weight is $2DF \approx 537$ MB. Tensor parallelism stores $2\times537/4 \approx 268$ MB per chip and only communicates 2 MB activations. Replication needs 1.07 GB per chip; FSDP must materialize a 537 MB gathered matrix; replicating $W_\text{out}$ alone needs $134 + 537$ MB.
+  - id: q12
+    source: Scaling Book ch. 3 (Sharding), Question 7
+    prompt: |
+      In that tensor-parallel MLP ($B = 128$ tokens), each chip must AllGather the 2 MB input and ReduceScatter the 2 MB output over 4 chips, receiving through 2 links of $4.5\times10^{10}$ B/s. Compare communication with compute ($1.97\times10^{14}$ FLOPs/s per chip).
+    correct: ≈ 35 µs of comms vs ≈ 174 µs of compute
+    wrong:
+      - ≈ 35 µs of comms vs ≈ 44 µs of compute
+      - ≈ 9 ms of comms vs ≈ 174 µs of compute
+      - ≈ 350 µs of comms vs ≈ 174 µs of compute
+    explanation: |
+      Each collective: a chip receives 3/4 of 2.1 MB over 2 links, ≈ 17 µs, so ≈ 35 µs for both. Compute per chip is $2\cdot2\cdot BDF/4 \approx 3.4\times10^{10}$ FLOPs, ≈ 174 µs, so the layer is not comms-bound. (It is in fact HBM-bound: reading the 268 MB of weight shards takes ≈ 327 µs, since $B = 128 < 240$.) 9 ms is what gathering the weights (FSDP) would cost.
+  - id: q13
+    source: Scaling Book ch. 3 (Sharding) §"What Have We Learned?"
+    prompt: |
+      Which statement is **false**?
+    correct: AllToAll costs as much as AllGather, as every byte must move
+    wrong:
+      - A ReduceScatter costs about the same as an AllGather of the full array
+      - An AllReduce can be built from a ReduceScatter followed by an AllGather
+      - All four collectives become latency-bound for small enough shards
+    explanation: |
+      In an AllToAll most bytes leave their device, but each piece travels only to its destination (≈ $N/4$ hops on a bidirectional ring), while an AllGather replicates every shard to every device. So AllToAll ≈ $V/(4W)$ vs $V/W$. The other three statements are true.
+
+  - id: q15
+    source: Scaling Book ch. 3 (Sharding), Question 5
+    prompt: |
+      On a TPU v4p $4\times4\times4$ cube ($W = 9\times10^{10}$ B/s, wraparound on all axes), compute $A[I, J]\cdot B[J, K]$ with $I = J = K = 8192$ (bf16), ending with $C$ replicated, as fast as possible. Which plan wins?
+    correct: Shard I over all 64 chips, then AllGather C (≈ 0.5 ms)
+    wrong:
+      - Shard J over all 64 chips, then AllReduce C (≈ 0.5 ms)
+      - Replicate everything, no communication at all (≈ 0.5 ms)
+      - Shard J over all 64 chips, then AllGather C (≈ 1.0 ms)
+    explanation: |
+      Sharding $I$: $2IJK/64$ FLOPs per chip (≈ 0.06 ms), then AllGather $V = 2IK$ over 3 axes: $V/(3W) \approx 0.50$ ms. Sharding $J$ needs an AllReduce of the same $V$, ≈ 1.0 ms (2×), and an AllGather can't sum partial results. Full replication avoids communication but every chip does all $2IJK$ FLOPs, ≈ 4 ms. Sharding $K$ ties with $I$.
+cards:
+  - id: f1
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll"'
+    front: What does an AllToAll do, and what are its main uses?
+    back: |
+      Moves a subscript: $A[I_X, J]\to A[I, J_X]$ (piece $j$ of device $d$ goes to device $j$). Used for MoE token routing (two per layer) and changing layouts between model regions.
+  - id: f2
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll"'
+    front: AllToAll cost on a bidirectional ring and on an N-D torus?
+    back: |
+      Ring ≈ $V/(4W)$, a quarter of an AllGather. Torus: $V\max(A, B, C, \dots)/(4NW)$, falling with the shortest axis in 2D.
+  - id: f3
+    source: Scaling Book ch. 3 (Sharding), Question 10
+    front: Where does the AllToAll's factor of ¼ come from?
+    back: |
+      One direction: pieces stop at their destination, $1 + \dots + (N-1)$ piece-hops, giving ½ of an AllGather. Both directions: pieces go the short way (≤ N/2 hops) split over two directions, $\approx V/8$ vs the AllGather's $V/2$ per direction. Ratio exactly ¼ when the antipodal piece is split across both directions.
+  - id: f4
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    front: How are AllGather and ReduceScatter related in backpropagation?
+    back: |
+      Each is the transpose (reverse-mode derivative) of the other, since reduce = broadcast$^\top$. Forward AllGather ⇒ backward ReduceScatter of gradients; forward ReduceScatter ⇒ backward AllGather.
+  - id: f5
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    front: What is "deferring the AllGather"?
+    back: |
+      Finish a partial-sum matmul with a ReduceScatter (cost $V/W$) instead of an AllReduce ($2V/W$), keep the result sharded, and AllGather later only if needed.
+  - id: f6
+    source: Scaling Book ch. 3 (Sharding) §"How to overlap matmul communication with compute"
+    front: What is a collective matmul?
+    back: |
+      A sharded matmul that splits the contraction into chunks and passes chunks around the ring (ppermute) while multiplying the current one, so communication hides under compute (Wang et al. 2023).
+  - id: f7
+    type: open
+    source: 'Scaling Book ch. 3 (Sharding) §"Our final communication primitive: the AllToAll", Question 10'
+    front: Derive why an AllToAll costs about a quarter of an AllGather on a bidirectional ring.
+    back: |
+      - Each device holds $V/N$, split into $N$ pieces of $V/N^2$, one per destination.
+      - AllGather: every shard reaches every device; per-direction link load ≈ $(N/2)(V/N) = V/2$ with both directions.
+      - AllToAll one-way: piece for distance $k$ travels $k$ hops; $\sum_k k = N(N-1)/2$, so the load is ≈ $V/2$ (vs $V$ for a one-way AllGather).
+      - Both ways: pieces take the short route, ≤ $N/2$ hops; the busier direction carries ≈ $(N/2)^2/2$ piece-hops, i.e. ≈ $V/8$.
+      - Ratio $\tfrac12/\tfrac18 = 4$, so $T \approx V/(4W)$. Alternatively: average distance $N/4$, or a bisection argument.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"More about the ReduceScatter"
+    front: Explain to an interviewer why the backward pass of an AllGather is a ReduceScatter, and give a training example.
+    back: |
+      - Collectives are linear: $y = Mx$. Backprop gives $\partial L/\partial x = M^\top\,\partial L/\partial y$.
+      - Broadcast = $u\otimes I$, reduce = $u^\top\otimes I$, so reduce = broadcast$^\top$; applied shard by shard, AllGather$^\top$ = ReduceScatter.
+      - Intuition: in the forward pass each shard was copied to every device; in the backward pass each copy received its own gradient, and these must be summed back onto the owner.
+      - FSDP: forward AllGathers sharded weights just in time; backward ReduceScatters the weight gradients so each device updates only its shard.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 3 (Sharding), Question 7
+    front: An MLP with D = 8192, F = 32768 (bf16) must run on a TPU v5e 2×2 with 300 MB free per chip at batch 128. Choose a sharding and justify it with numbers.
+    back: |
+      - Each weight is 537 MB, so replication (1.07 GB/chip) is out.
+      - FSDP would need to materialize a 537 MB gathered matrix (> 300 MB) and move ≈ 1 GB per layer (≈ 9 ms).
+      - Tensor parallel: $In[B, D_{XY}]$, $W_\text{in}[D, F_{XY}]$, $W_\text{out}[F_{XY}, D]$, $Out[B, D_{XY}]$: 268 MB of weights per chip.
+      - Comms: AllGather in + ReduceScatter out, 2 MB each; 3/4 received over 2 links at 4.5e10 → ≈ 17 µs each.
+      - Compute: $4BDF/4 = 3.4\times10^{10}$ FLOPs ≈ 174 µs; but streaming 268 MB of weights from HBM takes ≈ 327 µs, so the layer is HBM-bound ($B = 128$ is below the ridge of 240), with comms well hidden.
+      - ReduceScatter (not AllReduce) keeps the output in the input's layout for the next layer.
+      - Per-collective time uses one link per axis (axes of length 2 have one neighbour), not the multi-axis formula.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"What Have We Learned?"
+    front: Summarize the four collectives, their effect on a sharding, their costs, and the assumptions behind those costs.
+    back: |
+      - AllGather $[A_X, B]\to[A, B]$: $V/W$.
+      - ReduceScatter $[A, B]\{U_X\}\to[A_X, B]$: $V/W$.
+      - AllReduce removes $\{U\}$: $2V/W$ (RS + AG).
+      - AllToAll $[A, B_X]\to[A_X, B]$: $V/(4W)$ on a ring.
+      - Assumptions: bandwidth-bound (else ≈ hops × 1 µs below ≈ 45 kB/shard on v5e); full rings (no wraparound costs up to 2×); TPU torus (GPU hierarchy differs); $W$ bidirectional; multiple axes divide by $N_\text{axes}$; sharding on other axes shrinks $V$.
+
+reading:
+  - title: "Scaling Book ch. 3: Sharded Matrices and How to Multiply Them"
+    url: https://jax-ml.github.io/scaling-book/sharding/
+    kind: book
+    note: The AllToAll section and footnote derivations, the AllGather/ReduceScatter transpose argument, collective matmul, and Problems 6, 7 and 10.
+  - title: "Wang et al. (2023), Overlap Communication with Dependent Computation via Decomposition in Large Deep Learning Models"
+    url: https://dl.acm.org/doi/pdf/10.1145/3567955.3567959
+    kind: paper
+    note: The collective-matmul technique the book uses to hide AllGathers and ReduceScatters under matmuls.
+  - title: "Scaling Book ch. 10: Programming TPUs in JAX"
+    url: https://jax-ml.github.io/scaling-book/jax-stuff/
+    kind: book
+    note: A working shard_map collective matmul with ppermute, and its measured speed-up (311 → 244 µs).
+  - title: "Lepikhin et al. (2020), GShard"
+    url: https://arxiv.org/abs/2006.16668
+    kind: paper
+    note: Mixture-of-experts at scale on TPUs, with the AllToAll dispatch and combine steps.

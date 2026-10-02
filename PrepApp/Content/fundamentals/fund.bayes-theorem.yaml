@@ -1,0 +1,472 @@
+id: fund.bayes-theorem
+area: fundamentals
+title: Bayes' Theorem, Base Rates & Naive Bayes
+summary: Inverting a conditional probability, why rare conditions defeat accurate tests, odds and sequential updating, explaining away, and the naive Bayes classifier with its link to logistic regression.
+order: 30
+level: core
+tags: [probability, bayes, classification, naive-bayes, generative-models]
+prereqs: [fund.probability-basics]
+
+explainer:
+  - title: "The problem: inverting a conditional"
+    body: |
+      Models usually describe how data arise from a hidden state: how likely a positive test is for a sick patient, or what pixels a "7" tends to produce. What we want is the reverse: how likely the patient is sick *given* a positive test, or which digit produced *these* pixels. Bayes' theorem converts one direction into the other.
+
+      **Derivation.** Write the joint probability of a hidden state $h$ and an observation $y$ in two ways using the product rule, $p(h,y)=p(h\mid y)\,p(y)=p(y\mid h)\,p(h)$, then divide by $p(y)$:
+
+      $$p(h\mid y)=\frac{p(y\mid h)\,p(h)}{p(y)}$$
+
+      Each term has a name and a job:
+      - **Prior** $p(h)$: belief about $h$ before seeing $y$.
+      - **Likelihood** $p(y\mid h)$, read as a function of $h$ with the observed $y$ held fixed. It is *not* a distribution over $h$: for a test with $p(+\mid\text{sick})=0.99$ and $p(+\mid\text{healthy})=0.05$, the likelihood values for the two states sum to $1.04$.
+      - **Evidence** (marginal likelihood) $p(y)$: by the sum rule, $p(y)=\sum_{h'}p(y\mid h')\,p(h')$, an integral for continuous $h$. It does not depend on $h$, so it only normalizes.
+      - **Posterior** $p(h\mid y)$: the updated belief.
+
+      In words: **posterior ∝ likelihood × prior**. A practical recipe follows: multiply prior by likelihood for every hypothesis, then divide by the total.
+
+      The theorem is plain probability calculus, accepted by frequentists and Bayesians alike. "Bayesian statistics" is the further step of treating unknown *parameters* as random variables with priors; that is the subject of fund.mle-map.
+    source: Murphy PML1 §2.3; Goodfellow DL §3.11; MacKay ITILA §2.3
+
+  - title: "Base rates: a worked diagnostic test"
+    body: |
+      A disease has prevalence 1%. A test has **sensitivity** $p(+\mid\text{sick})=0.99$ and **false-positive rate** (FPR) $p(+\mid\text{healthy})=0.05$. You test positive. How likely are you to be sick?
+
+      $$\begin{aligned}p(\text{sick}\mid +)&=\frac{0.99\times0.01}{0.99\times0.01+0.05\times0.99}\\&=\frac{0.0099}{0.0594}=\frac16\approx0.167\end{aligned}$$
+
+      **Natural frequencies** make this obvious. Of 10,000 people, 100 are sick and 99 of them test positive. Of the 9,900 healthy people, 5% (495) also test positive. Only 99 of the 594 positives are sick.
+
+      ![1,000 people (rounded to whole people). The positives are the coloured dots: about 10 sick vs 50 healthy. The healthy group is so large that its 5% false-positive rate swamps the true positives.](fund.bayes-theorem/base-rate-grid)
+
+      **Why intuition fails.** People read "99% accurate" as $p(\text{sick}\mid +)$, but 0.99 is $p(+\mid\text{sick})$. Swapping the two conditionals is the *base-rate fallacy*: it ignores the prior. True positives are $0.99\times1\%$ of the population, false positives $0.05\times99\%\approx4.95\%$.
+
+      **The prior matters as much as the test.** With the same test at prevalence 10%, $p(\text{sick}\mid +)=0.099/(0.099+0.045)\approx0.69$. A negative result at 1% prevalence gives $p(\text{sick}\mid -)=\frac{0.01\times0.01}{0.01\times0.01+0.95\times0.99}\approx1.1\times10^{-4}$.
+
+      This posterior is exactly a classifier's **precision**. Precision depends on class balance; sensitivity (recall) does not (see fund.classification-metrics).
+    source: Murphy PML1 §2.3.1
+
+  - title: "The odds form and sequential updating"
+    body: |
+      Write Bayes' theorem for $h$ and for its complement $\neg h$, then divide. The evidence $p(y)$ cancels:
+
+      $$\begin{aligned}\frac{p(h\mid y)}{p(\neg h\mid y)}&=\frac{p(y\mid h)}{p(y\mid \neg h)}\cdot\frac{p(h)}{p(\neg h)}\end{aligned}$$
+
+      That is, **posterior odds = likelihood ratio × prior odds**. Odds $o$ convert back to a probability as $o/(1+o)$.
+
+      **Same test, odds form.** The positive likelihood ratio is $0.99/0.05=19.8$. Prior odds are $1{:}99$, so the posterior odds are $19.8/99=0.2$, i.e. $p=0.2/1.2=1/6$, as before. A negative result has ratio $0.01/0.95\approx0.0105$.
+
+      **A second positive test.** If the two results are *conditionally independent given the disease state*, $p(y_1,y_2\mid h)=p(y_1\mid h)\,p(y_2\mid h)$, so the likelihood ratios multiply:
+
+      $$\begin{aligned}\text{odds}&=\tfrac{1}{99}\times19.8^2=3.96\\ p(\text{sick}\mid +,+)&=\tfrac{3.96}{4.96}\approx0.80\end{aligned}$$
+
+      Equivalently, yesterday's posterior (1/6) is today's prior. A third positive gives $0.987$.
+
+      ![Each conditionally independent positive multiplies the odds by 19.8.](fund.bayes-theorem/sequential-update)
+
+      **Log-odds add.** Taking logs, $\log(\text{posterior odds})=\log(\text{prior odds})+\sum_i\log\mathrm{LR}_i$. Independent pieces of evidence contribute additive terms. Logistic regression models the log-odds as a linear function $w^\top x+b$, which is this additive structure with learned weights; naive Bayes produces it exactly, as shown later in this lesson.
+
+      **When the multiplication is wrong.** If both tests share a failure cause (the same contaminated sample re-run, or two raters copying each other), the second result is far less informative given the first, and multiplying ratios double-counts evidence.
+    source: Murphy PML1 §2.3.1; MacKay ITILA ch.3 (eq. 3.43)
+
+  - title: "Setting up the likelihood: Monty Hall"
+    body: |
+      Most Bayes puzzles are hard because of the likelihood, not the arithmetic. The likelihood must describe **how the observation was generated**.
+
+      **The game.** A car is behind one of three doors; you pick door 1. The host, who knows where the car is, opens another door that hides a goat, choosing at random when both remaining doors are goats. He opens door 3. Should you switch to door 2?
+
+      Let $H_i$ be "the car is behind door $i$", each with prior $1/3$. The datum $D$ is "the host opened door 3 and it showed a goat". Under these rules:
+      - $p(D\mid H_1)=\tfrac12$: both other doors hide goats, so he picks door 3 half the time.
+      - $p(D\mid H_2)=1$: door 2 hides the car, so he is forced to open door 3.
+      - $p(D\mid H_3)=0$: he never reveals the car.
+
+      Prior × likelihood gives $(\tfrac16,\tfrac13,0)$, which normalizes to
+
+      $$p(H_1\mid D)=\tfrac13,\qquad p(H_2\mid D)=\tfrac23.$$
+
+      Switching wins with probability 2/3.
+
+      **Same observation, different process.** Now suppose the host does not know where the car is and opens door 2 or 3 at random; door 3 happens to show a goat. The likelihoods become $p(D\mid H_1)=\tfrac12$, $p(D\mid H_2)=\tfrac12$ (he picked door 3 by chance, and it held a goat) and $p(D\mid H_3)=0$. The posterior is $(\tfrac12,\tfrac12,0)$, so switching no longer helps.
+
+      **The ML lesson.** What you condition on includes the mechanism that produced the data. Datasets filtered by a decision (outcomes observed only for approved loans, labels only for flagged items) need the selection process in the likelihood, or the posterior is wrong.
+    source: Murphy PML1 §2.3.2; MacKay ITILA §3.5 (Ex. 3.8–3.9)
+
+  - title: "Conditional independence and explaining away"
+    body: |
+      **Definitions.** $X$ and $Y$ are *independent* if $p(x,y)=p(x)\,p(y)$. They are *conditionally independent given* $Z$ if $p(x,y\mid z)=p(x\mid z)\,p(y\mid z)$ for every $z$. Neither property implies the other. Two three-variable structures show both directions:
+      - **Common cause** $X\leftarrow Z\rightarrow Y$. Ice-cream sales and drownings are correlated, but independent given the temperature. This is the structure naive Bayes assumes, with the class as $Z$.
+      - **Common effect** $X\rightarrow Z\leftarrow Y$ (a *v-structure* or *collider*). Two independent causes become dependent once the effect is observed.
+
+      **Explaining away, with numbers.** Burglary $B$ ($p=0.01$) and earthquake $E$ ($p=0.02$) are independent. Either can trigger an alarm $A$:
+      - $p(A\mid\neg B,\neg E)=0.001$, $p(A\mid B,\neg E)=0.95$
+      - $p(A\mid \neg B,E)=0.30$, $p(A\mid B,E)=0.97$
+
+      Enumerate the four $(B,E)$ states, multiply prior by likelihood of the alarm, and normalize ($p(A)\approx0.0164$). The alarm alone raises $p(B\mid A)$ to $0.58$. Now learn that an earthquake happened. Keep only the $E$ states and renormalize:
+
+      $$p(B\mid A,E)=\frac{0.01\cdot0.02\cdot0.97}{0.01\cdot0.02\cdot0.97+0.99\cdot0.02\cdot0.30}\approx0.032$$
+
+      The earthquake *explains away* the alarm. Learning that there was no earthquake would instead push $p(B\mid A,\neg E)$ up to $0.91$.
+
+      ![Observing the effect couples its causes: evidence for one cause lowers the other.](fund.bayes-theorem/explaining-away)
+
+      **Where it bites in ML.** Conditioning on a collider manufactures correlation (Berkson's paradox): if a dataset only contains papers that were accepted, novelty and rigour can look negatively correlated even when they are independent in all submissions. In latent-variable models, explaining away couples the posterior over latent causes, which is one reason exact inference becomes intractable.
+    source: MacKay ITILA §21.1; Murphy PML2 §4.2.4.2; Murphy PML1 §2.2.4
+
+  - title: "Bayes for classification, and the naive Bayes assumption"
+    body: |
+      For a class label $y\in\{1,\dots,C\}$ and features $x$:
+
+      $$p(y=c\mid x)=\frac{p(x\mid c)\,p(c)}{\sum_{c'}p(x\mid c')\,p(c')}$$
+
+      **The Bayes-optimal decision.** Under 0–1 loss, predicting $\hat y$ has expected loss $1-p(\hat y\mid x)$, so the best choice is $\arg\max_c p(c\mid x)$. With unequal costs, predict positive when the expected cost of saying "negative", $p_1 c_{FN}$, exceeds that of saying "positive", $p_0 c_{FP}$:
+
+      $$p(y=1\mid x)>\frac{c_{FP}}{c_{FP}+c_{FN}}$$
+
+      If a missed disease costs 9 times a false alarm, the threshold is $0.1$. The patient from the diagnostic example, at $1/6$, should get a follow-up test even though they are probably healthy.
+
+      **Two routes to $p(y\mid x)$.** A *generative* classifier models $p(x\mid y)$ and $p(y)$ and applies Bayes. A *discriminative* one models $p(y\mid x)$ directly (logistic regression, most neural nets).
+
+      **Why the generative route needs an assumption.** With $d$ binary features, a full table for $p(x\mid y=c)$ has $2^d-1$ free parameters per class. A spam filter over a 50,000-word vocabulary would need $2^{50000}-1$. The **naive Bayes assumption** is that features are conditionally independent given the class:
+
+      $$p(x\mid y=c)=\prod_{j=1}^{d}p(x_j\mid y=c)$$
+
+      That leaves $d$ parameters per class. It says nothing about *marginal* independence. "Buy" and "price" can be strongly correlated across all emails because both are common in spam: that is the common-cause structure of the previous card.
+    source: Murphy PML1 §5.1.2, §9.3; CS229 notes §4.2
+
+  - title: "Fitting naive Bayes: counting, logs and smoothing"
+    body: |
+      **Event models for text.** In the *Bernoulli* model, $x_j\in\{0,1\}$ records whether word $j$ appears and $\theta_{jc}=p(x_j{=}1\mid c)$, so absent words contribute factors $1-\theta_{jc}$. In the *multinomial* model, a document is a sequence of tokens drawn i.i.d. from a class-specific distribution $\phi_c$ over the vocabulary $V$, so repeated words count and absent words contribute nothing. Real-valued features get a Gaussian per class and feature.
+
+      **The MLE is counting.** The log-likelihood splits into one term for the class prior and one per (feature, class) pair, so each parameter is fitted separately. Each is a Bernoulli fit: maximizing $N_1\log\theta+N_0\log(1-\theta)$ gives $N_1/(N_0+N_1)$. Hence $\hat\pi_c=N_c/N$ and $\hat\theta_{jc}=N_{jc}/N_c$, the fraction of class-$c$ documents containing word $j$.
+
+      **Predict in log space**: $\hat y=\arg\max_c\,[\log\pi_c+\sum_j\log p(x_j\mid c)]$. A product of 784 factors of 0.1 is $10^{-784}$, far below the smallest positive float64 (about $5\times10^{-324}$), so it underflows to 0. Its log, $-1805.2$, is harmless. Use log-sum-exp if you need normalized probabilities.
+
+      **Zero counts break it.** Take 4 spam and 6 ham emails. "Prize" appears in 2 spam and 0 ham, "meeting" in 0 spam and 3 ham. An email containing both gets $\hat\theta=0$ in *both* classes, so the posterior is $0/0$. **Laplace (add-one) smoothing** uses $(N_{jc}+1)/(N_c+2)$ instead:
+      - spam: $\theta_{\text{prize}}=3/6$, $\theta_{\text{meeting}}=1/6$
+      - ham: $\theta_{\text{prize}}=1/8$, $\theta_{\text{meeting}}=4/8$
+
+      With priors $0.4$ and $0.6$, the scores are $0.4\cdot\frac12\cdot\frac16=\frac1{30}$ and $0.6\cdot\frac18\cdot\frac12=\frac3{80}$, so $p(\text{spam}\mid x)=8/17\approx0.47$. The multinomial version is $(\text{count}+1)/(\text{tokens in class}+|V|)$. fund.mle-map shows that add-one smoothing is the posterior mean under a uniform prior.
+    source: CS229 notes §4.2–4.2.2; Murphy PML1 §9.3.1–9.3.3; d2l §22.9.4
+
+  - title: "Why naive Bayes works, and its link to logistic regression"
+    body: |
+      **Naive Bayes is a linear classifier.** For binary $y$ and the Bernoulli model, take the log of the posterior odds:
+
+      $$\begin{aligned}\log\frac{p(1\mid x)}{p(0\mid x)}&=\log\frac{\pi_1}{\pi_0}+\sum_j x_j\log\frac{\theta_{j1}}{\theta_{j0}}\\&\quad+\sum_j(1-x_j)\log\frac{1-\theta_{j1}}{1-\theta_{j0}}\end{aligned}$$
+
+      Collecting the terms in $x_j$ gives $w^\top x+b$, with $w_j=\log\frac{\theta_{j1}(1-\theta_{j0})}{\theta_{j0}(1-\theta_{j1})}$. That is exactly the logistic-regression form. Gaussian naive Bayes with variances shared across classes is also linear, because the $x_j^2$ terms cancel. The two methods still learn **different weights**: naive Bayes maximizes the *joint* likelihood $\prod_n p(x_n,y_n)$ by counting, while logistic regression maximizes the *conditional* likelihood $\prod_n p(y_n\mid x_n)$.
+
+      **Why a wrong assumption often classifies well.** Classification needs only the sign of the log-odds, not its size. Correlated features get their evidence counted more than once. Duplicate a feature whose likelihood ratio is 3: with equal priors the posterior goes from 0.75 to $9/10=0.9$. Probabilities are pushed towards 0 or 1, so naive Bayes is often **poorly calibrated**, but the ranking frequently survives. With only $O(Cd)$ parameters, its biased density estimates buy a large reduction in variance.
+
+      **Generative vs discriminative.**
+      - If the class-conditional model is roughly right, the generative model needs less data. Gaussian discriminant analysis is asymptotically efficient when its assumptions hold.
+      - If it is wrong, logistic regression is more robust, usually better calibrated, and accepts arbitrary feature transformations.
+      - A generative model handles a missing feature by marginalizing it out. In naive Bayes this means dropping that factor. It can also add a class without refitting the others.
+    source: Murphy PML1 §9.3.4, §9.4; ESL §6.6.3; CS229 notes §4.1.3
+
+  - title: "What interviewers probe"
+    body: |
+      - *A 99%-sensitive test is positive; is the patient sick?* Depends on prevalence and the FPR. At 1% prevalence and 5% FPR, $p=1/6$. Show natural frequencies.
+      - *Second positive test?* Multiply odds by the likelihood ratio, but only if results are conditionally independent given disease status. Same-sample retests are not.
+      - *Why is the likelihood not a probability distribution?* It is $p(y\mid h)$ as a function of $h$; it need not sum to 1 over $h$.
+      - *Why can we drop the evidence?* It does not depend on $h$, so it does not change the argmax or the ratios. We need it only for calibrated probabilities.
+      - *Monty Hall: why 2/3?* The host's choice depends on the car's location, so $p(D\mid H_2)=1$ vs $p(D\mid H_1)=\tfrac12$. A random host gives 1/2.
+      - *Give an example where conditioning creates dependence.* Explaining away at a common effect; selection on a collider.
+      - *What exactly does naive Bayes assume?* Conditional independence of features given the class, not marginal independence.
+      - *Zero count for a test word?* The whole class posterior becomes 0. Use add-one smoothing, a uniform-prior posterior mean.
+      - *Is naive Bayes well calibrated?* Usually not, because it double-counts correlated evidence. Its argmax is often fine.
+      - *Naive Bayes vs logistic regression?* Same linear log-odds form; joint vs conditional likelihood; naive Bayes wins with little data if the assumption roughly holds, and logistic regression wins asymptotically when it doesn't.
+      - *Is naive Bayes "Bayesian"?* Only if you put priors on its parameters. The name refers to using Bayes' rule.
+    source: Murphy PML1 §2.3, §9.3–9.4; MacKay ITILA §21.1
+
+  - title: "Key results"
+    body: |
+      - Bayes' theorem and the evidence:
+
+      $$\begin{aligned}p(h\mid y)&=\frac{p(y\mid h)\,p(h)}{p(y)}\\ p(y)&=\textstyle\sum_{h'}p(y\mid h')\,p(h')\end{aligned}$$
+
+      - Odds form: posterior odds = LR × prior odds. Log-odds add over conditionally independent evidence.
+      - Diagnostic test: $p(\text{sick}\mid+)=\dfrac{s\,\pi}{s\,\pi+f(1-\pi)}$ with sensitivity $s$, FPR $f$, prevalence $\pi$. Example: $(0.99,0.05,0.01)\Rightarrow1/6$; a second independent positive gives $\approx0.80$.
+      - Bayes decision: argmax posterior under 0–1 loss; with costs, predict positive iff $p_1>c_{FP}/(c_{FP}+c_{FN})$.
+      - Conditional independence ≠ independence. A common cause gives dependence that disappears given the cause; a common effect gives independence that disappears given the effect (explaining away).
+      - Naive Bayes:
+
+      $$\hat y=\arg\max_c\Big[\log\pi_c+\sum_j\log p(x_j\mid c)\Big]$$
+
+      with MLE by counting, Laplace smoothing $(N_{jc}+1)/(N_c+2)$, and log-odds linear in $x$ (the logistic-regression form, fitted by joint rather than conditional likelihood).
+    source: Murphy PML1 §2.3, §5.1.2, §9.3
+
+quiz:
+  - id: q1
+    prompt: |
+      A condition affects 2% of a population. A screening test has sensitivity 90% and a false-positive rate of 5%. A randomly chosen person tests positive. What is the probability they have the condition?
+    correct: About 0.27
+    wrong:
+      - About 0.90
+      - About 0.95
+      - About 0.018
+    explanation: |
+      $\frac{0.9\times0.02}{0.9\times0.02+0.05\times0.98}=\frac{0.018}{0.067}\approx0.27$. 0.90 is the sensitivity $p(+\mid\text{sick})$, the conditional pointing the wrong way. 0.95 is the specificity. 0.018 is the joint $p(\text{sick},+)$, before dividing by the evidence $p(+)=0.067$.
+    source: Murphy PML1 §2.3.1
+
+  - id: q2
+    prompt: |
+      ![1,000 people tested, coloured by true status and test result.](fund.bayes-theorem/base-rate-grid-q)
+
+      Using the grid, what is the probability that a person who tests positive is actually sick?
+    correct: About 0.32
+    wrong:
+      - About 0.47
+      - About 0.90
+      - About 0.14
+    explanation: |
+      Among the $45+95=140$ positives, 45 are sick: $45/140\approx0.32$. 0.47 is $45/95$, the *odds* of being sick given a positive, not the probability. 0.90 is $45/50$, the sensitivity. 0.14 is $140/1000$, the overall positive rate $p(+)$.
+    source: Murphy PML1 §2.3.1
+
+  - id: q3
+    prompt: |
+      Prevalence is 1%. A test has sensitivity 0.8 and false-positive rate 0.1. A patient tests positive on two tests whose errors are conditionally independent given disease status. What is $p(\text{sick}\mid +,+)$?
+    correct: About 0.39
+    wrong:
+      - About 0.65
+      - About 0.075
+      - About 0.64
+    explanation: |
+      Each positive has likelihood ratio $0.8/0.1=8$. Posterior odds are $\frac{1}{99}\times8^2=0.646$, so $p=0.646/1.646\approx0.39$. 0.65 reports the odds as if they were a probability. 0.075 is the posterior after one test ($8/99$ odds). 0.64 is $0.8^2$, the probability that a sick person gets two positives, which ignores the prior.
+    source: Murphy PML1 §2.3.1; MacKay ITILA ch.3 (eq. 3.43)
+
+  - id: q4
+    prompt: |
+      A lab test's false positives come almost entirely from a contaminant that stays in the sample. A patient's sample tests positive, and the lab re-runs the **same sample**, which is positive again. Compared with multiplying the two likelihood ratios, the correct posterior is:
+    correct: "Much lower: given the first, the second adds little"
+    wrong:
+      - The same, because each run has the same sensitivity and FPR
+      - Higher, because two agreeing results confirm each other
+      - Lower, but only if the prevalence is below 50%
+    explanation: |
+      Multiplying ratios assumes $p(y_1,y_2\mid h)=p(y_1\mid h)\,p(y_2\mid h)$. Here a healthy sample that tested positive because of the contaminant will almost surely test positive again, so $p(+_2\mid +_1,\text{healthy})\approx1$. The second likelihood ratio given the first is close to 1. Having the same marginal sensitivity and FPR per run does not make the runs conditionally independent.
+    source: Murphy PML1 §2.3.1; MacKay ITILA ch.3
+
+  - id: q5
+    prompt: |
+      Three doors, one car. You pick door 1. The host **does not know** where the car is. He opens door 2 or door 3 at random, and door 3 happens to show a goat. What is the probability that switching to door 2 wins?
+    correct: 1/2, as his choice is uninformative
+    wrong:
+      - 2/3, as in the standard Monty Hall game
+      - 1/3, since switching never helps
+      - 3/4, since one goat has been ruled out
+    explanation: |
+      $p(D\mid H_1)=\tfrac12$ (he picks door 3 half the time, and it is a goat), $p(D\mid H_2)=\tfrac12$, $p(D\mid H_3)=0$. With equal priors the posterior on doors 1 and 2 is $\tfrac12$ each. The 2/3 answer needs $p(D\mid H_2)=1$, which holds only when the host knowingly avoids the car.
+    source: MacKay ITILA §3.5 (Ex. 3.9); Murphy PML1 §2.3.2
+
+  - id: q6
+    prompt: |
+      Burglaries and earthquakes occur independently, and either can set off an alarm. Given that the alarm rang, you then learn an earthquake occurred. What happens to $P(\text{burglary})$?
+    correct: It drops, because the earthquake explains the alarm
+    wrong:
+      - It is unchanged, since the two causes are independent
+      - It rises, since there is more evidence of a disturbance
+      - It drops to exactly zero, since one cause suffices
+    explanation: |
+      Burglary and earthquake are independent a priori but become dependent once their common effect is observed. In the lesson's numbers, $p(B\mid A)=0.58$ falls to $p(B\mid A,E)\approx0.03$. It does not reach zero, because a burglary can still have happened alongside the earthquake. Marginal independence does not imply conditional independence.
+    source: MacKay ITILA §21.1
+
+  - id: q7
+    prompt: |
+      Which statement is **false**?
+    correct: If $X\perp Y$, then $X\perp Y\mid Z$ for any third variable $Z$
+    wrong:
+      - In $X\leftarrow Z\rightarrow Y$, $X$ and $Y$ can be dependent yet independent given $Z$
+      - In $X\rightarrow Z\leftarrow Y$, independent $X,Y$ can become dependent given $Z$
+      - Naive Bayes assumes features are independent given the class, not marginally
+    explanation: |
+      The collider $X\rightarrow Z\leftarrow Y$ is the counterexample: $X$ and $Y$ are independent, but conditioning on their common effect couples them (explaining away). The other three statements describe the common-cause structure, the collider structure and the naive Bayes assumption correctly.
+    source: Murphy PML1 §2.2.4; Murphy PML2 §4.2.4.2
+
+  - id: q8
+    prompt: |
+      A Bernoulli naive Bayes spam filter is trained on 8 spam and 8 ham emails. The word "lottery" appears in 4 spam emails and 0 ham emails. Considering only this feature, with equal class priors and add-one smoothing, what is $p(\text{spam}\mid \text{"lottery" present})$?
+    correct: 5/6
+    wrong:
+      - '1'
+      - 1/2
+      - 4/5
+    explanation: |
+      Smoothed estimates: $\theta_{\text{spam}}=(4+1)/(8+2)=0.5$ and $\theta_{\text{ham}}=(0+1)/(8+2)=0.1$. Posterior $=0.5/(0.5+0.1)=5/6$. Without smoothing the ham likelihood is 0 and the answer is 1, an overconfident zero-count artefact. 1/2 reports $\theta_{\text{spam}}$, the likelihood, not the posterior. 4/5 is $4/(4+0+1)$: it adds one to the raw zero count but never divides by the class sizes.
+    source: CS229 notes §4.2.1; Murphy PML1 §9.3.3
+
+  - id: q9
+    prompt: |
+      In a naive Bayes model, a feature with likelihood ratio 3 (spam vs ham) is accidentally included twice, as two perfectly correlated copies. Classes have equal priors, and only this feature is present. What does the model output for $p(\text{spam})$?
+    correct: "$0.9$: overconfident, since the true value is $0.75$"
+    wrong:
+      - "$0.75$: the duplicate is recognised as redundant"
+      - "$0.5$: the two copies cancel each other out"
+      - "$0.86$: the evidence adds but is damped"
+    explanation: |
+      Naive Bayes multiplies the likelihood ratios of the two copies as if they were independent evidence: odds $=3\times3=9$, so $p=0.9$. The correct posterior uses the ratio once: odds 3, $p=0.75$. This double counting of correlated features is why naive Bayes probabilities are pushed towards 0 or 1, even when its argmax is right.
+    source: Murphy PML1 §9.3, §9.4.1; ESL §6.6.3
+
+  - id: q10
+    prompt: |
+      Which statement about naive Bayes is **false**?
+    correct: Its probabilities are well calibrated, because it is a generative model
+    wrong:
+      - With Bernoulli features, its log-odds are linear in the features
+      - It is fitted by maximizing the joint likelihood $\prod_n p(x_n,y_n)$
+      - It can ignore a missing feature by dropping that feature's factor
+    explanation: |
+      Being generative does not make a model calibrated. Naive Bayes's independence assumption double-counts correlated evidence and produces extreme posteriors. The other statements are true. The log-odds are $w^\top x+b$, the logistic-regression form. Fitting maximizes the joint likelihood, unlike logistic regression's conditional likelihood. Marginalizing a missing $x_j$ sums its factor to 1.
+    source: Murphy PML1 §9.3.4, §9.4
+
+  - id: q11
+    prompt: |
+      You have 30 labelled examples, and the class-conditional densities really are Gaussian with a shared covariance. Which classifier would you expect to estimate $p(y\mid x)$ more accurately, and why?
+    correct: GDA, because its correct assumptions save data
+    wrong:
+      - Logistic regression, since discriminative models always win
+      - Logistic regression, since it has strictly more parameters
+      - Neither, because both yield an identical decision boundary
+    explanation: |
+      Shared-covariance GDA implies a logistic posterior, but the converse does not hold, so GDA makes the stronger assumption. When that assumption is true, GDA is asymptotically efficient and generally better with little data. Logistic regression is the robust choice when the Gaussian assumption fails. The two give the same *form* of boundary but different fitted boundaries.
+    source: CS229 notes §4.1.3; Murphy PML1 §9.4
+
+  - id: q12
+    prompt: |
+      A model gives a patient $p(\text{disease}\mid x)=0.105$. A missed disease costs 9 times as much as an unnecessary follow-up, and correct decisions cost nothing. What is the Bayes-optimal action?
+    correct: Follow up, since 0.105 exceeds the threshold of 0.1
+    wrong:
+      - No follow-up, since 0.105 is below the threshold of 1/9
+      - No follow-up, since 0.105 is below the threshold of 0.5
+      - No follow-up, since 0.105 is below the threshold of 0.9
+    explanation: |
+      Following up costs $(1-p)\,c_{FP}=0.895c$ in expectation; not following up costs $p\,c_{FN}=0.105\times9c=0.945c$. Equivalently, act when $p>c_{FP}/(c_{FP}+c_{FN})=1/10$. The tempting 1/9 is $c_{FP}/c_{FN}$, which forgets that the two expected costs are weighted by $p$ and $1-p$. 0.5 is right only under 0–1 loss, and 0.9 inverts the cost ratio.
+    source: Murphy PML1 §5.1.2
+
+cards:
+  - id: f1
+    front: State Bayes' theorem, name every term, and write the evidence as a sum.
+    back: |
+      $$p(h\mid y)=\frac{p(y\mid h)\,p(h)}{p(y)}$$
+
+      Prior $p(h)$, likelihood $p(y\mid h)$ (a function of $h$, not a distribution over it), evidence $p(y)=\sum_{h'}p(y\mid h')p(h')$, posterior $p(h\mid y)$. It follows from the product rule $p(h,y)=p(h\mid y)p(y)=p(y\mid h)p(h)$.
+    source: Murphy PML1 §2.3
+
+  - id: f2
+    front: Write the odds form of Bayes' rule. When can likelihood ratios from two tests be multiplied?
+    back: |
+      $$\frac{p(h\mid y)}{p(\neg h\mid y)}=\frac{p(y\mid h)}{p(y\mid\neg h)}\cdot\frac{p(h)}{p(\neg h)}$$
+
+      Multiply ratios only when the results are conditionally independent given $h$: $p(y_1,y_2\mid h)=p(y_1\mid h)p(y_2\mid h)$. In log space, evidence adds.
+    source: Murphy PML1 §2.3.1; MacKay ITILA ch.3
+
+  - id: f3
+    front: Bayes-optimal decision rule under 0–1 loss and under asymmetric costs $c_{FP}$, $c_{FN}$.
+    back: |
+      0–1 loss: $\hat y=\arg\max_c p(c\mid x)$, since predicting $\hat y$ has expected loss $1-p(\hat y\mid x)$.
+
+      Costs: predict positive iff $p(1\mid x)>\dfrac{c_{FP}}{c_{FP}+c_{FN}}$. If $c_{FN}=9c_{FP}$, the threshold is 0.1.
+    source: Murphy PML1 §5.1.2
+
+  - id: f4
+    front: "Naive Bayes: the assumption, the classifier in log form, and the MLE of $\\theta_{jc}=p(x_j=1\\mid c)$ (Bernoulli model)."
+    back: |
+      Assumption: $p(x\mid c)=\prod_j p(x_j\mid c)$, i.e. conditional independence given the class.
+
+      $$\hat y=\arg\max_c\Big[\log\pi_c+\sum_j\log p(x_j\mid c)\Big]$$
+
+      MLE: $\hat\pi_c=N_c/N$ and $\hat\theta_{jc}=N_{jc}/N_c$, the fraction of class-$c$ examples with feature $j$ on.
+    source: Murphy PML1 §9.3.1–9.3.2; CS229 notes §4.2
+
+  - id: f5
+    front: Laplace smoothing in the Bernoulli and multinomial naive Bayes event models.
+    back: |
+      Bernoulli: $\theta_{jc}=\dfrac{N_{jc}+1}{N_c+2}$.
+
+      Multinomial: $\phi_{kc}=\dfrac{\text{count of word }k\text{ in class }c+1}{\text{tokens in class }c+|V|}$.
+
+      Both are posterior means under a uniform Beta or Dirichlet prior. They stop a single unseen word from zeroing a class.
+    source: CS229 notes §4.2.1–4.2.2; Murphy PML1 §9.3.3
+
+  - id: f6
+    front: Independence vs conditional independence. Which graph structure creates dependence when you condition?
+    back: |
+      $X\perp Y$: $p(x,y)=p(x)p(y)$. $X\perp Y\mid Z$: $p(x,y\mid z)=p(x\mid z)p(y\mid z)$ for all $z$. Neither implies the other.
+
+      Common cause $X\leftarrow Z\rightarrow Y$: dependent, but independent given $Z$. Common effect $X\rightarrow Z\leftarrow Y$: independent, but dependent given $Z$ (explaining away, Berkson's paradox).
+    source: Murphy PML1 §2.2.4; Murphy PML2 §4.2.4.2
+
+  - id: f7
+    type: open
+    front: Explain the base-rate fallacy to an interviewer using a diagnostic test, and say how the answer changes with prevalence.
+    back: |
+      1. Set up: prevalence $\pi=1\%$, sensitivity 0.99, FPR 0.05.
+      2. Natural frequencies: of 10,000 people, 100 are sick and 99 test positive; 9,900 are healthy and 495 test positive. So $p(\text{sick}\mid+)=99/594=1/6$.
+      3. The fallacy is reading $p(+\mid\text{sick})=0.99$ as $p(\text{sick}\mid+)$. That ignores the prior, and false positives from the large healthy group dominate.
+      4. Odds form: LR $=19.8$, prior odds $1{:}99$, posterior odds $0.2$. At 10% prevalence the answer is about 0.69. A second conditionally independent positive gives about 0.80.
+      5. ML link: this posterior is precision, which depends on class balance while recall does not. Rare-class detectors therefore have low precision even with good ROC curves.
+    source: Murphy PML1 §2.3.1
+
+  - id: f8
+    type: open
+    front: Derive that Bernoulli naive Bayes has a linear decision boundary, and explain how it differs from logistic regression.
+    back: |
+      Log posterior odds:
+
+      $$\begin{aligned}&\log\frac{\pi_1}{\pi_0}+\sum_j x_j\log\frac{\theta_{j1}}{\theta_{j0}}\\&+\sum_j(1-x_j)\log\frac{1-\theta_{j1}}{1-\theta_{j0}}\end{aligned}$$
+
+      This is linear in $x$: $w_j=\log\frac{\theta_{j1}(1-\theta_{j0})}{\theta_{j0}(1-\theta_{j1})}$ and $b=\log\frac{\pi_1}{\pi_0}+\sum_j\log\frac{1-\theta_{j1}}{1-\theta_{j0}}$. So $p(y=1\mid x)=\sigma(w^\top x+b)$, the logistic-regression form.
+
+      Difference: naive Bayes sets $w$ by counting (maximizing the joint likelihood $\prod p(x,y)$ under the independence assumption). Logistic regression maximizes the conditional likelihood $\prod p(y\mid x)$ directly and makes no assumption about $p(x\mid y)$. Naive Bayes double-counts correlated features, which gives poor calibration. It can win with little data; logistic regression wins asymptotically when the assumption is wrong.
+    source: Murphy PML1 §9.3.4; ESL §6.6.3
+
+  - id: f9
+    type: open
+    front: Compare generative and discriminative classifiers. When would you choose each?
+    back: |
+      **Generative** (naive Bayes, GDA) models $p(x\mid y)p(y)$ and applies Bayes.
+      - Data-efficient if the model is roughly right (GDA is asymptotically efficient then).
+      - Easy to fit by counting or averaging.
+      - Handles missing features by marginalizing them out.
+      - Adds classes without retraining the others, and can use unlabelled data.
+
+      **Discriminative** (logistic regression, neural nets) models $p(y\mid x)$.
+      - Spends no capacity on modelling $x$.
+      - Robust to a misspecified $p(x\mid y)$ and accepts arbitrary feature transformations.
+      - Usually better calibrated, and usually more accurate with plenty of data.
+
+      Choose generative when data are scarce and the structure is well understood, or when inputs are often missing. Choose discriminative otherwise.
+    source: Murphy PML1 §9.4; CS229 notes §4.1.3
+
+  - id: f10
+    type: open
+    front: Solve Monty Hall with Bayes' theorem, then explain why the answer changes if the host opens a door at random.
+    back: |
+      Hypotheses $H_i$ (car behind door $i$), prior $1/3$ each. You pick door 1; the datum $D$ is "host opens door 3 and shows a goat".
+
+      Knowing host: $p(D\mid H_1)=\tfrac12$, $p(D\mid H_2)=1$, $p(D\mid H_3)=0$. Posterior $\propto(\tfrac16,\tfrac13,0)$, which is $(\tfrac13,\tfrac23,0)$. Switch.
+
+      Random host: $p(D\mid H_2)$ drops to $\tfrac12$, because he could have opened door 2 and revealed the car. Posterior $(\tfrac12,\tfrac12,0)$. Switching doesn't matter.
+
+      Point: the likelihood must model the process that generated the observation, which is the same issue as selection bias in datasets.
+    source: Murphy PML1 §2.3.2; MacKay ITILA §3.5
+
+reading:
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, §2.3 and §9.3–9.4"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: Bayes' rule with the COVID test and Monty Hall, then naive Bayes, its link to logistic regression, and generative vs discriminative trade-offs.
+  - title: "MacKay, Information Theory, Inference, and Learning Algorithms, ch. 2–3 and §21.1"
+    url: https://www.inference.org.uk/itprnn/book.html
+    kind: book
+    note: Forward vs inverse probability, likelihood ratios as evidence, the three-doors exercises and the burglar-alarm explaining-away example.
+  - title: "CS229 Lecture Notes, ch. 4 (Generative learning algorithms)"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: GDA vs logistic regression, the naive Bayes spam filter, Laplace smoothing and the two text event models.
+  - title: "Dive into Deep Learning, §22.9 Naive Bayes"
+    url: https://d2l.ai/chapter_appendix-mathematics-for-deep-learning/naive-bayes.html
+    kind: book
+    note: A runnable naive Bayes on MNIST, including the log-space trick against underflow.
+  - title: "Hastie, Tibshirani & Friedman, The Elements of Statistical Learning, §6.6.3"
+    url: https://hastie.su.domains/ElemStatLearn/
+    kind: book
+    note: Why naive Bayes can beat more sophisticated classifiers despite its assumption (bias traded for variance).

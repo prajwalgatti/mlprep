@@ -1,0 +1,369 @@
+id: sb.transformer-accounting
+area: scalingbook
+title: "Transformer Params and FLOPs, Layer by Layer"
+summary: The book's per-layer accounting of a modern Transformer (gated MLP, grouped-query attention), the T/8D rule for when attention FLOPs matter, and worked parameter counts.
+order: 100
+level: core
+tags: [scaling-book, transformers, flops, parameters]
+prereqs: [sb.flops-counting]
+
+explainer:
+  - title: Notation and the layer we are counting
+    source: Scaling Book ch. 4 (Transformers) §"Transformer Accounting"
+    body: |
+      The book uses single letters for every dimension. We keep them throughout the series:
+
+      - $B$ batch (sequences), $T$ query length, $S$ key/value length ($S = T$ in self-attention), $L$ layers.
+      - $D$ model width ($d_\text{model}$), $F$ feed-forward width ($d_\text{ff}$), $V$ vocabulary size.
+      - $N$ query heads, $K$ key/value heads, $H$ head dimension, $G = N/K$ query heads per KV head.
+
+      A layer of a modern decoder (the book's diagram; LLaMA-style) has three parts:
+
+      - **Pre-norm.** The normalization is applied before each block, $x + \text{attn}(\text{norm}(x))$. The original Transformer normalized after the residual add (post-norm), $\text{norm}(x + \text{attn}(x))$.
+      - **Attention** with $N$ query heads but only $K$ key/value heads. $K = N$ is multi-head attention (MHA), $K = 1$ multi-query (MQA), and $1 < K < N$ (with $K$ dividing $N$) grouped-query attention (GQA). Each KV head is shared by $G$ query heads.
+      - **A gated MLP** ("gating einsum", as in SwiGLU): two up-projections $W_\text{in1}, W_\text{in2}\in[D, F]$, combined as $\sigma(xW_\text{in1}) \odot xW_\text{in2}$ ($\sigma$ an activation such as SiLU/Swish), then $W_\text{out}\in[F, D]$. Older models used one up-projection (2 matrices). At equal parameters, the gated version uses a smaller $F$.
+
+      All counts below are **per layer**; multiply by $L$. Training FLOPs are 3× forward FLOPs (lesson 90).
+  - title: The MLP block
+    source: Scaling Book ch. 4 (Transformers) §"MLPs"
+    body: |
+      With $BT$ tokens of width $D$:
+
+      - $A[B, T, D]\cdot W_\text{in1}[D, F]$: $DF$ params, $2BTDF$ forward FLOPs, $6BTDF$ training.
+      - $A[B, T, D]\cdot W_\text{in2}[D, F]$: the same.
+      - $\sigma(A_\text{in1}) \odot A_\text{in2}$: $O(BTF)$ elementwise, negligible.
+      - $A[B, T, F]\cdot W_\text{out}[F, D]$: $DF$ params, $6BTDF$ training.
+
+      $$\text{MLP: } 3DF \text{ params}, \quad 18\,BTDF \text{ training FLOPs}.$$
+
+      A non-gated MLP has $2DF$ params and $12BTDF$ FLOPs.
+
+      **Worked example.** Switching from a 2-matrix MLP with $F = 4D$ to a gated one at the **same** parameter count needs $3DF' = 2D\cdot4D$, so $F' = 8D/3 \approx 2.67D$. LLaMA-3 70B uses $F = 28672 = 3.5D$, so its MLP is somewhat larger than that equivalent.
+
+      For typical shapes the MLP holds most of a layer's parameters and FLOPs, as the next cards show.
+  - title: Attention projections
+    source: Scaling Book ch. 4 (Transformers) §"Attention"
+    body: |
+      Four weight matrices, with equal head dimension $H$ for Q, K and V:
+
+      - $W_Q[D, N, H]$: $DNH$ params, $6BTDNH$ training FLOPs.
+      - $W_K[D, K, H]$ and $W_V[D, K, H]$: $DKH$ params each, $6BTDKH$ each.
+      - $W_O[N, H, D]$: $DNH$ params, $6BTDNH$ (it contracts both $N$ and $H$).
+
+      $$\text{QKVO: } 2D(N + K)H \text{ params}, \quad 12\,BTD(N + K)H \text{ FLOPs}.$$
+
+      With MHA ($K = N$) and the usual $NH = D$, this is $4D^2$ params, and the attention share of a layer's parameters is
+
+      $$\frac{4D^2}{4D^2 + 3DF} = \frac{4D^2}{4D^2 + 12D^2} = \frac14 \quad (F = 4D).$$
+
+      **GQA shrinks K and V.** LLaMA-3 70B has $N = 64$, $K = 8$, $H = 128$, $D = 8192$. Its attention parameters are $80\times2\cdot8192\cdot72\cdot128 \approx 12.1$B. With full MHA ($K = 64$) they would be $80\times4\cdot8192^2 \approx 21.5$B. GQA saves about 9.4B parameters here, and it shrinks the KV cache 8× (lesson 110).
+  - title: Dot-product attention
+    source: Scaling Book ch. 4 (Transformers) §"Attention"
+    body: |
+      Between the projections sit two parameter-free matmuls. Reshape $Q$ to $[B, T, K, G, H]$ so each KV head's $G$ query heads are grouped:
+
+      - **Scores** $Q[B, T, K, G, H]\cdot K[B, S, K, H]\to[B, T, S, K, G]$. $B, K$ batching, $H$ contracting: $2BTSKGH = 2BTSNH$ forward, $6BTSNH$ training.
+      - **Softmax** over $S$: $O(BTSN)$, elementwise.
+      - **Values** $P[B, T, S, K, G]\cdot V[B, S, K, H]\to[B, T, K, G, H]$. $S$ contracting: again $6BTSNH$ training.
+
+      $$\text{attention: } 12\,BTSNH = 12\,BT^2NH \ (S = T).$$
+
+      **Notes.**
+
+      - The cost depends on $N$, not $K$: GQA saves memory and bandwidth, not these FLOPs.
+      - It is **quadratic in $T$**, while every other term is linear in $T$.
+      - **Causal masking** makes half of the scores useless (each query sees only earlier keys). A plain einsum still computes them; getting the 2× saving needs a kernel that skips the masked blocks (lesson 120).
+
+      **Other operations.** Two norms per layer: $2D$ params, $O(BTD)$ FLOPs. The unembedding $[D, V]$ is one more matmul: $DV$ params, $6BTDV$ training FLOPs, counted once for the model, not per layer. The input embedding is a lookup, with $DV$ params (unless tied to the unembedding) and almost no FLOPs.
+  - title: Adding it up, and 6ND again
+    source: Scaling Book ch. 4 (Transformers) §"General rule of thumb for Transformer FLOPs", §"What Should You Take Away from this Section?"
+    body: |
+      Ignoring the dot-product attention term, the per-layer training FLOPs are
+
+      $$\begin{aligned} &18BTDF + 12BTD(N+K)H \\ &= 6\cdot BT\cdot\big(3DF + 2D(N+K)H\big). \end{aligned}$$
+
+      The bracket is exactly the layer's parameter count (less the tiny norms). Summed over layers, plus the unembedding (which follows the same pattern), this is **6 × tokens × parameters**, the rule of lesson 90 recovered from the architecture.
+
+      The book's summary table (MHA, $K = N$):
+
+      - **MLP:** $3DF$ params; $18BTDF$ training FLOPs.
+      - **Attention:** $4DNH$ params; $24BTDNH + 12BT^2NH$ training FLOPs.
+      - **Norms:** $2D$ params; $O(BTD)$ FLOPs.
+      - **Vocabulary:** $DV$ params (per matrix, not per layer); $6BTDV$ training FLOPs for the unembedding matmul. (The book's table writes $12BTDV$.)
+
+      **The unembedding is not negligible.** LLaMA-3 70B ($V = 128{,}256$) spends $6DV \approx 6.3$ GFLOPs per token on it in training. One layer's matmuls ($18DF + 12D(N+K)H$) cost about 5.1 GFLOPs per token. So the output layer costs as much as about 1.2 extra layers.
+  - title: When does attention dominate? The T/8D rule
+    source: Scaling Book ch. 4 (Transformers) §"Fractional cost of attention with context length", Question 5
+    body: |
+      Divide the attention FLOPs by the parameter matmuls. Assume MHA ($N = K$), $D = NH$ and $F = 4D$:
+
+      $$\begin{aligned} \frac{12BT^2NH}{18BTDF + 24BTDNH} &= \frac{12BT^2D}{72BTD^2 + 24BTD^2} \\ &= \frac{12BT^2D}{96BTD^2} = \frac{T}{8D}. \end{aligned}$$
+
+      **Attention FLOPs exceed all the other matmuls only when $T > 8D$.** For $D = 8192$ that is about 65k tokens; for Gemma-27B ($D = 4608$), about 37k. Bigger models push the crossover further out, because their MLPs grow like $D^2$ per token while attention grows like $D$.
+
+      ![Share of FLOPs spent on dot-product attention vs sequence length; it reaches 50% at T = 8D (MHA, F = 4D, D = NH)](sb.transformer-accounting/attention-fraction)
+
+      **Scope.** The $T/8D$ number holds only under its assumptions. GQA ($K < N$) and a different $F/D$ change the denominator. Causal masking halves the useful numerator if the kernel skips masked blocks. For LLaMA-3 70B's real shapes ($K = 8$, $F = 3.5D$) the non-causal crossover is near $T \approx 52$k, not 65k.
+
+      **Book Q5.** The scores equal just the QKVO projection FLOPs when $24BTDNH = 12BT^2NH$, i.e. $T = 2D$: 8192 tokens for $D = 4096$.
+  - title: "Worked example: count a model"
+    source: Scaling Book ch. 4 (Transformers), Question 1
+    body: |
+      **Book Q1.** $D = 4096$, $F = 4D = 16384$, $V = 32{,}000$, $L = 64$, MHA with $NH = D$. Separate embedding and unembedding matrices. KV cache in int8.
+
+      **Parameters.**
+
+      $$\begin{aligned} P &= L\,(3DF + 4D^2 + 2D) + 2DV \\ &\approx 64\times 2.68\times10^{8} + 2.6\times10^{8} \\ &\approx 1.74\times10^{10}. \end{aligned}$$
+
+      About 17.4B. The book rounds $D$ to $4\times10^3$ and quotes 16B.
+
+      **Attention share** of the per-layer parameters: $4D^2/(4D^2 + 12D^2) = 1/4$.
+
+      **KV cache per token.** Each layer stores one key and one value vector per KV head: $2\cdot L\cdot K\cdot H$ numbers. With $K\cdot H = NH = D$ in int8 that is $2\cdot64\cdot4096 = 524{,}288$ bytes $= 512$ KiB per token. An 8k-token context would need 4 GiB for a single sequence, which is why the next lesson's GQA matters.
+
+      ![Training FLOPs per token per layer for LLaMA-3 70B shapes: the MLP dominates at 4k context; non-causal attention scores overtake everything else near 52k](sb.transformer-accounting/flops-breakdown)
+  - title: What interviewers probe
+    source: Scaling Book ch. 4 (Transformers)
+    body: |
+      - *Params per layer?* MLP $3DF$ (gated) + attention $2D(N+K)H$ + norms $2D$. MHA with $NH = D$, $F = 4D$: $16D^2$, with ¼ in attention.
+      - *Training FLOPs per layer?* $18BTDF + 12BTD(N+K)H + 12BT^2NH$.
+      - *Does GQA reduce FLOPs?* It reduces K/V projection FLOPs and parameters, and the KV cache, but not the score/value matmuls ($2BTSNH$ each).
+      - *When does attention dominate?* $T > 8D$ under MHA, $F = 4D$, $NH = D$; shapes and causal kernels shift it.
+      - *Where does 6ND come from architecturally?* Every non-attention term is $6\times$ tokens $\times$ that matrix's params.
+      - *Gated vs plain MLP?* 3 matrices vs 2; at equal params $F$ drops from $4D$ to $\approx 2.67D$.
+      - *What else is big?* The unembedding, ≈ 1.2 layers' worth of FLOPs at LLaMA-3 70B's vocabulary.
+  - title: Key results
+    source: Scaling Book ch. 4 (Transformers) §"What Should You Take Away from this Section?"
+    body: |
+      $$\text{MLP: } 3DF \text{ params}, \ 18BTDF \text{ FLOPs}$$
+
+      $$\text{QKVO: } 2D(N+K)H, \ 12BTD(N+K)H$$
+
+      $$\text{scores + values: } 12BT^2NH$$
+
+      $$\frac{\text{attention}}{\text{matmuls}} = \frac{T}{8D}$$
+
+      The last ratio holds for MHA, $F = 4D$, $D = NH$.
+
+      - Training FLOPs ≈ $6\times$ tokens $\times$ params while $T \ll 8D$.
+      - Attention is ¼ of layer params for MHA with $F = 4D$; GQA shrinks K/V params and the KV cache, not the score FLOPs.
+      - Causal masking halves useful score FLOPs only with a block-skipping kernel.
+      - KV cache per token $= 2LKH$ numbers.
+      - Unembedding: $DV$ params, $6BTDV$ training FLOPs.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 4 (Transformers), Question 1
+    prompt: |
+      A model has $D = 4096$, $F = 4D$, $V = 32{,}000$, $L = 64$, gated MLP, MHA with $NH = D$, and separate embedding and unembedding. About how many parameters does it have?
+    correct: About 17.4B
+    wrong:
+      - About 13.1B
+      - About 4.6B
+      - About 16.6B
+    explanation: |
+      $L(3DF + 4D^2 + 2D) + 2DV = 64\times(2.01\times10^8 + 6.7\times10^7 + 8192) + 2.6\times10^8 \approx 1.74\times10^{10}$ (the book rounds to 16B). 13.1B uses a 2-matrix MLP; 4.6B counts only attention and vocabulary; 16.6B is the book's arithmetic with $D$ rounded to 4000 and $F$ to 16,000.
+  - id: q2
+    source: Scaling Book ch. 4 (Transformers), Question 1
+    prompt: |
+      In a layer with a gated MLP ($F = 4D$) and MHA with $NH = D$, what fraction of the layer's parameters is in attention?
+    correct: 1/4
+    wrong:
+      - 1/2
+      - 1/3
+      - 1/7
+    explanation: |
+      Attention $4D^2$, MLP $3DF = 12D^2$: $4/16 = 1/4$. A plain MLP ($2DF = 8D^2$) would give $4/12 = 1/3$, the classic GPT-style share.
+  - id: q3
+    source: Scaling Book ch. 4 (Transformers) §"Attention"; Scaling Book ch. 6 §"What does LLaMA 3 look like?"
+    prompt: |
+      LLaMA-3 70B has $L = 80$, $D = 8192$, $N = 64$, $H = 128$ and $K = 8$ KV heads. Roughly how many attention parameters does using $K = 8$ instead of full MHA ($K = 64$) save across the model?
+    correct: About 9.4B
+    wrong:
+      - About 18.8B
+      - About 1.2B
+      - None, since GQA only changes the KV cache
+    explanation: |
+      Attention params are $L\cdot2D(N+K)H$: with $K = 8$, $80\cdot2\cdot8192\cdot72\cdot128 \approx 12.1$B; with $K = 64$, $\approx 21.5$B. The difference is ≈ 9.4B. GQA shrinks both the K/V projection weights and the KV cache.
+  - id: q4
+    source: Scaling Book ch. 4 (Transformers), Question 1; Scaling Book ch. 4 §"Key-Value (KV) caching"
+    prompt: |
+      For the model in q1 ($L = 64$, MHA with $KH = D = 4096$), how large is the int8 KV cache per token?
+    correct: 512 KiB
+    wrong:
+      - 256 KiB
+      - 1 MiB
+      - 8 KiB
+    explanation: |
+      Per token and layer we store a key and a value of $KH$ numbers each: $2\cdot L\cdot KH = 2\cdot64\cdot4096 = 524{,}288$ bytes in int8 = 512 KiB. 256 KiB forgets the factor of 2 for keys plus values; 1 MiB assumes bf16.
+  - id: q5
+    source: Scaling Book ch. 4 (Transformers) §"Fractional cost of attention with context length"
+    prompt: |
+      Under the book's assumptions (MHA, $D = NH$, $F = 4D$), at what sequence length do dot-product attention FLOPs equal all the other matmul FLOPs, for $D = 8192$?
+    correct: About 65k tokens
+    wrong:
+      - About 16k tokens
+      - About 8k tokens
+      - About 1M tokens
+    explanation: |
+      The ratio is $T/(8D)$, which equals 1 at $T = 8D = 65{,}536$. 16k (= 2D) is where the scores equal only the QKVO projections, not all matmuls; 8k confuses $T$ with $D$.
+  - id: q6
+    source: Scaling Book ch. 4 (Transformers), Question 5
+    prompt: |
+      At what sequence length do the self-attention score/value FLOPs equal the Q/K/V/O projection FLOPs, for $D = 4096$ (MHA, $D = NH$)?
+    correct: 8192
+    wrong:
+      - 32768
+      - 4096
+      - 2048
+    explanation: |
+      Set $24BTDNH = 12BT^2NH$: $T = 2D = 8192$. 32768 is the $T = 8D$ crossover against all matmuls including the MLP.
+  - id: q7
+    source: Scaling Book ch. 4 (Transformers) §"Fractional cost of attention with context length"
+    prompt: |
+      For LLaMA-3 70B's real shapes ($D = 8192$, $F = 28672$, $N = 64$, $K = 8$, $H = 128$), what share of a layer's training FLOPs goes to (non-causal) attention scores and values at $T = 8192$?
+    correct: About 14%
+    wrong:
+      - About 50%
+      - About 3%
+      - About 33%
+    explanation: |
+      Per token: scores $12TNH \approx 0.81$ GFLOPs; MLP $18DF \approx 4.23$; QKVO $12D(N+K)H \approx 0.91$. Share $= 0.81/5.94 \approx 14\%$. The $T/8D$ rule gives $8192/65536 = 1/8$ as a *ratio* (≈ 11% share) under MHA and $F = 4D$; real shapes differ a little.
+  - id: q8
+    source: Scaling Book ch. 4 (Transformers) §"Attention"
+    prompt: |
+      With causal masking, what happens to the dot-product attention FLOPs if attention is written as a plain einsum followed by a mask?
+    correct: All are still computed; a block-skipping kernel saves half
+    wrong:
+      - They halve automatically, since half the scores are masked
+      - They drop to zero for masked rows, a quarter of the total
+      - They double, because the mask adds an extra matmul
+    explanation: |
+      An einsum computes every score, then the mask discards the upper triangle; the useful FLOPs are half, but the executed FLOPs are not. Realizing the 2× needs a kernel (e.g. Flash-style blocks) that skips blocks entirely above the diagonal.
+  - id: q9
+    source: Scaling Book ch. 4 (Transformers) §"Other Operations"
+    prompt: |
+      LLaMA-3 70B has $V = 128{,}256$ and per-layer matmuls costing $18DF + 12D(N+K)H \approx 5.1$ GFLOPs per token in training. How does the unembedding's training cost compare with one layer?
+    correct: About 1.2 layers' worth
+    wrong:
+      - About 0.1 of a layer
+      - About 80 layers' worth
+      - About 3.7 layers' worth
+    explanation: |
+      The unembedding is a $[D, V]$ matmul: $6DV = 6\cdot8192\cdot128{,}256 \approx 6.3$ GFLOPs per token, ≈ 1.2× a layer. With large vocabularies the output layer is not negligible, though over 80 layers it is still only ~1.5% of the total.
+  - id: q10
+    source: Scaling Book ch. 4 (Transformers) §"Attention"
+    prompt: |
+      Which statement is **false**?
+    correct: Fewer KV heads (GQA) cut the FLOPs of the $QK^\top$ scores
+    wrong:
+      - The score and value matmuls have no parameters but grow quadratically with T
+      - A gated MLP has three D×F matrices and 18BTDF training FLOPs
+      - The QKVO projections cost 12BTD(N+K)H training FLOPs
+    explanation: |
+      The score einsum $Q[B,T,K,G,H]\cdot K[B,S,K,H]$ costs $2BTSKGH = 2BTSNH$, which is independent of how heads are grouped. GQA saves K/V projection FLOPs, parameters and KV-cache bytes, not score FLOPs.
+  - id: q11
+    source: Scaling Book ch. 4 (Transformers) §"Transformer Accounting" (gating einsum note)
+    prompt: |
+      A design moves from a 2-matrix MLP with $F = 4D$ to a gated 3-matrix MLP, keeping the MLP's parameter count fixed. What should the new $F$ be?
+    correct: About 2.67D
+    wrong:
+      - About 4D
+      - About 6D
+      - About 3.5D
+    explanation: |
+      Equal params: $3DF' = 2D\cdot4D$, so $F' = 8D/3 \approx 2.67D$. 6D would *increase* params; 3.5D is LLaMA-3 70B's actual choice, a slightly larger MLP than the equal-parameter one.
+  - id: q12
+    source: Scaling Book ch. 4 (Transformers) §"MLPs", §"Attention"
+    prompt: |
+      For LLaMA-3 70B shapes ($D = 8192$, $F = 28672$, $N = 64$, $H = 128$), at what context length do the (non-causal) attention score/value FLOPs equal the MLP's FLOPs?
+    correct: About 43k tokens
+    wrong:
+      - About 65k tokens
+      - About 16k tokens
+      - About 230k tokens
+    explanation: |
+      Per token: $12TNH = 18DF$ gives $T = 18DF/(12NH) = 18\cdot8192\cdot28672/(12\cdot8192) \approx 43{,}000$. 65k is the textbook $8D$ against *all* matmuls under MHA and $F = 4D$, a different comparison.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 4 (Transformers) §"MLPs"
+    front: Params and training FLOPs of a gated MLP block?
+    back: |
+      $3DF$ params; $18BTDF$ training FLOPs (three $D\times F$ matmuls at $6BTDF$ each). Plain MLP: $2DF$, $12BTDF$.
+  - id: f2
+    source: Scaling Book ch. 4 (Transformers) §"Attention"
+    front: Params and training FLOPs of the QKVO projections with N query and K KV heads?
+    back: |
+      $2D(N+K)H$ params; $12BTD(N+K)H$ training FLOPs. MHA with $NH = D$: $4D^2$, $24BTD^2$.
+  - id: f3
+    source: Scaling Book ch. 4 (Transformers) §"Attention"
+    front: Training FLOPs of dot-product attention (scores + values)?
+    back: |
+      $12BTSNH$ ($= 12BT^2NH$ for self-attention). Depends on $N$, not $K$; quadratic in $T$; causal masking halves useful FLOPs only with a block-skipping kernel.
+  - id: f4
+    source: Scaling Book ch. 4 (Transformers) §"Fractional cost of attention with context length"
+    front: The T/8D rule. What is it, and under which assumptions?
+    back: |
+      Attention FLOPs / other matmul FLOPs $= T/(8D)$, assuming MHA, $D = NH$, $F = 4D$, non-causal. Attention dominates only for $T > 8D$ (≈ 65k at $D = 8192$; ≈ 37k for Gemma-27B).
+  - id: f5
+    source: Scaling Book ch. 4 (Transformers) §"Transformer Accounting"
+    front: What are MHA, MQA and GQA in terms of N and K?
+    back: |
+      MHA: $K = N$. MQA: $K = 1$. GQA: $1 < K < N$ with $K \mid N$; each KV head serves $G = N/K$ query heads.
+  - id: f6
+    source: Scaling Book ch. 4 (Transformers) §"Other Operations"
+    front: Cost of the unembedding?
+    back: |
+      $DV$ params, $6BTDV$ training FLOPs, once per model. For LLaMA-3 70B ($V = 128$k) ≈ 6.3 GFLOPs/token, about 1.2 layers' worth.
+  - id: f7
+    source: Scaling Book ch. 4 (Transformers), Question 1
+    front: KV-cache size per token?
+    back: |
+      $2\cdot L\cdot K\cdot H$ numbers (keys + values for every layer and KV head); e.g. $L = 64$, $KH = 4096$, int8 → 512 KiB/token.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 4 (Transformers) §"Fractional cost of attention with context length"
+    front: Derive the T/8D rule and explain what it implies for long-context training. Where does it stop holding?
+    back: |
+      - Attention $12BT^2NH$; other matmuls $18BTDF + 24BTDNH$ (MHA).
+      - With $D = NH$, $F = 4D$: $12BT^2D/(72BTD^2 + 24BTD^2) = T/(8D)$.
+      - Implication: for large $D$ the quadratic term matters only past tens of thousands of tokens (65k at $D = 8192$), and larger models push it further out.
+      - Limits: GQA and $F \ne 4D$ change the denominator (LLaMA-3 70B: ≈ 52k); causal kernels halve the numerator; memory (activations, KV) can bite before FLOPs do; local attention changes it.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 4 (Transformers) §"Transformer Accounting", §"General rule of thumb for Transformer FLOPs"
+    front: Walk through counting a Transformer's parameters and training FLOPs from its config, and show that it reduces to 6ND.
+    back: |
+      - Per layer: MLP $3DF$ (gated); attention $2D(N+K)H$; norms $2D$. Plus $DV$ for each of the embedding and unembedding (if untied).
+      - Training FLOPs per layer: $18BTDF + 12BTD(N+K)H$ (+ $12BT^2NH$ attention), plus $6BTDV$ unembedding.
+      - Factor: $6\cdot BT\cdot(3DF + 2D(N+K)H)$ = 6 × tokens × layer params; summing gives 6ND.
+      - Example (D = 4096, F = 4D, V = 32k, L = 64, MHA): ≈ 17.4B params, ¼ of layer params in attention, 512 KiB/token int8 KV.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 4 (Transformers) §"Attention"; Scaling Book ch. 7 §"Tricks for Improving Generation Throughput and Latency"
+    front: Compare MHA, GQA and MQA. What do they change about params, FLOPs and memory?
+    back: |
+      - All keep $N$ query heads; they differ in KV heads: $K = N$, $1 < K < N$, $K = 1$.
+      - Params and FLOPs of $W_K$, $W_V$ scale with $K$; $W_Q$, $W_O$ don't.
+      - Score/value FLOPs ($2BTSNH$ each) are unchanged: each query head still attends over all keys.
+      - KV cache shrinks by $N/K$ (LLaMA-3 70B: 8×), which matters most for inference memory and decode bandwidth.
+      - Decode attention intensity rises from ≈ 1 to ≈ $G$ (lesson 110). Quality is usually close to MHA.
+
+reading:
+  - title: "Scaling Book ch. 4: All the Transformer Math You Need to Know"
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    kind: book
+    note: '"Transformer Accounting" through "Fractional cost of attention with context length", and Problems 1 and 5.'
+  - title: "Ainslie et al. (2023), GQA: Training Generalized Multi-Query Transformer Models"
+    url: https://arxiv.org/abs/2305.13245
+    kind: paper
+    note: Defines grouped-query attention and measures its quality against MHA and MQA.
+  - title: "Shazeer (2020), GLU Variants Improve Transformer"
+    url: https://arxiv.org/abs/2002.05202
+    kind: paper
+    note: The gated MLP (SwiGLU) and the 2/3 scaling of d_ff that keeps parameters matched.
+  - title: "Scaling Book ch. 6: Training LLaMA 3 on TPUs"
+    url: https://jax-ml.github.io/scaling-book/applied-training/
+    kind: book
+    note: Applies this accounting to LLaMA-3 70B's config to recover its 70B parameters.

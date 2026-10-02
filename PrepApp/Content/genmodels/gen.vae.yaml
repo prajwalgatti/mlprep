@@ -1,0 +1,555 @@
+id: gen.vae
+area: genmodels
+title: Variational Autoencoders
+summary: The VAE as amortized variational inference for a deep latent-variable model. The reparameterization trick against REINFORCE, the closed-form Gaussian KL, what the reconstruction term really is, a training step with shapes, and why samples blur and the prior has holes.
+order: 40
+level: core
+tags: [vae, elbo, reparameterization, kl-divergence, amortized-inference, generative]
+prereqs: [gen.latent-variables-elbo, fund.autoencoders]
+
+explainer:
+  - title: "From the ELBO to a VAE"
+    body: |
+      **Recap.** A latent-variable model $p_\theta(x,z)=p(z)\,p_\theta(x\mid z)$ is trained by maximising the ELBO, which needs an approximate posterior $q$ (gen.latent-variables-elbo). A **variational autoencoder** (Kingma & Welling 2014; Rezende et al. 2014) makes three concrete choices.
+
+      - **Prior** $p(z)=\mathcal N(0,I)$ on $z\in\mathbb R^d$, with no learned parameters.
+      - **Decoder** $p_\theta(x\mid z)$: a network maps $z$ to the parameters of a simple distribution over $x$. That is a Gaussian mean $\mu_\theta(z)$ for real-valued data, or per-pixel Bernoulli probabilities for binary data. Pixels are independent *given* $z$, so every dependence between them must flow through $z$.
+      - **Encoder** $q_\phi(z\mid x)=\mathcal N\big(\mu_\phi(x),\mathrm{diag}\,\sigma^2_\phi(x)\big)$: a network outputs a mean and a log-variance for each latent dimension. This is **amortized** inference: one network serves every $x$.
+
+      **Why output $\log\sigma^2$?** Any real number maps to a positive variance by exponentiating, so no constraint is needed. Variances also span orders of magnitude, and the log scale keeps the outputs and their gradients well-scaled. Kingma & Welling output $\log\sigma$, which is equivalent.
+
+      **Objective.** Maximise, jointly over $\theta$ and $\phi$, the per-datapoint ELBO in its reconstruction − KL form, averaged over a minibatch:
+
+      $$\begin{aligned}\mathcal L_{\theta,\phi}(x)&=\mathbb E_{q_\phi(z\mid x)}\big[\log p_\theta(x\mid z)\big]\\&\quad-\mathrm{KL}\big(q_\phi(z\mid x)\,\|\,\mathcal N(0,I)\big).\end{aligned}$$
+
+      In code, the loss is $-\mathcal L$.
+
+      ![The VAE computation. The accent path is deterministic given $\epsilon$, so backprop reaches the encoder through $\mu$ and $\sigma$.](gen.vae/architecture)
+
+      **The name.** The encoder maps $x$ to a code and the decoder maps it back, as in an autoencoder. But the code is a *distribution*, and the loss is a bound on $\log p_\theta(x)$, not an arbitrary reconstruction error.
+
+      **Three questions** the next cards answer:
+      1. How do we differentiate through the random sample $z$?
+      2. How do we compute the KL?
+      3. What is the reconstruction term in practice?
+    source: Kingma & Welling 2014 §3; Kingma & Welling 2019 §2.1, §2.5; Murphy PML2 §21.1–21.2.1
+
+  - title: "Differentiating through the sample: reparameterization"
+    body: |
+      The reconstruction term is $\mathbb E_{q_\phi}[f(z)]$ with $f(z)=\log p_\theta(x\mid z)$. Its $\theta$-gradient is easy. But $\phi$ shapes the *distribution* of $z$, so the gradient cannot be pushed inside.
+
+      **Score-function (REINFORCE) estimator.** Use $\nabla_\phi q_\phi=q_\phi\nabla_\phi\log q_\phi$:
+
+      $$\begin{aligned}\nabla_\phi\mathbb E_{q_\phi}[f]&=\int f(z)\,\nabla_\phi q_\phi(z)\,dz\\&=\mathbb E_{q_\phi}\big[f(z)\,\nabla_\phi\log q_\phi(z)\big].\end{aligned}$$
+
+      It is unbiased and needs only *values* of $f$, so it works for discrete $z$. But it is noisy: it learns the direction only from how $f$'s value happens to correlate with the score. Baselines (control variates) help, but only partly.
+
+      **Reparameterization.** Write the sample as a deterministic function of parameter-free noise:
+
+      $$z=\mu_\phi(x)+\sigma_\phi(x)\odot\epsilon,\quad\epsilon\sim\mathcal N(0,I).$$
+
+      A shifted, scaled standard normal has exactly the distribution $q_\phi(z\mid x)$. Now the expectation is over a fixed distribution, so the gradient moves inside:
+
+      $$\begin{aligned}\nabla_\phi\mathbb E_{q_\phi}[f(z)]&=\nabla_\phi\mathbb E_{\epsilon}\big[f(\mu_\phi+\sigma_\phi\odot\epsilon)\big]\\&=\mathbb E_\epsilon\Big[\nabla_z f\cdot\frac{\partial z}{\partial\phi}\Big],\end{aligned}$$
+
+      with $\partial z_j/\partial\mu_j=1$ and $\partial z_j/\partial\sigma_j=\epsilon_j$. One draw of $\epsilon$ gives an unbiased estimate, and backprop computes it. It uses the *slope* of $f$, which is why it is usually far less noisy.
+
+      ![200,000 one-sample estimates of the same gradient under $q=\mathcal N(1,1)$, $f=z^2$. Both are centred on 2; the score-function estimates spread much wider.](gen.vae/estimator-variance)
+
+      **Concrete comparison.** $q=\mathcal N(\mu,1)$ at $\mu=1$, $f(z)=z^2$, so $\partial_\mu\mathbb E[z^2]=2\mu=2$.
+      - Reparameterized sample: $2(\mu+\epsilon)$, with variance 4.
+      - Score-function sample: $z^2(z-\mu)=(1+\epsilon)^2\epsilon$. Using $\mathbb E\epsilon^4=3$ and $\mathbb E\epsilon^6=15$, its variance is 30. Subtracting the baseline $\mathbb E f=2$ still leaves 18.
+
+      **Limits.** The trick needs continuous $z$ and differentiable $f$ and $g$. Location-scale families (Gaussian, Laplace, Student-t), distributions with an invertible CDF, and compositions (log-normal, gamma) all reparameterize. Discrete latents need REINFORCE-type estimators or relaxations such as Gumbel-softmax (fund.gumbel-softmax). Statisticians call this the *pathwise derivative*. Lower variance is typical for smooth $f$, but not guaranteed.
+    source: Kingma & Welling 2014 §2.2–2.4; Kingma & Welling 2019 §2.4; Murphy PML2 §6.3.4–6.3.5
+
+  - title: "The KL term in closed form"
+    body: |
+      For a Gaussian encoder and a standard-normal prior the KL needs no sampling. Derive it in 1-D for $q=\mathcal N(\mu,\sigma^2)$, $p=\mathcal N(0,1)$, using $\mathrm{KL}=\mathbb E_q[\log q-\log p]$ and two moments: $\mathbb E_q[(z-\mu)^2]=\sigma^2$ and $\mathbb E_q[z^2]=\mu^2+\sigma^2$.
+
+      $$\begin{aligned}\mathbb E_q[\log q]&=-\tfrac12\log(2\pi\sigma^2)-\tfrac{\mathbb E_q[(z-\mu)^2]}{2\sigma^2}\\&=-\tfrac12\log(2\pi\sigma^2)-\tfrac12,\\\mathbb E_q[\log p]&=-\tfrac12\log(2\pi)-\tfrac12(\mu^2+\sigma^2).\end{aligned}$$
+
+      Subtracting, the $\log 2\pi$ terms cancel:
+
+      $$\begin{aligned}&\mathrm{KL}\big(\mathcal N(\mu,\sigma^2)\|\mathcal N(0,1)\big)\\&\quad=\tfrac12\big(\mu^2+\sigma^2-1-\log\sigma^2\big).\end{aligned}$$
+
+      **Diagonal Gaussians.** Both $q$ and $p$ factorise over dimensions, so their log-densities are sums and the KL is a sum of per-dimension terms:
+
+      $$\mathrm{KL}=\tfrac12\sum_{j=1}^{d}\big(\mu_j^2+\sigma_j^2-1-\log\sigma_j^2\big).$$
+
+      **Reading it.** It is 0 iff $\mu=0$ and $\sigma=1$. $\mu^2$ charges for moving the code away from the origin. $\sigma^2-1-\log\sigma^2$ is minimised at $\sigma=1$ and blows up as $\sigma\to0$, which stops the encoder from collapsing to a point code. Examples: $\mu=1,\sigma=1$ gives $0.5$ nats; $\mu=0,\sigma=0.5$ gives $\tfrac12(0.25-1+1.386)=0.318$ nats.
+
+      **General two-Gaussian KL** (reused in diffusion). The same two moments with $p=\mathcal N(\mu_2,\sigma_2^2)$, where $\mathbb E_q[(z-\mu_2)^2]=\sigma_1^2+(\mu_1-\mu_2)^2$, give
+
+      $$\begin{aligned}&\mathrm{KL}\big(\mathcal N(\mu_1,\sigma_1^2)\|\mathcal N(\mu_2,\sigma_2^2)\big)\\&\quad=\log\frac{\sigma_2}{\sigma_1}+\frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\frac12.\end{aligned}$$
+
+      **Why use it.** Kingma & Welling give two estimators of the ELBO. One samples everything, $\log p_\theta(x,z)-\log q_\phi(z\mid x)$. The other uses the analytic KL and samples only the reconstruction. The second typically has lower variance, so it is the standard choice whenever the KL is available in closed form.
+    source: Kingma & Welling 2014 §2.3, App. B; Murphy PML2 §10.2.1.1
+
+  - title: "The reconstruction term: which likelihood?"
+    body: |
+      $\mathbb E_q[\log p_\theta(x\mid z)]$ is estimated with one sample $z$ per datapoint. Kingma & Welling found one sample enough with minibatches of about 100. What it computes depends on the decoder's distribution.
+
+      **Gaussian decoder, fixed variance $\sigma_x^2$**, with $x\in\mathbb R^D$:
+
+      $$\begin{aligned}-\log p_\theta(x\mid z)&=\frac{\|x-\mu_\theta(z)\|^2}{2\sigma_x^2}\\&\quad+\tfrac D2\log(2\pi\sigma_x^2).\end{aligned}$$
+
+      So the loss is the sum of squared errors divided by $2\sigma_x^2$, plus the KL. Multiplying through by $2\sigma_x^2$ gives the same minimiser as
+
+      $$\|x-\mu_\theta(z)\|^2+2\sigma_x^2\,\mathrm{KL}.$$
+
+      **$\sigma_x^2$ is a hidden KL weight**: $\beta=2\sigma_x^2$ relative to a plain sum-of-squares loss. A small $\sigma_x^2$ means reconstruction dominates, which acts like a small $\beta$. A large $\sigma_x^2$ lets the KL win.
+
+      **Learning $\sigma_x^2$.** With one shared variance and squared error $S=\|x-\mu_\theta(z)\|^2$, set $\partial_{\sigma_x^2}\big[\tfrac{S}{2\sigma_x^2}+\tfrac D2\log\sigma_x^2\big]=0$. This gives $\sigma_x^2=S/D$, the per-pixel MSE, so the balance adjusts itself as reconstructions improve.
+
+      **Bernoulli decoder** for binary $x$, with $p=\mu_\theta(z)\in(0,1)^D$:
+
+      $$-\log p_\theta(x\mid z)=-\textstyle\sum_i\big[x_i\log p_i+(1-x_i)\log(1-p_i)\big],$$
+
+      which is binary cross-entropy. Applying BCE to *continuous* intensities in $[0,1]$ is common but not a proper likelihood. For example, with $p_i=0.5$ the "density" $p_i^{x}(1-p_i)^{1-x}=0.5$ integrates to $0.5$ over $x\in[0,1]$, not 1. The resulting number is then not a bound on any $\log p(x)$.
+
+      **Reductions change $\beta$ silently.** The ELBO *sums* over pixels and over latent dimensions. Suppose the reconstruction term is averaged over $D=784$ pixels (e.g. a default mean-reduced MSE) while the KL is summed. Then the loss is $\tfrac{1}{784}(\text{SSE}+784\,\mathrm{KL})$: the KL is effectively weighted 784 times too heavily. Averaging the KL over $d=32$ latent dimensions as well still leaves $\beta=784/32=24.5$. Both give blurry outputs and unused latents. Averaging over the *batch* is harmless; it only rescales the learning rate.
+    source: Kingma & Welling 2014 §2.3, §3, App. C; Murphy PML2 §21.3.1 (eq. 21.23); Kingma & Welling 2019 §1.7.3
+
+  - title: "One training step, with shapes"
+    body: |
+      For a batch of $B$ images flattened to $D$ pixels in $[0,1]$, a latent size $d$, and a Gaussian decoder with fixed variance `sx2`:
+
+      ```python
+      # x: [B, D]
+      mu, logvar = encoder(x)        # [B, d], [B, d]
+      eps = torch.randn_like(mu)     # [B, d]
+      z = mu + torch.exp(0.5 * logvar) * eps
+      x_mean = decoder(z)            # [B, D]
+      rec = ((x - x_mean) ** 2).sum(1) / (2 * sx2)
+      kl = 0.5 * (mu ** 2 + logvar.exp()
+                  - 1 - logvar).sum(1)   # [B]
+      loss = (rec + kl).mean()       # -ELBO + const
+      opt.zero_grad(); loss.backward(); opt.step()
+      ```
+
+      Line by line:
+      - The encoder has two heads, one for the mean and one for the log-variance.
+      - `exp(0.5 * logvar)` is $\sigma$. Sampling `eps` separately is the reparameterization, so `z` is differentiable in `mu` and `logvar`.
+      - `rec` sums over pixels and is $-\log p_\theta(x\mid z)$ up to the dropped constant $\frac D2\log(2\pi\sigma_x^2)$. For a Bernoulli decoder, use `binary_cross_entropy_with_logits(logits, x, reduction="none").sum(1)`. Logits are more numerically stable than probabilities.
+      - `kl` is the closed form from the previous card, summed over latent dimensions.
+      - The mean over the batch gives a minibatch estimate of the average negative ELBO. Kingma & Welling multiply by $N/M$ to estimate the dataset sum, which only rescales the gradient.
+
+      **Sanity checks.**
+      - At initialisation, `kl` should be small and `rec` large.
+      - If `kl` collapses to about 0 for every input, the decoder is ignoring $z$ (posterior collapse, gen.vae-variants).
+      - Report the ELBO in nats per image (or bits per dimension) with the constant included, so different runs can be compared.
+
+      **At test time** there is no sampling of `eps` for reconstruction (use `mu`). For generation, skip the encoder entirely: draw `z = torch.randn(B, d)` and decode.
+    source: Kingma & Welling 2014 §2.3 (Alg. 1, eq. 8); Kingma & Welling 2019 §2.4–2.5 (Alg. 2); Murphy PML2 §21.2.2
+
+  - title: "Generation, the aggregate posterior and prior holes"
+    body: |
+      **Generating.** Draw $z\sim\mathcal N(0,I)$ and decode. People usually show the decoder *mean* $\mu_\theta(z)$. A sample from a Gaussian decoder adds independent per-pixel noise, which looks like static rather than detail.
+
+      **Which codes did the decoder train on?** Only codes drawn from the encoder. Pooled over the data, they follow the **aggregate posterior**
+
+      $$q_\phi(z)=\frac1N\sum_{i=1}^N q_\phi(z\mid x_i).$$
+
+      Sampling uses the prior instead, so what matters is how well $q_\phi(z)$ matches $p(z)$. The KL term matches them only partially. Averaging the KL over the data and inserting $q_\phi(z)$:
+
+      $$\begin{aligned}\mathbb E_{x}\,\mathrm{KL}\big(q_\phi(z\mid x)\|p(z)\big)&=\mathbb E_{x,z}\Big[\log\frac{q_\phi(z\mid x)}{q_\phi(z)}+\log\frac{q_\phi(z)}{p(z)}\Big]\\&=I_q(x;z)+\mathrm{KL}\big(q_\phi(z)\|p(z)\big).\end{aligned}$$
+
+      Here the expectation is over $x$ from the data and $z\sim q_\phi(z\mid x)$. $I_q(x;z)$ is the mutual information between input and code under this joint. So the KL term charges for **information stored in $z$** as well as for **mismatch with the prior**. Good reconstructions need information, so the optimum trades some mismatch for it.
+
+      ![Illustrative 2-D latent space (synthetic encoder outputs). Each training image contributes one small Gaussian; together they form the shaded aggregate posterior. Points A, B, C are candidate prior draws.](gen.vae/aggregate-posterior-holes)
+
+      **Prior holes.** Regions where $p(z)$ is high but $q_\phi(z)$ is low were rarely seen by the decoder during training, so decoding them can give implausible images. Fixes are learned or more flexible priors, or fitting a second model to $q_\phi(z)$ after training (named here; see gen.latent-diffusion).
+
+      **Interpolation.** Decoding along a path between two codes gives smooth morphs. In high dimensions, prior samples concentrate at norm $\approx\sqrt d$. The midpoint of two independent samples is distributed as $\mathcal N(0,\tfrac12I)$, so its norm is about $\sqrt{d/2}$: for $d=64$, 5.7 instead of 8. Midpoints are therefore atypical for the prior, which motivates interpolating along the sphere instead of a straight line.
+
+      **AE vs VAE.** A plain autoencoder has a deterministic encoder and no KL. Its codes can occupy any shape, so decoding random codes fails, while a VAE can generate by decoding prior samples. With KL weight 0, the encoder variances shrink toward 0 and a VAE turns into an AE.
+    source: Murphy PML2 §21.2.3–21.2.4 (eqs. 21.14, 21.22); Kingma & Welling 2019 §2.7; Goodfellow DL §20.10.3
+
+  - title: "Why VAE samples are blurry"
+    body: |
+      **A mechanism you can derive.** Take a Gaussian decoder with fixed variance and hold the encoder fixed. Over $x$ from the data and $z\sim q_\phi(z\mid x)$, the decoder minimises $\mathbb E\|x-\mu_\theta(z)\|^2$. For each $z$, the minimiser of an expected squared error is the conditional mean:
+
+      $$\mu^*_\theta(z)=\mathbb E_q[x\mid z].$$
+
+      Whenever the encoder's distributions for *different* inputs overlap at $z$, the decoder outputs their average. The KL term encourages exactly this overlap, by pulling every $q_\phi(z\mid x)$ toward the same prior and keeping its variance from shrinking.
+
+      **Two-image example.** Let the data be $x=-1$ and $x=+1$, equally often, encoded as $\mathcal N(\mp m,s^2)$. Bayes' rule over the two inputs gives $P(x{=}{+}1\mid z)=\sigma(2mz/s^2)$, with $\sigma$ the logistic function, so
+
+      $$\mathbb E_q[x\mid z]=\tanh\!\Big(\frac{mz}{s^2}\Big).$$
+
+      With little overlap the decoder output is a sharp step. With heavy overlap it is a ramp, and codes near $z=0$, which are typical prior draws, decode to about 0: a value neither input had. For images, that average is a blur.
+
+      ![Exact optimal decoder for the two-image toy ($m=1$). More encoder overlap turns a sharp switch into a wide band of averaged outputs.](gen.vae/blur-averaging)
+
+      **Other contributing factors.** A factorised Gaussian likelihood scores errors pixel by pixel, so small or low-contrast details cost little and get dropped. Maximum likelihood, i.e. minimising $\mathrm{KL}(p_{data}\|p_\theta)$, is mass-covering, so it can put probability on blurry images to avoid missing real ones. Goodfellow et al. call the cause unsettled; treat these as complementary.
+
+      **Remedies.**
+      - Lower $\beta$ (closer to an AE), which gives sharper reconstructions but worse prior samples.
+      - More expressive decoders, e.g. autoregressive ones. These risk *posterior collapse*: the decoder models $x$ alone and the KL drives $q$ to the prior (gen.vae-variants).
+      - Richer posteriors and hierarchical latents.
+      - Perceptual and adversarial reconstruction losses (VQGAN, named).
+
+      In modern practice the last option dominates. The autoencoder of latent diffusion trains with reconstruction plus adversarial losses and a KL weight of about $10^{-6}$, so it is used as a compressor rather than a sampler (gen.latent-diffusion).
+    source: Murphy PML2 §21.3.1; Goodfellow DL §20.10.3; Rombach et al. 2022 §3.1, App. G
+
+  - title: "How good is the inference? Gaps and log-likelihoods"
+    body: |
+      **The gap, split.** $\log p_\theta(x)-\mathcal L=\mathrm{KL}(q_\phi\|p_\theta(z\mid x))$ is the sum of two parts. The **approximation gap** comes from the diagonal-Gaussian family. The **amortization gap** comes from one encoder serving all $x$ (gen.latent-variables-elbo). Cremer et al. measured both on MNIST, Fashion-MNIST and CIFAR-10 and found the amortization gap is often the larger, and that the decoder learns to make its true posteriors fit the chosen family, so the approximation gap looks small partly by adaptation.
+
+      **Fixes.**
+      - *Approximation:* a full-covariance Gaussian $z=\mu+L\epsilon$ with $L$ lower-triangular and diagonal $\sigma$. Its Jacobian is triangular, so $\log|\det\partial z/\partial\epsilon|=\sum_i\log\sigma_i$ stays cheap. Chains of such maps give normalizing-flow posteriors such as IAF (gen.flows).
+      - *Amortization:* a bigger encoder, or *semi-amortized* inference, which starts from the encoder's output and takes a few gradient steps on that datapoint's ELBO.
+
+      **Estimating $\log p_\theta(x)$** to compare models, since ELBOs alone can mislead. Use $q_\phi$ as an importance-sampling proposal with $K$ samples:
+
+      $$\log p_\theta(x)\approx\log\frac1K\sum_{k=1}^K\frac{p_\theta(x,z_k)}{q_\phi(z_k\mid x)},\quad z_k\sim q_\phi.$$
+
+      The average inside the log is unbiased for $p_\theta(x)$, so by Jensen the estimate's expectation is at most $\log p_\theta(x)$. It equals the ELBO at $K=1$, increases with $K$, and converges to $\log p_\theta(x)$ as $K\to\infty$ when the weights are bounded (Burda et al., Thm 1). In the previous lesson's toy ($x=1$) with $q$ = prior, the remaining gap is 0.403 nats at $K=1$, about 0.019 at $K=10$ and about 0.002 at $K=100$ (simulated). Optimising this multi-sample bound itself gives the IWAE (gen.vae-variants). Importance weights degrade badly as $\dim z$ grows, so a good $q$ still matters.
+
+      **Where the conflict lives.** Averaged over data, the ELBO equals, up to a constant,
+
+      $$-\mathrm{KL}(p_D\|p_\theta(x))-\mathbb E_{p_D}\,\mathrm{KL}\big(q_\phi\|p_\theta(z\mid x)\big),$$
+
+      where $p_D$ is the empirical data distribution. The first term is the MLE objective; the second is the inference error. With a limited $q$ they compete. Because $x$ has far more dimensions than $z$, reconstruction usually wins over faithful posterior inference.
+    source: Cremer et al. 2018 §1, Table 1; Kingma & Welling 2019 §2.5.1, §2.6; Burda et al. 2016 Thm 1; Murphy PML2 §10.1.6, §21.2.4 (eqs. 21.20–21.22)
+
+  - title: "Pitfalls and what interviewers probe"
+    body: |
+      **Common mistakes**
+      - Saying the KL term "needs Monte Carlo". For a Gaussian $q$ and a Gaussian prior it is closed-form; only the reconstruction is sampled.
+      - Inconsistent reductions: a mean over pixels with a sum over latents multiplies the KL weight by $D$.
+      - BCE on continuous pixels presented as a likelihood. It isn't normalised, so the reported "ELBO" is only a loose lower bound on a continuous-Bernoulli likelihood, not a bound on the model you think you trained.
+      - Comparing models by ELBO alone. Use an importance-sampled $\log p$ with many samples.
+      - Forgetting that $\sigma_x^2$ is a KL weight: tuning it is tuning $\beta$.
+      - "Reparameterization trick" (Kingma) and "pathwise derivative" (statistics) are the same thing; REINFORCE is the score-function estimator.
+      - Viewing the VAE as "an AE plus noise". Kingma frames it as amortized VI for a deep latent-variable model, which is why the loss is a likelihood bound.
+
+      **Interview chain, with short answers**
+      - *Write the VAE loss.* The negative ELBO: $-\mathbb E_q\log p_\theta(x\mid z)+\mathrm{KL}(q_\phi\|\mathcal N(0,I))$, with the KL as $\frac12\sum(\mu^2+\sigma^2-1-\log\sigma^2)$.
+      - *Why reparameterize?* So that $\phi$ sits inside the integrand and backprop gives a low-variance unbiased gradient. REINFORCE also works, but it is much noisier.
+      - *When does the trick fail?* For discrete latents. Use REINFORCE with baselines, or a Gumbel-softmax relaxation.
+      - *Why log-variance?* There's no positivity constraint, and the output is well-scaled.
+      - *Why blurry?* With an MSE-type likelihood, the optimal decoder outputs $\mathbb E[x\mid z]$, which averages over the inputs whose codes overlap.
+      - *What does the decoder variance do?* It sets the reconstruction/KL balance ($\beta=2\sigma_x^2$).
+      - *AE vs VAE?* A stochastic encoder plus the KL gives a sampleable latent space.
+      - *Aggregate posterior?* $\mathbb E_x q(z\mid x)$. Its mismatch with the prior creates holes; $\mathbb E_x\mathrm{KL}=I(x;z)+\mathrm{KL}(q(z)\|p(z))$.
+      - *How do you get $\log p(x)$?* Importance sampling with $q$ as the proposal. The estimate tightens with $K$ (the IWAE idea).
+    source: Kingma & Welling 2014 §2.3–2.4; Murphy PML2 §21.2–21.3.1; Cremer et al. 2018 §1
+
+  - title: Key results
+    body: |
+      - Model: $p(z)=\mathcal N(0,I)$, decoder $p_\theta(x\mid z)$, encoder $q_\phi(z\mid x)=\mathcal N(\mu_\phi,\mathrm{diag}\,\sigma_\phi^2)$ outputting $\log\sigma^2$.
+      - Loss $=-$ELBO:
+
+      $$-\mathbb E_{q_\phi}[\log p_\theta(x\mid z)]+\mathrm{KL}(q_\phi\|\mathcal N(0,I))$$
+
+      - Reparameterization: $z=\mu+\sigma\odot\epsilon$, $\epsilon\sim\mathcal N(0,I)$, so $\nabla_\phi\mathbb E_q f=\mathbb E_\epsilon[\nabla_z f\,\partial z/\partial\phi]$.
+      - Score function: $\nabla_\phi\mathbb E_q f=\mathbb E_q[f\,\nabla_\phi\log q_\phi]$. Unbiased but noisy (variance 30 vs 4 in the $z^2$ example).
+      - Gaussian KL to $\mathcal N(0,1)$:
+
+      $$\tfrac12\textstyle\sum_j(\mu_j^2+\sigma_j^2-1-\log\sigma_j^2)$$
+
+      - Two Gaussians: $\log\frac{\sigma_2}{\sigma_1}+\frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\frac12$.
+      - Gaussian decoder: $-\log p=\frac{\|x-\mu_\theta\|^2}{2\sigma_x^2}+$ const, so $\beta_{\rm eff}=2\sigma_x^2$; the learned $\sigma_x^2$ is the per-pixel MSE.
+      - $\mathbb E_x\mathrm{KL}(q(z\mid x)\|p)=I_q(x;z)+\mathrm{KL}(q(z)\|p(z))$.
+      - Optimal fixed-variance Gaussian decoder: $\mathbb E_q[x\mid z]$, hence blur.
+      - $\log p(x)\approx\log\frac1K\sum_k w_k$ is a lower bound in expectation that tightens with $K$; at $K=1$ it is the ELBO.
+    source: Kingma & Welling 2014 §2.3–2.4, App. B; Kingma & Welling 2019 §2.6; Murphy PML2 §21.2.4, §21.3.1
+
+quiz:
+  - id: q1
+    prompt: |
+      An encoder outputs $\mu=(0.5,\,-1)$ and $\log\sigma^2=(0,\,\log 0.25)$ for one image. What is $\mathrm{KL}(q_\phi(z\mid x)\,\|\,\mathcal N(0,I))$ in nats?
+    correct: "0.943"
+    wrong:
+      - "0.472"
+      - "0.250"
+      - "0.722"
+    explanation: |
+      Per dimension, $\frac12(\mu^2+\sigma^2-1-\log\sigma^2)$. Dimension 1: $\frac12(0.25+1-1-0)=0.125$. Dimension 2: $\frac12(1+0.25-1+1.386)=0.818$. The sum is $0.943$. 0.472 averages over dimensions instead of summing. 0.250 drops the $-\log\sigma^2$ term, which is what stops $\sigma$ from collapsing. 0.722 treats $\sigma=0.5$ as if it were the variance.
+    source: Kingma & Welling 2014 App. B
+
+  - id: q2
+    prompt: |
+      Which statement about a standard VAE (Gaussian encoder, $\mathcal N(0,I)$ prior) is **false**?
+    correct: The KL term has to be estimated by sampling $z$ from the encoder
+    wrong:
+      - With a fixed-variance Gaussian decoder, the reconstruction term is a scaled squared error plus a constant
+      - With minibatches of about 100, one sample of $z$ per datapoint is typically enough
+      - The reparameterized one-sample gradient is an unbiased estimate of the ELBO's gradient
+    explanation: |
+      For two Gaussians the KL is analytic: $\frac12\sum_j(\mu_j^2+\sigma_j^2-1-\log\sigma_j^2)$. Kingma & Welling's second estimator uses this form, and it typically has lower variance than sampling the KL. The other statements are true. $-\log\mathcal N(x;\mu,\sigma_x^2I)=\|x-\mu\|^2/(2\sigma_x^2)+$ const. They used $L=1$ with $M=100$. And $\mathbb E_\epsilon[\nabla\tilde{\mathcal L}]=\nabla\mathcal L$ because $\epsilon$'s distribution doesn't depend on the parameters.
+    source: Kingma & Welling 2014 §2.3; Kingma & Welling 2019 §2.4.3
+
+  - id: q3
+    prompt: |
+      A VAE on images in $[0,1]$ uses a Gaussian decoder whose fixed variance is lowered from $\sigma_x^2=0.1$ to $\sigma_x^2=0.001$. What is the most likely effect?
+    correct: Reconstruction dominates, like a smaller $\beta$; codes drift from the prior and prior samples worsen
+    wrong:
+      - The KL term dominates, so the encoder collapses to the prior and ignores the input
+      - Nothing changes, because $\sigma_x^2$ only adds a constant to the loss
+      - Prior samples sharpen, because the decoder now adds far less pixel noise to them
+    explanation: |
+      The squared error is divided by $2\sigma_x^2$, so a 100× smaller variance makes reconstruction errors 100× more expensive relative to the KL ($\beta_{\rm eff}=2\sigma_x^2$). The encoder then stores more information and its posteriors move away from $\mathcal N(0,I)$. That widens the prior holes, so decoded prior samples tend to get worse even as reconstructions sharpen. $\sigma_x^2$ adds a constant $\frac D2\log 2\pi\sigma_x^2$, but it also *scales* the squared-error term. The "less pixel noise" option confuses the decoder mean, which is what people display, with decoder sampling.
+    source: Murphy PML2 §21.3.1 (eqs. 21.23–21.24)
+
+  - id: q4
+    prompt: |
+      A VAE for $28\times28$ images ($D=784$) with $d=32$ latents computes `rec = F.mse_loss(x_hat, x)` (a mean over pixels and the batch) and `kl` summed over latent dimensions and averaged over the batch, with `loss = rec + kl`. Take a decoder with $\sigma_x^2=\frac12$, so that $-\log p=\text{SSE}+\text{const}$. What KL weight $\beta$ does this loss effectively use, relative to the true ELBO?
+    correct: "784"
+    wrong:
+      - "1/784"
+      - "24.5"
+      - "1"
+    explanation: |
+      Per image, the code's loss is $\text{SSE}/784+\mathrm{KL}=\frac{1}{784}(\text{SSE}+784\,\mathrm{KL})$. The overall factor only rescales the learning rate, so the KL is weighted 784× relative to the ELBO's $\text{SSE}+\mathrm{KL}$. 24.5 would apply if the KL were *also* averaged over the 32 latent dimensions ($784/32$). Averaging over the batch is harmless because it applies to both terms. Such a huge $\beta$ typically gives blurry reconstructions and many collapsed latent dimensions.
+    source: Kingma & Welling 2014 §2.3, §3; Murphy PML2 §21.3.1
+
+  - id: q5
+    prompt: |
+      With $z=\mu+\sigma\epsilon$, $\mu=0.3$, $\sigma=0.5$, a drawn $\epsilon=-1.2$ and $f(z)=z^2$, what is the one-sample reparameterized estimate of $\partial_\sigma\,\mathbb E_q[f(z)]$?
+    correct: "0.72"
+    wrong:
+      - "−0.60"
+      - "1.00"
+      - "−0.72"
+    explanation: |
+      $z=0.3+0.5(-1.2)=-0.3$, and $\partial f/\partial\sigma=f'(z)\,\partial z/\partial\sigma=2z\cdot\epsilon=2(-0.3)(-1.2)=0.72$. $-0.60$ is $2z$, which is the $\mu$-gradient ($\partial z/\partial\mu=1$). $1.00$ is the *exact* gradient $\partial_\sigma(\mu^2+\sigma^2)=2\sigma$: a single sample is unbiased, not exact. $-0.72$ drops the sign of $\epsilon$.
+    source: Kingma & Welling 2019 §2.4.2; Kingma & Welling 2014 §2.4
+
+  - id: q6
+    prompt: |
+      For which latent variable does the reparameterization trick **not** apply directly?
+    correct: A categorical latent selecting one of $K$ codebook vectors
+    wrong:
+      - A Laplace latent with learned location and scale
+      - A full-covariance Gaussian latent built with a Cholesky factor
+      - A log-normal latent, the exponential of a learned Gaussian
+    explanation: |
+      Reparameterization needs $z=g_\phi(\epsilon)$ to be differentiable in $\phi$. A categorical draw is piecewise constant in its probabilities, so its gradient is zero almost everywhere. You need REINFORCE, or a relaxation such as Gumbel-softmax, or a straight-through estimator. The Laplace is a location-scale family ($\mu+b\epsilon$). The full-covariance Gaussian is $\mu+L\epsilon$. The log-normal is a composition, $\exp(\mu+\sigma\epsilon)$. All three are differentiable.
+    source: Kingma & Welling 2014 §2.4; Murphy PML2 §6.3.5–6.3.6
+
+  - id: q7
+    prompt: |
+      ![Illustrative trained VAE latent space: shaded aggregate posterior, dashed prior contours.](gen.vae/aggregate-posterior-holes)
+
+      You decode three codes, A, B and C. Which one is **both** a typical draw from the prior **and** likely to decode to an implausible image?
+    correct: B, near the prior's mode but far from every training code
+    wrong:
+      - A, inside a cluster but more than 1 sd from the prior's mode
+      - C, far from both the prior's mode and the training codes
+      - None of them, since every point within 2 sd of the prior decodes well
+    explanation: |
+      The decoder only ever trained on codes from the aggregate posterior $q_\phi(z)$, the shaded region. B has the *highest* prior density of the three, so samples land near it often, yet there are no training codes there: a prior hole. A sits inside a cluster, so it decodes well even though it isn't at the prior's mode. C would likely decode badly too, but it lies beyond 2 sd, so prior samples rarely land there. Prior coverage does not guarantee good decoding.
+    source: Murphy PML2 §21.2.4 (eq. 21.22)
+
+  - id: q8
+    prompt: |
+      Averaged over the data, the VAE's KL term $\mathbb E_x\,\mathrm{KL}(q_\phi(z\mid x)\|p(z))$ equals which expression? Here $q_\phi(z)$ is the aggregate posterior and $I_q$ is mutual information under $p_D(x)q_\phi(z\mid x)$.
+    correct: $I_q(x;z)+\mathrm{KL}(q_\phi(z)\,\|\,p(z))$
+    wrong:
+      - $\mathrm{KL}(q_\phi(z)\,\|\,p(z))$ alone
+      - $\mathrm{KL}(q_\phi(z)\,\|\,p(z))-I_q(x;z)$
+      - $I_q(x;z)$ alone
+    explanation: |
+      Insert $q_\phi(z)$: $\log\frac{q(z\mid x)}{p(z)}=\log\frac{q(z\mid x)}{q(z)}+\log\frac{q(z)}{p(z)}$. The first term's expectation is $I_q(x;z)$, and the second's is $\mathrm{KL}(q(z)\|p(z))$, because its integrand depends only on $z$, whose marginal is $q(z)$. So the KL penalty charges for information as well as for prior mismatch. That is why driving it to zero means the code carries no information about $x$.
+    source: Murphy PML2 §21.2.4
+
+  - id: q9
+    prompt: |
+      A Gaussian-decoder VAE (fixed variance) trains on two images that differ only by a small shift of one stroke. Their encoder posteriors overlap heavily. What does the decoder mean output for a code in the overlap?
+    correct: Roughly the pixelwise average, i.e. a faint doubled or smeared stroke
+    wrong:
+      - Whichever of the two images has the higher likelihood, chosen deterministically
+      - One of the two images at random, selected by the decoder's own noise
+      - A sharp new image with the stroke halfway between the two positions
+    explanation: |
+      For fixed encoder and squared-error loss, the optimal decoder mean is $\mathbb E_q[x\mid z]$, a weighted average of the inputs whose posteriors cover $z$. Averaging two shifted strokes gives two half-intensity strokes, not one stroke halfway. A sharp "halfway" image would need a decoder that represents the stroke's position, which pixelwise averaging cannot do. The decoder mean has no noise to pick a sample with; sampling the Gaussian decoder would add independent pixel noise instead.
+    source: Murphy PML2 §21.3.1; Goodfellow DL §20.10.3
+
+  - id: q10
+    prompt: |
+      You estimate $\log p_\theta(x)$ as $\log\frac1K\sum_{k=1}^K p_\theta(x,z_k)/q_\phi(z_k\mid x)$ with $z_k\sim q_\phi$. What happens to this estimator as $K$ grows?
+    correct: Its expectation rises toward $\log p_\theta(x)$ and never exceeds it
+    wrong:
+      - It is unbiased for $\log p_\theta(x)$ at every $K$, but its variance falls
+      - Its expectation falls toward $\log p_\theta(x)$ from above, like an upper bound
+      - It converges to the ELBO, which is the best achievable with this $q$
+    explanation: |
+      The average of the weights is unbiased for $p_\theta(x)$, but the log of an unbiased estimate is biased low (Jensen), so the expectation is at most $\log p_\theta(x)$. It equals the ELBO at $K=1$, increases with $K$ (Burda et al., Thm 1), and converges as $K\to\infty$. In the linear-Gaussian toy with $q$ = prior, the gap is 0.403 nats at $K=1$, about 0.019 at $K=10$ and about 0.002 at $K=100$. The "unbiased" option confuses $p$ with $\log p$.
+    source: Kingma & Welling 2019 §2.6; Goodfellow DL §20.10.3 (eq. 20.79)
+
+  - id: q11
+    prompt: |
+      Which statement about the approximation and amortization gaps is **false**?
+    correct: Enlarging the encoder network can only reduce the approximation gap
+    wrong:
+      - Switching from a diagonal to a full-covariance Gaussian family can shrink the approximation gap
+      - A few per-datapoint gradient steps from the encoder's output target the amortization gap
+      - The two gaps sum to $\mathrm{KL}(q_\phi(z\mid x)\,\|\,p_\theta(z\mid x))$ for each $x$
+    explanation: |
+      The approximation gap, $\log p(x)-\mathcal L[q^*]$, depends on the *family* (and the decoder), not on how well the encoder hits the family's best member. A bigger encoder targets the amortization gap, $\mathcal L[q^*]-\mathcal L[q_\phi]$. Cremer et al. also found that more expressive approximations help partly by reducing amortization error, so the two interact. The family change, the refinement steps and the sum identity are all true by definition.
+    source: Cremer et al. 2018 §1, Table 1
+
+  - id: q12
+    prompt: |
+      A Gaussian decoder uses one learned variance $\sigma_x^2$ shared by all $D$ pixels. For a fixed reconstruction with squared error $S=\|x-\mu_\theta(z)\|^2$, which $\sigma_x^2$ minimises $-\log p_\theta(x\mid z)$?
+    correct: $S/D$, the mean squared error per pixel
+    wrong:
+      - $S$, the total squared error
+      - $\sqrt{S/D}$, the root-mean-square error
+      - $\tfrac12$, independent of the reconstruction
+    explanation: |
+      $-\log p=\frac{S}{2\sigma_x^2}+\frac D2\log(2\pi\sigma_x^2)$. Its derivative in $\sigma_x^2$ is $-\frac{S}{2\sigma_x^4}+\frac{D}{2\sigma_x^2}$, which vanishes at $\sigma_x^2=S/D$. $\sqrt{S/D}$ is the optimal standard deviation, not the variance. $\frac12$ is just the value at which $-\log p$ equals SSE plus a constant. Learning $\sigma_x^2$ makes the effective $\beta=2\sigma_x^2$ shrink as reconstructions improve.
+    source: Murphy PML2 §21.3.1 (eq. 21.23)
+
+  - id: q13
+    prompt: |
+      You set the KL weight to zero ($\beta=0$) but keep the stochastic encoder and the reparameterization. What breaks first?
+    correct: Decoding $z\sim\mathcal N(0,I)$ gives poor images, as nothing ties the codes to the prior
+    wrong:
+      - Reconstructions get blurrier, because the encoder variances grow without the KL
+      - The reparameterized gradient becomes biased without the KL term
+      - The encoder outputs collapse onto the prior, so the decoder ignores $z$
+    explanation: |
+      With no KL, the only pressure is reconstruction. The encoder shrinks its variances toward 0, since noise only hurts reconstruction, and places codes anywhere convenient. The model becomes a plain autoencoder: reconstructions are good, but the aggregate posterior bears no relation to $\mathcal N(0,I)$, so prior samples decode badly. Variances *shrink* rather than grow. Collapse onto the prior is the opposite failure, which comes from too *much* KL weight or an over-powerful decoder.
+    source: Murphy PML2 §21.2.3, §21.3.1
+
+cards:
+  - id: f1
+    front: State the reparameterization trick for a diagonal Gaussian encoder, and say why it gives gradients for $\phi$.
+    back: |
+      $$z=\mu_\phi(x)+\sigma_\phi(x)\odot\epsilon,\quad\epsilon\sim\mathcal N(0,I)$$
+
+      The noise distribution doesn't depend on $\phi$, so $\nabla_\phi\mathbb E_{q_\phi}[f(z)]=\mathbb E_\epsilon[\nabla_\phi f(\mu_\phi+\sigma_\phi\odot\epsilon)]$, and one sample gives an unbiased estimate via backprop. $\partial z/\partial\mu=1$ and $\partial z/\partial\sigma=\epsilon$.
+    source: Kingma & Welling 2014 §2.4; Kingma & Welling 2019 §2.4–2.5
+
+  - id: f2
+    front: Closed form of $\mathrm{KL}\big(\mathcal N(\mu,\mathrm{diag}\,\sigma^2)\,\|\,\mathcal N(0,I)\big)$.
+    back: |
+      $$\tfrac12\sum_{j=1}^d\big(\mu_j^2+\sigma_j^2-1-\log\sigma_j^2\big)$$
+
+      It is zero iff $\mu=0$ and $\sigma=1$. Examples: $\mu=1,\sigma=1$ gives 0.5; $\mu=0,\sigma=0.5$ gives 0.318 nats.
+    source: Kingma & Welling 2014 App. B
+
+  - id: f3
+    front: $\mathrm{KL}\big(\mathcal N(\mu_1,\sigma_1^2)\,\|\,\mathcal N(\mu_2,\sigma_2^2)\big)$ in 1-D.
+    back: |
+      $$\log\frac{\sigma_2}{\sigma_1}+\frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\frac12$$
+
+      This follows from $\mathbb E_q[\log q-\log p]$ with $\mathbb E_q(z-\mu_2)^2=\sigma_1^2+(\mu_1-\mu_2)^2$.
+    source: Kingma & Welling 2014 App. B; Murphy PML2 §10.2.1.1
+
+  - id: f4
+    front: Score-function (REINFORCE) estimator of $\nabla_\phi\mathbb E_{q_\phi}[f(z)]$. When is it needed?
+    back: |
+      $$\nabla_\phi\mathbb E_{q_\phi}[f]=\mathbb E_{q_\phi}\big[f(z)\,\nabla_\phi\log q_\phi(z)\big]$$
+
+      This follows from $\nabla q=q\nabla\log q$. It is unbiased and needs only values of $f$, so it is used for discrete $z$ or non-differentiable $f$. It has high variance; baselines help partly.
+    source: Kingma & Welling 2014 §2.2; Murphy PML2 §6.3.4
+
+  - id: f5
+    front: With a fixed-variance Gaussian decoder, what is $-\log p_\theta(x\mid z)$, and how does $\sigma_x^2$ act?
+    back: |
+      $$\frac{\|x-\mu_\theta(z)\|^2}{2\sigma_x^2}+\frac D2\log(2\pi\sigma_x^2)$$
+
+      The loss is equivalent to $\text{SSE}+2\sigma_x^2\,\mathrm{KL}$, so $\sigma_x^2$ is a hidden KL weight, $\beta=2\sigma_x^2$. If learned, the optimum is $\sigma_x^2=\text{SSE}/D$.
+    source: Murphy PML2 §21.3.1
+
+  - id: f6
+    front: Decompose the data-averaged KL term $\mathbb E_x\,\mathrm{KL}(q_\phi(z\mid x)\|p(z))$.
+    back: |
+      $$I_q(x;z)+\mathrm{KL}\big(q_\phi(z)\,\|\,p(z)\big)$$
+
+      Here $q_\phi(z)=\mathbb E_x q_\phi(z\mid x)$ is the aggregate posterior. The penalty charges for information in the code as well as for prior mismatch; the leftover mismatch shows up as prior holes.
+    source: Murphy PML2 §21.2.4
+
+  - id: f7
+    front: Importance-sampled estimate of $\log p_\theta(x)$ for a trained VAE, and its properties.
+    back: |
+      $$\log\frac1K\sum_{k=1}^K\frac{p_\theta(x,z_k)}{q_\phi(z_k\mid x)},\quad z_k\sim q_\phi$$
+
+      Its expectation is at most $\log p_\theta(x)$ by Jensen. It equals the ELBO at $K=1$, is non-decreasing in $K$, and converges as $K\to\infty$.
+    source: Kingma & Welling 2019 §2.6
+
+  - id: f8
+    front: Why does a fixed-variance Gaussian decoder produce blurry outputs?
+    back: |
+      For a fixed encoder, the squared-error-optimal decoder is $\mu^*(z)=\mathbb E_q[x\mid z]$. Where the posteriors of different inputs overlap (which the KL encourages), it outputs their average, i.e. blur. In the two-input toy, $\mathbb E[x\mid z]=\tanh(mz/s^2)$.
+    source: Murphy PML2 §21.3.1
+
+  - id: f9
+    type: open
+    front: Walk an interviewer through one VAE training step, with tensor shapes and the loss.
+    back: |
+      1. Take a batch $x$ of shape $[B,D]$. The encoder returns $\mu$ and $\log\sigma^2$, each $[B,d]$.
+      2. Sample $\epsilon\sim\mathcal N(0,I)$ of shape $[B,d]$ and set $z=\mu+e^{\frac12\log\sigma^2}\odot\epsilon$. This is the reparameterization, so gradients reach the encoder.
+      3. The decoder maps $z$ to $\mu_\theta(z)$ of shape $[B,D]$, or to logits for a Bernoulli decoder.
+      4. Reconstruction: $\|x-\mu_\theta\|^2/(2\sigma_x^2)$ summed over pixels, or BCE-with-logits summed over pixels.
+      5. KL: $\frac12\sum_j(\mu_j^2+\sigma_j^2-1-\log\sigma_j^2)$ summed over latent dimensions, giving shape $[B]$.
+      6. Loss = mean over the batch of (rec + KL) = $-$ELBO + const. Backprop and step.
+
+      Mention the pitfalls: consistent sum reductions (otherwise $\beta$ changes silently); $\sigma_x^2$ acts as $\beta$; a KL near 0 for all inputs signals posterior collapse; at test time reconstruct with $\mu$ and generate by decoding $z\sim\mathcal N(0,I)$.
+    source: Kingma & Welling 2014 §2.3, §3; Kingma & Welling 2019 Alg. 2
+
+  - id: f10
+    type: open
+    front: Derive $\mathrm{KL}(\mathcal N(\mu,\sigma^2)\|\mathcal N(0,1))$ on a whiteboard, then extend it to a diagonal Gaussian.
+    back: |
+      Start from $\mathrm{KL}=\mathbb E_q[\log q]-\mathbb E_q[\log p]$.
+      - $\log q(z)=-\frac12\log 2\pi\sigma^2-\frac{(z-\mu)^2}{2\sigma^2}$. Since $\mathbb E_q(z-\mu)^2=\sigma^2$, $\mathbb E_q\log q=-\frac12\log2\pi\sigma^2-\frac12$.
+      - $\log p(z)=-\frac12\log2\pi-\frac{z^2}{2}$. Since $\mathbb E_qz^2=\mu^2+\sigma^2$, $\mathbb E_q\log p=-\frac12\log2\pi-\frac12(\mu^2+\sigma^2)$.
+      - Subtract: $\frac12(\mu^2+\sigma^2-1-\log\sigma^2)$.
+
+      **Diagonal case.** Both densities factorise, so the logs add and the KL is the sum over dimensions.
+
+      Interpretation: $\mu^2$ pulls codes to the origin, and $-\log\sigma^2$ stops variances collapsing. The term is deterministic and low-variance, which is why Kingma & Welling's second estimator uses it. The general version, $\log\frac{\sigma_2}{\sigma_1}+\frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\frac12$, is reused in diffusion models.
+    source: Kingma & Welling 2014 App. B
+
+  - id: f11
+    type: open
+    front: Compare the reparameterization and score-function gradient estimators. When would you use each?
+    back: |
+      - **Score function.** $\mathbb E_q[f\nabla_\phi\log q_\phi]$, from $\nabla q=q\nabla\log q$. It is unbiased and needs only values of $f$, so it works for discrete latents and black-box $f$. Its variance is high because it ignores $\nabla f$. Baselines and Rao–Blackwellization reduce it.
+      - **Reparameterization.** $z=g_\phi(\epsilon)$ with $\epsilon$ independent of $\phi$, so $\mathbb E_\epsilon[\nabla_z f\,\partial g/\partial\phi]$. It is unbiased, uses the slope of $f$, and is usually far lower-variance. It needs continuous $z$ and differentiable $f,g$ (location-scale families, invertible CDFs, compositions).
+      - **Numbers.** For $q=\mathcal N(1,1)$ and $f=z^2$, the per-sample variance is 4 (reparameterized) vs 30 (score function), or 18 with the baseline $b=\mathbb E f=2$ (14 with the variance-optimal constant $b=4$).
+      - **Choice.** Use reparameterization for Gaussian VAEs. For discrete codes (VQ, categorical) use REINFORCE with baselines, Gumbel-softmax relaxations or straight-through estimators.
+      - **Caveat.** Lower variance is typical for smooth $f$, but it is not a theorem for every $f$.
+    source: Kingma & Welling 2014 §2.2–2.4; Murphy PML2 §6.3.4–6.3.6
+
+  - id: f12
+    type: open
+    front: An interviewer asks, "Why are VAE samples blurry, and why can't you fix it by just training longer?"
+    back: |
+      - **Mechanism.** With a fixed-variance Gaussian decoder, the loss is squared error. For a fixed encoder, the optimal decoder outputs $\mathbb E_q[x\mid z]$, the average of all inputs whose posteriors cover $z$. The KL term deliberately makes posteriors overlap (it pulls them toward one prior and keeps them from shrinking), so the decoder averages, i.e. blurs. This is an optimum, not undertraining, so training longer doesn't help.
+      - **Contributing factors.** A pixelwise factorised likelihood under-weights small details. Maximum likelihood is mass-covering. Prior samples can also land in holes of the aggregate posterior.
+      - **Fixes and their costs.**
+        - Lower $\beta$ or $\sigma_x^2$: sharper reconstructions, worse samples.
+        - Autoregressive decoders: sharp, but they risk posterior collapse.
+        - Hierarchical or flow posteriors and priors.
+        - Perceptual and adversarial losses (VQGAN).
+        - Or use the AE only as a compressor, with a diffusion model in latent space (latent diffusion, KL weight about $10^{-6}$).
+    source: Murphy PML2 §21.3.1; Goodfellow DL §20.10.3; Rombach et al. 2022 App. G
+
+reading:
+  - title: "Kingma & Welling (2014), Auto-Encoding Variational Bayes"
+    url: https://arxiv.org/abs/1312.6114
+    kind: paper
+    note: The original. §2.3–2.4 for the two SGVB estimators and the reparameterization trick, §3 for the VAE, App. B for the Gaussian KL.
+  - title: "Kingma & Welling (2019), An Introduction to Variational Autoencoders, §2.3–2.7"
+    url: https://arxiv.org/abs/1906.02691
+    kind: paper
+    note: Unbiasedness of the reparameterized gradient, full-covariance posteriors via Cholesky, and importance-sampled log-likelihood estimates.
+  - title: "Murphy, Probabilistic Machine Learning: Advanced Topics, §21.2–21.3.1"
+    url: https://probml.github.io/pml-book/book2.html
+    kind: book
+    note: AE vs VAE on CelebA, the aggregate-posterior forms of the ELBO, and the decoder-averaging explanation of blur.
+  - title: "Cremer, Li & Duvenaud (2018), Inference Suboptimality in Variational Autoencoders"
+    url: https://arxiv.org/abs/1801.03558
+    kind: paper
+    note: Defines the approximation and amortization gaps and measures which one dominates in practice.
+  - title: "Weng (2018), From Autoencoder to Beta-VAE"
+    url: https://lilianweng.github.io/posts/2018-08-12-vae/
+    kind: blog
+    note: Intuition-level tour from autoencoders through VAEs to β-VAE and VQ-VAE; a good bridge to gen.vae-variants.

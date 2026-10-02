@@ -1,0 +1,326 @@
+id: code.attention-bugs
+area: mlcoding
+title: "Attention Implementation: Spot the Bug"
+summary: A clean PyTorch multi-head causal self-attention, plus the classic bugs (wrong softmax dim, missing scale, bad masks, head-merge reshapes, NaNs) and the tensor shapes at every line.
+order: 10
+level: intermediate
+tags: [pytorch, attention, debugging, shapes]
+prereqs: [llm.self-attention]
+
+explainer:
+  - title: "Reference: module setup"
+    body: |
+      This is a minimal multi-head **causal** self-attention, the kind you're asked to write on a whiteboard. Notation: $B$ batch, $T$ tokens, $C = h\cdot d_k$ model width.
+
+      ```python
+      import math
+      import torch
+      import torch.nn as nn
+
+      class CausalSelfAttention(nn.Module):
+          def __init__(self, C, n_heads):
+              super().__init__()
+              assert C % n_heads == 0
+              self.h = n_heads
+              self.dk = C // n_heads
+              self.qkv = nn.Linear(C, 3 * C)  # fused Q,K,V
+              self.out = nn.Linear(C, C)
+      ```
+
+      One fused linear layer produces Q, K and V together. That is faster than three separate layers and has the same parameters.
+  - title: "Reference: splitting heads"
+    body: |
+      ```python
+      def forward(self, x):                    # (B, T, C)
+          B, T, C = x.shape
+          q, k, v = self.qkv(x).split(C, dim=-1)
+          # (B,T,C) -> (B,T,h,dk) -> (B,h,T,dk)
+          q = q.view(B, T, self.h, self.dk).transpose(1, 2)
+          k = k.view(B, T, self.h, self.dk).transpose(1, 2)
+          v = v.view(B, T, self.h, self.dk).transpose(1, 2)
+      ```
+
+      - First `view` as (B, T, h, dk). That **splits the channel dim**, which is how the features are laid out in memory.
+      - Then `transpose(1, 2)` so the heads become a batch-like dim and each head is a (T, dk) matrix.
+      - Viewing directly as (B, h, T, dk) has the right shape but scrambles tokens and features.
+  - title: "Reference: scores, mask, merge"
+    body: |
+      ```python
+          att = q @ k.transpose(-2, -1) / math.sqrt(self.dk)
+          # att: (B, h, T, T); rows = queries, cols = keys
+          future = torch.triu(torch.ones(T, T, dtype=torch.bool,
+                              device=x.device), diagonal=1)
+          att = att.masked_fill(future, float('-inf'))
+          att = att.softmax(dim=-1)            # over keys
+          y = att @ v                          # (B, h, T, dk)
+          y = y.transpose(1, 2).contiguous().view(B, T, C)
+          return self.out(y)
+      ```
+
+      - `triu(..., diagonal=1)` is True strictly above the diagonal, which is exactly the future keys.
+      - Mask **before** the softmax. The softmax runs over the **last** dim (keys).
+      - Merging heads mirrors the split: transpose back, make the tensor contiguous, then view.
+      - In practice, `F.scaled_dot_product_attention(q, k, v, is_causal=True)` does the same thing with fused Flash or memory-efficient kernels.
+  - title: Common pitfalls
+    body: |
+      - `softmax(dim=-2)` normalizes over **queries**, so the rows don't sum to 1.
+      - Missing `/ math.sqrt(dk)` makes the logits too large, the softmax near one-hot, and gradients tiny.
+      - Masking **after** the softmax (multiplying by 0) leaves rows unnormalized and leaks future scores through the denominator.
+      - `tril` instead of `triu` hides the past and exposes the future. The last row becomes fully masked, giving NaN.
+      - `y.transpose(1, 2).view(...)` raises an error because transpose is non-contiguous. Use `.contiguous().view` or `.reshape`.
+      - `y.reshape(B, T, C)` **without** the transpose runs silently and mixes tokens.
+      - Fully masked rows (left padding plus causal) make the softmax of all `-inf` NaN.
+      - `masked_fill(mask, -1e9)` on fp16 overflows (max about 65504). Use `torch.finfo(att.dtype).min`.
+      - A padding mask needs shape (B, 1, 1, T) to broadcast over heads and queries.
+  - title: What interviewers ask
+    body: |
+      - *Implement MHA from scratch and state the shape after every line.* The key ones are (B, h, T, dk) and (B, h, T, T).
+      - *Why the transpose before view?* A view must respect the memory layout. Heads live in the channel dim.
+      - *What does contiguous() do?* It copies the tensor into a fresh row-major layout so that view can work.
+      - *How would you add a KV cache?* Concatenate new k and v onto the cached ones along the T dim. The query length is 1, and the causal mask is offset by the cache length.
+      - *Add a padding mask.* Use a key mask of shape (B, 1, 1, T) and OR it with the causal mask. Guard against fully masked rows.
+      - *Make it fast.* Use `F.scaled_dot_product_attention` (Flash or memory-efficient kernels), bf16, and fused QKV.
+      - *Where does dropout go?* On the attention probabilities after the softmax, and on the output projection, in training only.
+
+quiz:
+  - id: q1
+    prompt: |
+      What's the bug?
+
+      ```python
+      att = q @ k.transpose(-2, -1) / math.sqrt(dk)  # (B,h,T,T)
+      att = att.masked_fill(future, float('-inf'))
+      att = att.softmax(dim=-2)
+      y = att @ v
+      ```
+    correct: The softmax normalizes over queries instead of keys, so each query's weights don't sum to 1
+    wrong:
+      - Nothing. dim=-2 is the key dimension because k was transposed
+      - The transpose should be k.transpose(-1, -2)
+      - The scale should be math.sqrt(T), not math.sqrt(dk)
+    explanation: |
+      `att` is (B, h, T_q, T_k). Each query's distribution over keys lives on the **last** dim, so you need `softmax(dim=-1)`. `transpose(-1, -2)` is identical to `transpose(-2, -1)`, and the scale uses d_k, not T.
+  - id: q2
+    prompt: |
+      What is the shape of `att`?
+
+      ```python
+      B, T, C, h = 2, 5, 64, 4
+      x = torch.randn(B, T, C)
+      q = x.view(B, T, h, C // h).transpose(1, 2)
+      k = x.view(B, T, h, C // h).transpose(1, 2)
+      att = q @ k.transpose(-2, -1)
+      ```
+    correct: (2, 4, 5, 5)
+    wrong:
+      - (2, 4, 16, 16)
+      - (2, 5, 4, 4)
+      - (2, 4, 5, 16)
+    explanation: |
+      q and k are (2, 4, 5, 16). Then `q @ k.transpose(-2, -1)` is (2, 4, 5, 16) @ (2, 4, 16, 5), which gives (2, 4, 5, 5): one T×T score matrix per batch element and head.
+  - id: q3
+    prompt: |
+      What's wrong with this masking?
+
+      ```python
+      att = q @ k.transpose(-2, -1) / math.sqrt(dk)
+      att = att.softmax(dim=-1)
+      att = att.masked_fill(future, 0.0)
+      y = att @ v
+      ```
+    correct: The weights are normalized over all keys, so rows don't sum to 1 and future scores leak in through the softmax denominator
+    wrong:
+      - Nothing. Zeroing after the softmax is equivalent to adding −∞ before it
+      - It masks past tokens instead of future ones
+      - It makes the first row all NaN
+    explanation: |
+      Each surviving weight is $e^{s_{ij}}/\sum_{\text{all } j'} e^{s_{ij'}}$, with a denominator that includes future keys. So the output still depends on future tokens, and the rows sum to less than 1. Mask with $-\infty$ **before** the softmax so it renormalizes over the allowed keys only.
+  - id: q4
+    prompt: |
+      Intended as a causal mask. What actually happens?
+
+      ```python
+      mask = torch.tril(torch.ones(T, T, dtype=torch.bool))
+      att = att.masked_fill(mask, float('-inf'))
+      att = att.softmax(dim=-1)
+      ```
+    correct: Each token can see only future tokens, and the last row is fully masked, so it becomes NaN
+    wrong:
+      - It's correct, because tril marks the positions to keep
+      - Only the diagonal is wrong. Each token just can't see itself
+      - It's correct as long as T matches the sequence length
+    explanation: |
+      `masked_fill` fills where the mask is **True**. `tril` is True on and below the diagonal, so this hides the past and the present and leaves the future visible. Row T−1 has every key masked, and the softmax of all −∞ is NaN. Use `triu(..., diagonal=1)`, or `masked_fill(~tril, -inf)`.
+  - id: q5
+    prompt: |
+      What happens when merging heads like this ($T > 1$)?
+
+      ```python
+      y = att @ v                         # (B, h, T, dk)
+      y = y.transpose(1, 2).view(B, T, C)
+      ```
+    correct: It raises a RuntimeError because the transposed tensor isn't contiguous. Use .contiguous().view(...) or .reshape(...)
+    wrong:
+      - It silently scrambles heads across tokens
+      - It works, because view copies the data when needed
+      - It returns shape (B, h, T * dk)
+    explanation: |
+      `transpose` only swaps strides, and `view` can't merge the h and dk dims when they aren't adjacent in memory, so it raises an error. Subtle case: with T = 1 (decoding with a KV cache) the view happens to succeed, so the bug can hide until training.
+  - id: q6
+    prompt: |
+      This runs without error. Is it correct?
+
+      ```python
+      y = att @ v                 # (B, h, T, dk), contiguous
+      y = y.reshape(B, T, C)      # merge heads
+      out = self.out(y)
+      ```
+    correct: No. Without the transpose, each output row mixes values from different tokens (and heads)
+    wrong:
+      - Yes, because reshape handles the transpose automatically
+      - No, it raises a non-contiguous RuntimeError
+      - Yes, as long as C is divisible by h
+    explanation: |
+      Memory is ordered (h, T, dk). Reinterpreting it as (T, C) puts consecutive tokens of head 0 into row 0, and so on, so token 0's output would contain token 1's values. That even leaks the future. The correct merge is `y.transpose(1, 2).reshape(B, T, C)`.
+  - id: q7
+    prompt: |
+      Inputs are **left**-padded. Training gives NaN loss even though padded positions are excluded from the loss. Why?
+
+      ```python
+      # pad: (B, T) bool, True = padding token
+      causal = torch.triu(torch.ones(T, T, dtype=torch.bool), 1)
+      mask = causal | pad[:, None, None, :]   # (B,1,T,T)
+      att = att.masked_fill(mask, float('-inf')).softmax(-1)
+      ```
+    correct: Padded query rows have every key masked, so the softmax gives NaN, and it spreads through later layers
+    wrong:
+      - float('-inf') cannot be represented in fp16
+      - The mask has the wrong shape and fails to broadcast
+      - The causal mask should use diagonal=0
+    explanation: |
+      The query at a leading pad position may only attend to keys at or before it, and those are all pads, so the whole row is −∞ and the softmax is 0/0. In the next layer those NaN keys and values get weight 0, but 0 · NaN = NaN, so everything is contaminated. Fix it with a finite fill value (`finfo.min`), by unmasking the diagonal, or by zeroing the outputs of fully masked rows.
+  - id: q8
+    prompt: |
+      $d_k = 128$, and q and k have roughly unit-variance entries. The scale is forgotten:
+
+      ```python
+      att = q @ k.transpose(-2, -1)       # no / math.sqrt(dk)
+      att = att.masked_fill(future, float('-inf')).softmax(-1)
+      ```
+
+      What is the most likely effect?
+    correct: Logits have std ≈ 11, so the softmax is nearly one-hot and gradients through it are tiny
+    wrong:
+      - Attention becomes nearly uniform over all visible keys
+      - The rows of att no longer sum to 1
+      - The output shape becomes (B, h, T, dk)
+    explanation: |
+      $\mathrm{Var}(q\cdot k) = d_k = 128$, so the std is about $11.3$. Softmax over logits that differ by tens is essentially an argmax, where the Jacobian $\mathrm{diag}(p) - pp^\top \approx 0$. The rows still sum to 1 and the shapes are unchanged.
+  - id: q9
+    prompt: |
+      Running in fp16:
+
+      ```python
+      att = att.half()
+      att = att.masked_fill(future, -1e9)
+      ```
+
+      What happens?
+    correct: It fails, because −1e9 is outside fp16's range (max ≈ 65504) and PyTorch raises an overflow error
+    wrong:
+      - It works. −1e9 is clamped to the most negative fp16 value
+      - It works, but the masked logits become +inf
+      - It works, and the masked rows sum to 0 after the softmax
+    explanation: |
+      PyTorch raises "value cannot be converted to type at::Half without overflow". Use `torch.finfo(att.dtype).min` or `float('-inf')`. Also note that adding *two* finfo.min biases in fp16 overflows to −∞, which can bring back the fully-masked-row NaN.
+  - id: q10
+    prompt: |
+      What's wrong with this head split?
+
+      ```python
+      # x: (B, T, C), with C = h * dk
+      q = self.q_proj(x).view(B, self.h, T, self.dk)
+      ```
+    correct: The shape is right, but each head's rows mix features from different tokens. It should be view(B, T, h, dk).transpose(1, 2)
+    wrong:
+      - It raises a RuntimeError because view needs a transpose first
+      - Nothing. It's equivalent to view(B, T, h, dk).transpose(1, 2)
+      - It's only wrong when T is not divisible by h
+    explanation: |
+      In memory, each token's C features are contiguous. A view as (h, T, dk) chops that flat buffer in token-major order, so "head 0, token 1" gets token 0's second chunk of features. The element count matches, so no error is raised. This is a silent bug.
+
+cards:
+  - id: f1
+    front: Shapes at each step of multi-head attention, from x of shape (B, T, C) to the output.
+    back: |
+      - x: (B, T, C)
+      - qkv split, each: (B, T, C)
+      - view and transpose: (B, h, T, dk)
+      - att = q @ kᵀ: (B, h, T, T)
+      - att @ v: (B, h, T, dk)
+      - transpose, contiguous, view: (B, T, C)
+      - out projection: (B, T, C)
+  - id: f2
+    front: How do you build a causal mask for masked_fill, and what does True mean?
+    back: |
+      ```python
+      future = torch.triu(torch.ones(T, T, dtype=torch.bool),
+                          diagonal=1)
+      att = att.masked_fill(future, float('-inf'))
+      ```
+
+      True means "fill this", so True marks future keys (j > i). With a keep-mask from `tril`, use `~mask`.
+  - id: f3
+    front: Why does `y.transpose(1, 2).view(B, T, C)` fail, and what are the two fixes?
+    back: |
+      `transpose` returns a strided, non-contiguous view, and `view` can't merge dims that aren't adjacent in memory.
+
+      Fixes: `y.transpose(1, 2).contiguous().view(B, T, C)`, or `y.transpose(1, 2).reshape(B, T, C)`. The second copies only when needed.
+  - id: f4
+    front: When does attention produce NaN, and how do you guard against it?
+    back: |
+      When a query row has **every** key masked with -inf: the softmax gives 0/0. Typical causes are left padding plus a causal mask, empty sequences, or using tril instead of triu.
+
+      Guards: fill with `torch.finfo(dtype).min` instead of -inf, always allow the diagonal, zero the outputs of fully masked rows, or use SDPA, which handles masks for you.
+  - id: f5
+    type: open
+    front: Live-code multi-head causal self-attention in PyTorch, talking through each shape.
+    back: |
+      ```python
+      B, T, C = x.shape
+      q, k, v = self.qkv(x).split(C, dim=-1)
+      q, k, v = (t.view(B, T, h, dk).transpose(1, 2)
+                 for t in (q, k, v))           # (B,h,T,dk)
+      att = q @ k.transpose(-2, -1) / math.sqrt(dk)
+      att = att.masked_fill(future, float('-inf'))
+      att = att.softmax(-1)                    # over keys
+      y = (att @ v).transpose(1, 2).reshape(B, T, C)
+      return self.out(y)
+      ```
+
+      Mention: why √d_k, mask before the softmax, triu with diagonal=1, contiguity, and that SDPA with `is_causal=True` does this with fused kernels.
+  - id: f6
+    type: open
+    front: How would you modify the reference attention to support a KV cache for decoding?
+    back: |
+      - Keep `cache_k` and `cache_v` of shape (B, h, T_past, dk) per layer.
+      - At each step, compute q, k, v for the new token(s) only, where T_new is 1.
+      - Append: `k = torch.cat([cache_k, k], dim=2)`, and likewise for v. Store them back.
+      - Compute att as q @ kᵀ, with shape (B, h, T_new, T_past + T_new).
+      - With T_new = 1 no causal mask is needed. For chunked prefill, offset the mask by T_past.
+      - Apply RoPE with absolute positions T_past + i before caching k.
+      - Watch memory: about $2\cdot L\cdot T\cdot h_{kv}\cdot d_k$ elements per sequence.
+
+reading:
+  - title: "torch.nn.functional.scaled_dot_product_attention (PyTorch docs)"
+    url: https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html
+    kind: docs
+    note: Includes a reference Python implementation and the mask semantics (True = attend for boolean masks).
+  - title: The Annotated Transformer (Harvard NLP)
+    url: https://nlp.seas.harvard.edu/annotated-transformer/
+    kind: blog
+    note: A line-by-line implementation of the original paper.
+  - title: nanoGPT (Karpathy)
+    url: https://github.com/karpathy/nanoGPT
+    kind: docs
+    note: model.py has a clean CausalSelfAttention, about 40 lines, close to this reference.

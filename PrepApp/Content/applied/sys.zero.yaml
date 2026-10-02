@@ -1,0 +1,492 @@
+id: sys.zero
+area: applied
+title: "ZeRO: Sharding Optimizer State, Gradients and Parameters"
+summary: Why DDP wastes memory, how ZeRO-1/2/3 shard optimizer state, gradients and parameters across data-parallel ranks, the memory and communication of each stage derived from scratch, why ZeRO-3's 1.5× traffic leaves the compute-bound condition unchanged, and offload.
+order: 190
+level: core
+tags: [distributed-training, zero, fsdp, sharding, memory, deepspeed]
+prereqs: [sys.ddp, sys.memory-anatomy]
+
+explainer:
+  - title: "The problem: DDP stores everything P times"
+    body: |
+      **Recap of model states** (`sys.memory-anatomy`). Mixed-precision training with Adam keeps, per parameter:
+      - bf16 (or fp16) weights for the forward and backward: 2 bytes;
+      - bf16 gradients: 2 bytes;
+      - fp32 master weights, Adam's first moment $m$ and second moment $v$: $4+4+4=12$ bytes.
+
+      The ZeRO paper calls the optimizer part $K\Psi$ bytes with $K=12$; it counts the fp32 master copy as optimizer state. It writes $\Psi$ for the parameter count and $N_d$ for the data-parallel degree. Here they are $N$ and $P$. Total: **16 bytes per parameter**. For 7B parameters that is 112 GB, before any activations, which doesn't fit on an 80 GB H100.
+
+      **DDP's redundancy.** Every one of the $P$ ranks holds all 16 bytes per parameter. After the all-reduce, every rank also performs the *identical* Adam update on *every* parameter. That duplicates both memory and work $P$ times.
+
+      **ZeRO's observation.** A rank never needs the optimizer state of parameters it doesn't update. So **partition** (shard) the model states across the $P$ data-parallel ranks:
+      - rank $p$ owns a contiguous $1/P$ slice of the parameters;
+      - it stores optimizer state only for that slice, updates only that slice, and reconstructs anything else only when needed, with collectives.
+
+      This gives three cumulative stages:
+      - **ZeRO-1** ($P_{os}$): shard the optimizer state.
+      - **ZeRO-2** ($P_{os+g}$): also shard the gradients.
+      - **ZeRO-3** ($P_{os+g+p}$): also shard the bf16 parameters. This is what PyTorch calls FSDP with full sharding; the implementation details are in `sys.fsdp`.
+
+      ![Per-rank model-state memory for 4 ranks. Each sharded part keeps only the slice its rank owns (the staircase); dashed outlines show what was removed. The totals use P = 4.](sys.zero/zero-stages)
+
+
+      **What can't be sharded this way: activations.** Each rank processes a different micro-batch, so its activations are not copies of anyone else's. There is nothing redundant to remove. Activations need checkpointing or model parallelism instead.
+    source: 'ZeRO §3.1, §5 (intro); Ultra-Scale Playbook "ZeRO (Zero Redundancy Optimizer)", "Memory usage revisited"'
+
+  - title: "ZeRO-1: shard the optimizer state"
+    body: |
+      **One training step on rank $p$:**
+      1. **Forward** with the full bf16 parameters, which are still replicated.
+      2. **Backward** produces the full local bf16 gradient, $2N$ bytes.
+      3. **Reduce-scatter** the gradients. Rank $p$ receives the *summed* gradient for its slice only, which is all its optimizer needs.
+      4. **Update** its slice: fp32 master weights, $m$ and $v$ for $N/P$ parameters. Then write the new bf16 values of that slice.
+      5. **All-gather** the bf16 parameter slices so every rank has the full updated weights for the next forward.
+
+      **Memory per rank.** The replicated bf16 weights and gradients stay; the 12-byte optimizer state is split $P$ ways:
+
+      $$M_1=2N+2N+\frac{12N}{P}=4N+\frac{12N}{P}$$
+
+      As $P\to\infty$ this tends to $4N$: a **4× saving** over DDP's $16N$. Example: the ZeRO paper's 7.5B model on $P=64$ needs $4(7.5)+12(7.5)/64\approx31.4$ GB per GPU instead of 120 GB.
+
+      **Communication.** One reduce-scatter of the gradients and one all-gather of the parameters. Each moves about $N$ elements per rank, by the lower bounds in `sys.collectives`, for $2N$ in total. DDP's all-reduce *is* a reduce-scatter followed by an all-gather, so ZeRO-1 moves **the same volume as DDP**. It just does the all-gather on parameters, after the update, instead of on gradients. So the memory saving costs no extra communication volume.
+
+      **Overlap.** The all-gather after the update can overlap with the optimizer step for other slices, or be split per layer and overlapped with the next forward. The Playbook notes that both need careful hook engineering.
+    source: 'ZeRO §5.1, §7.2.1; Ultra-Scale Playbook "ZeRO-1: partitioning optimizer states"'
+
+  - title: "ZeRO-2: shard the gradients too"
+    body: |
+      **The next observation.** In ZeRO-1, rank $p$ holds the full $2N$-byte gradient but uses only its own slice. Why keep the rest?
+
+      **Mechanism.** During the backward pass, gradients are bucketed as in DDP. When a bucket is complete, **reduce-scatter** it, so each rank receives the sum over ranks for the part of that bucket it owns. Then **free** the parts it doesn't own. At any moment a rank holds its own $2N/P$ gradient slice plus the few buckets still in flight.
+
+      **Memory per rank:**
+
+      $$M_2=2N+\frac{2N}{P}+\frac{12N}{P}=2N+\frac{14N}{P}$$
+
+      As $P\to\infty$ this tends to $2N$, an **8× saving**. For the 7.5B model on 64 GPUs: $15+14(7.5)/64\approx16.6$ GB.
+
+      **Communication: still $2N$.** A reduce-scatter of the gradients ($N$) and an all-gather of the updated parameters ($N$). It is the same pair of collectives as ZeRO-1, now issued bucket by bucket during the backward. The Playbook concludes that ZeRO-2 has essentially no overhead over ZeRO-1 and is usually the better choice.
+
+      **fp32 gradient accumulation.** Some recipes accumulate gradients in fp32, which costs 4 more bytes per parameter. With ZeRO-2 that buffer is needed only for the owned slice, $4N/P$.
+
+    source: 'ZeRO §5.2, §7.2.1; Ultra-Scale Playbook "ZeRO-2: adding gradient partitioning"'
+
+  - title: "ZeRO-3: shard the parameters, gather them on demand"
+    body: |
+      **The last replicated item** is the $2N$ bytes of bf16 weights. ZeRO-3 shards them too, so each rank permanently stores only $1/P$ of every model state.
+
+      **But the forward needs the whole weight matrix of each layer.** So weights are gathered just in time and thrown away straight after use.
+      - **Forward, layer $\ell$:** all-gather $\ell$'s weight slices, compute, free the gathered copy.
+      - **Backward, layer $\ell$:** all-gather $\ell$'s weights again (they were freed), compute its input and weight gradients, free the weights, and **reduce-scatter** its weight gradients so each rank keeps its own slice.
+      - **Optimizer step:** purely local on each rank's slice. No parameter all-gather is needed afterwards, because the next forward gathers layer by layer anyway.
+
+      ![ZeRO-3 on one rank over three layers. Each layer's all-gather is issued one layer ahead (prefetching), so it overlaps the previous layer's compute. The backward re-gathers the weights and reduce-scatters each layer's gradients once they exist (illustrative durations).](sys.zero/zero3-dataflow)
+
+      **Memory per rank:**
+
+      $$M_3=\frac{2N+2N+12N}{P}=\frac{16N}{P}$$
+
+      On top of that come the *working set*, meaning the fully gathered weights of the layer being computed and the next layer being prefetched, and the activations. For 7.5B on 64 GPUs, $16(7.5)/64=1.875$ GB (the paper's Fig. 1 shows 1.9). With enough GPUs, any model's states fit, which is the paper's headline claim (1T parameters on 1024 GPUs).
+
+      **Prefetching is essential.** If layer $\ell+1$'s all-gather starts only when layer $\ell$ finishes, every gather is exposed. Instead, issue it while layer $\ell$ computes, and in the backward gather layer $\ell-1$ while layer $\ell$ computes. The cost is holding two gathered layers at once.
+
+      **Latency.** ZeRO-3 issues about $2L$ per-layer all-gathers per step for $L$ layers, where ZeRO-2 issues a single (bucketed) all-gather after the update. The exact count depends on the implementation. Each has a fixed cost, and limited overlap at large scale is why the Playbook's rule of thumb is not to push ZeRO-3's data-parallel degree much past about 512.
+    source: 'ZeRO §5.3, §7.2.2; Ultra-Scale Playbook "ZeRO-3: adding parameter partitioning"; Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"'
+
+  - title: "Worked memory numbers"
+    body: |
+      ![Model-state memory per GPU for a 7B model as the data-parallel degree grows. ZeRO-1 and ZeRO-2 level off at 4N = 28 GB and 2N = 14 GB (dotted), because the replicated parts never shrink. Only ZeRO-3 keeps falling.](sys.zero/zero-memory-vs-gpus)
+
+      Formulas per GPU, in bytes, for $N$ parameters and $P$ ranks:
+      - DDP: $16N$
+      - ZeRO-1: $4N+12N/P$
+      - ZeRO-2: $2N+14N/P$
+      - ZeRO-3: $16N/P$
+
+      **7B model, $P=64$:** 112 / 29.3 / 15.5 / 1.75 GB. ZeRO-1 already fits on an 80 GB GPU, with about 50 GB left for activations.
+
+      **7B model, $P=8$ (one node):** 112 / 38.5 / 26.3 / 14 GB. All three ZeRO stages fit, and ZeRO-3 leaves the most room for activations.
+
+      **70B model:**
+      - ZeRO-1 on $P=128$: $4(70)+12(70)/128\approx286.6$ GB. It **cannot fit at any $P$**: the replicated bf16 weights and gradients alone are $4N=280$ GB.
+      - ZeRO-2 never goes below $2N=140$ GB, so it can't fit either.
+      - ZeRO-3: 17.5 GB on 64 GPUs, 2.19 GB on 512.
+
+      **The lesson.** ZeRO-1/2 help when the *optimizer state* is the problem. When the bf16 weights themselves (2 bytes per parameter) approach GPU memory, only ZeRO-3, or model parallelism, helps.
+
+      **Scope.** These are model states only. On top come activations (which scale with micro-batch and sequence length), ZeRO-3's gathered working set, communication buffers, the CUDA context and fragmentation. The 16 bytes per parameter assumes mixed-precision Adam; other optimizers change $K$, e.g. SGD with momentum has fp32 master weights and momentum, $K=8$.
+    source: 'ZeRO §5.1–5.4, Fig. 1, Table 1; Ultra-Scale Playbook "Memory usage revisited"'
+
+  - title: "Communication volume: 2N, 2N, 3N"
+    body: |
+      Count **elements sent per rank per step**, using the per-rank bounds from `sys.collectives`: an all-gather or reduce-scatter of an $N$-element array moves about $N$ per rank (exactly $\frac{P-1}{P}N$), and an all-reduce moves about $2N$.
+
+      **DDP.** One all-reduce of the gradients, which is reduce-scatter + all-gather: $N+N=2N$.
+
+      **ZeRO-1 and ZeRO-2.** A reduce-scatter of the gradients ($N$), then an all-gather of the updated bf16 parameters ($N$): $2N$, **the same as DDP**.
+
+      **ZeRO-3.**
+      - Forward: all-gather all parameters, layer by layer: $N$.
+      - Backward: all-gather them again, because they were freed: $N$.
+      - Backward: reduce-scatter the gradients: $N$.
+      - No all-gather after the update.
+      - Total **$3N$ = 1.5× DDP**.
+
+      **In bytes, for a 7B model with bf16 weights and gradients** (2 bytes per element):
+      - DDP / ZeRO-1 / ZeRO-2: $2\times14=28$ GB per rank per step.
+      - ZeRO-3: $3\times14=42$ GB per rank per step.
+      - Across nodes at about 400 GB/s per node, these take roughly 70 ms and 105 ms of link time (large-$P$ limit, dropping the $\frac{P-1}{P}$ factor; `sys.collectives` gets 69 ms with it).
+
+      **Where 1.5× comes from.** DDP and ZeRO-1/2 need the full weights resident, so they never communicate weights in the forward pass. ZeRO-3 trades $2N$ bytes of resident weights for one extra all-gather per step. Keeping the gathered weights between forward and backward would avoid the second all-gather but undo much of the memory saving. FSDP exposes this trade-off as an option (`sys.fsdp`).
+    source: 'ZeRO §7.1–7.2; Ultra-Scale Playbook "ZeRO-3: adding parameter partitioning"'
+
+  - title: "1.5× the bytes, yet the same compute-bound condition"
+    body: |
+      **An apparent contradiction.** The ZeRO paper says stage 3 costs 1.5× DDP's communication. The Scaling Book says the ZeRO stages "have the same communication cost". Both are right; they measure different things. ZeRO counts **volume**, while the Scaling Book compares **communication time to the compute it can hide behind**.
+
+      **Per-phase accounting.** Take one layer with $n$ parameters, $B/P$ tokens per GPU, $C$ FLOP/s, $W$ bytes/s and bf16 weights.
+      - **Forward:** all-gather $2n$ bytes; compute $2n(B/P)$ FLOPs.
+      - **Backward:** all-gather + reduce-scatter, $2n+2n=4n$ bytes; compute $4n(B/P)$ FLOPs.
+      - **DDP backward, for comparison:** all-reduce $\approx4n$ bytes; compute $4n(B/P)$ FLOPs.
+
+      Every phase has the same ratio
+
+      $$\frac{T_{\text{comm}}}{T_{\text{comp}}}=\frac{C}{W\,(B/P)}$$
+
+      So ZeRO-3 is compute-bound under exactly DDP's condition, $B/P>C/W$: about 2,470 tokens per GPU across H100 nodes. The extra all-gather brings proportionally extra compute (the forward) to hide behind. DDP has the same forward FLOPs but no communication to overlap with them.
+
+      **Predictions.**
+      - Above the threshold, with good prefetching, switching ZeRO-2 → ZeRO-3 costs little step time while freeing $2N(1-1/P)$ bytes per GPU.
+      - Below the threshold, all stages are communication-bound. In the strongly comm-bound limit, ZeRO-3's step time approaches 1.5× ZeRO-2's.
+      - Unavoidable exposure: the first layer's all-gather before the forward starts, and the last reduce-scatter after the backward ends.
+
+      **Scope.** This assumes perfect per-layer overlap, which needs each layer's compute to exceed its gather time. Very small layers, very large $P$ (latency) and limited prefetch break it. The forward-phase argument also needs the forward all-gathers to be overlappable, which they are with prefetching. The Scaling Book marks the all-gathers as "can be done ahead of time" and the gradient reduce-scatters as "not on the critical path".
+    source: 'Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"; Scaling Book Part 12 "Data Parallelism"; ZeRO §7.2.2'
+
+  - title: "What ZeRO doesn't fix: activations and ZeRO-R"
+    body: |
+      **Activations are not sharded.** ZeRO-DP removes *redundant* state. Activations differ across data-parallel ranks, so the per-GPU micro-batch and sequence length still decide activation memory. The remedies are activation checkpointing (`sys.activation-checkpointing`), a smaller micro-batch with gradient accumulation, or tensor, sequence or context parallelism, which *split* a single example's activations.
+
+      **ZeRO-R** targets the "residual" memory:
+      - $P_a$, **partitioned activation checkpoints.** Under tensor (model) parallelism, every TP rank holds a replica of each layer's input activations. ZeRO-R keeps only a $1/t$ slice per rank and all-gathers it just before recomputation. The paper's 100B example drops from about 33 GB to about 2 GB per GPU of checkpoints.
+      - **Constant-size buffers.** Fused communication buffers sized to the whole model grow with it; a 3B model's fp32 fused buffer is 12 GB. ZeRO-R caps them at a fixed size.
+      - **Memory defragmentation.** Short-lived (recomputed) and long-lived (checkpointed) tensors interleave and fragment memory. Pre-allocated contiguous regions avoid OOMs despite free memory.
+    source: 'ZeRO §6.1–6.3; Ultra-Scale Playbook "ZeRO (Zero Redundancy Optimizer)"'
+
+  - title: "Offloading to the CPU: ZeRO-Offload"
+    body: |
+      **When GPUs are few,** sharding across $P$ ranks can't shrink model states enough, so ZeRO-Offload moves part of them to CPU memory. To decide which part, treat training as a data-flow graph:
+      - Forward and backward cost $O(N\cdot B)$ and must stay on the GPU.
+      - The optimizer update costs $O(N)$ and can move to the CPU.
+      - So the fp32 master weights, $m$, $v$ and the Adam step live in CPU memory. The GPU keeps the bf16 weights, and bf16 gradients stream to the CPU during the backward.
+      - Ren et al. show that $4N$ bytes per step over PCIe ($2N$ of gradients down, $2N$ of updated bf16 weights back) is the minimum any such split can achieve. Their chosen split also maximises the GPU memory saved.
+
+      **Example.** For a 7B model, 14 GB each way per step. At about 25 GB/s per direction (roughly what PCIe Gen4 x16 achieves; Gen5 hosts such as H100 servers give about double), that is about 0.56 s.
+
+      **The CPU Adam step.** It streams roughly 30 bytes per parameter through CPU memory (read the fp32 weights, $m$, $v$ and the gradient; write three of them back). For 7B that is about 200 GB, which takes on the order of a second or more at a CPU's 100–200 GB/s. Ren et al. tackle this with a vectorised CPU-Adam (over 6× faster than PyTorch's) and a one-step delayed parameter update that overlaps the CPU step with the next GPU step.
+
+      Offload is therefore worth it only when a step already takes seconds: large batches, few GPUs, fine-tuning. Ren et al. report models over 13B trained on a single 32 GB V100. ZeRO-Infinity extends the idea to offloading parameters too, and to NVMe storage.
+    source: 'Ren et al. 2021 §3–4, §5.1, abstract; ZeRO-Infinity (Rajbhandari et al. 2021, not in the source cache)'
+
+  - title: "Choosing a stage, and what interviewers probe"
+    body: |
+      **Choosing.**
+      - **ZeRO-1** when the weights and gradients fit and only Adam's state is the problem. It composes most simply with **pipeline parallelism**; the Playbook cites DeepSeek-V3 using PP with ZeRO-1.
+      - **ZeRO-2** costs the same communication as ZeRO-1 for more memory saving. The Playbook says ZeRO-1 and ZeRO-2 both combine easily with PP, and Llama 3 ran FSDP that sharded optimizer state and gradients (but kept the weights after the forward) together with PP. The trade-off with PP: sharded gradients must be reduce-scattered after every micro-batch, or a full gradient buffer held until the last one. That is traffic against memory, and DeepSpeed's pipeline engine supports only ZeRO-1.
+      - **ZeRO-3** is the one that conflicts with PP: it would re-gather each stage's weights for every micro-batch unless it keeps them resident.
+      - **ZeRO-3 / FSDP**, outside PP, when $4N$ (bf16 weights and gradients) doesn't fit. It requires $B/P\gtrsim C/W$ to hide traffic, plus prefetching.
+
+      **Probes.**
+      - *"Memory per GPU for model X on P GPUs at each stage?"* Use the four formulas, then add activations and the working set.
+      - *"Why is ZeRO-1 free?"* DDP's all-reduce is already reduce-scatter + all-gather; ZeRO-1 moves the all-gather from gradients to updated weights. The volume is $2N$ either way.
+      - *"ZeRO-3 vs DDP communication?"* $3N$ vs $2N$ elements, but the same bytes per FLOP in every phase, so the same $B/P>C/W$ threshold.
+      - *"Does ZeRO shard activations?"* No. Use checkpointing or TP/SP/CP. ZeRO-R's $P_a$ shards checkpoints across *TP* ranks only.
+      - *"ZeRO-3 vs tensor parallelism for a 70B model?"*
+        - ZeRO-3 communicates **weights** (traffic independent of batch). It needs a large per-GPU batch, and it leaves each GPU computing full layers on its own examples.
+        - TP communicates **activations** (traffic grows with tokens). It splits activation memory too, but needs NVLink-class bandwidth, so it is kept inside a node.
+        - At scale both are used: TP inside a node, ZeRO/FSDP across nodes (`sys.parallelism-composition`).
+    source: 'Ultra-Scale Playbook "ZeRO-2…", "Pipeline parallelism vs. ZeRO-3" (5D parallelism section); Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"; ZeRO §6.1; Llama 3 (Dubey et al. 2024) §3.3.2'
+
+  - title: "Key results"
+    body: |
+      - **Model states with mixed-precision Adam:** $2N+2N+12N=16N$ bytes ($K=12$ includes the fp32 master weights).
+      - **Memory per GPU:**
+
+      $$\begin{aligned}\text{DDP}&:\ 16N\\ \text{ZeRO-1}&:\ 4N+12N/P\\ \text{ZeRO-2}&:\ 2N+14N/P\\ \text{ZeRO-3}&:\ 16N/P\end{aligned}$$
+
+        For 7.5B on 64 GPUs: 120 / 31.4 / 16.6 / 1.9 GB.
+      - **Volume per rank per step:** DDP, ZeRO-1 and ZeRO-2 move $2N$ (RS + AG); ZeRO-3 moves $3N$ (AG forward + AG backward + RS) = 1.5×.
+      - **Same compute-bound condition** for every stage: $B/P>C/W$, about 2,470 tokens per GPU across H100 nodes.
+      - **ZeRO-3 per layer:** gather → compute → free, with the next layer prefetched. Exposed: the first gather and the last reduce-scatter.
+      - **Not sharded:** activations. ZeRO-R adds partitioned activation checkpoints (across TP ranks), constant-size buffers and defragmentation.
+      - **Offload:** fp32 state plus Adam on the CPU, $4N$ bytes over PCIe per step at minimum.
+      - **Rule of thumb:** ZeRO-1/2 with PP (ZeRO-2 trades per-micro-batch reduce-scatters for memory); avoid ZeRO-3 with PP; ZeRO-2 by default; ZeRO-3 when $4N$ doesn't fit.
+    source: 'ZeRO §3.1, §5, §7; Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"; Ren et al. 2021 §3'
+
+quiz:
+  - id: q1
+    prompt: |
+      A 7B-parameter model is trained with mixed-precision Adam and **ZeRO-2** on 64 GPUs. What is the model-state memory per GPU?
+    correct: "About 15.5 GB"
+    wrong:
+      - "About 29.3 GB"
+      - "About 1.75 GB"
+      - "About 14.0 GB"
+    explanation: |
+      ZeRO-2 keeps the bf16 weights replicated ($2N=14$ GB) and shards gradients and optimizer state: $14N/P=98/64\approx1.53$ GB, for about 15.5 GB in total. 29.3 GB is ZeRO-1 ($4N+12N/P$), where the gradients are still replicated. 1.75 GB is ZeRO-3. 14.0 GB is ZeRO-2's large-$P$ limit, which forgets the sharded terms.
+    source: 'ZeRO §5.2'
+
+  - id: q2
+    prompt: |
+      Can a 70B model be trained with mixed-precision Adam under **ZeRO-1** on 128 GPUs of 80 GB each (model states only)?
+    correct: "No: replicated bf16 weights and grads already need 280 GB"
+    wrong:
+      - "Yes: model states shrink to 16N/P, about 8.75 GB per GPU"
+      - "Yes: Adam's state shrinks to 12N/P, about 6.6 GB per GPU"
+      - "Yes, once P exceeds 1120 GB / 80 GB = 14 GPUs or more"
+    explanation: |
+      ZeRO-1 shards only the optimizer state, so each GPU still holds $2N+2N=280$ GB of bf16 weights and gradients. The total is $4N+12N/128\approx286.6$ GB, and no value of $P$ gets below $4N$. 8.75 GB is the ZeRO-3 figure. The 6.6 GB figure is correct for the optimizer part alone but ignores the replicated $4N$. Dividing total memory by GPU memory assumes everything is sharded.
+    source: 'ZeRO §5.1, §5.4'
+
+  - id: q3
+    prompt: |
+      Why does ZeRO-2 move the same communication volume per step as DDP, even though it adds an all-gather of parameters?
+    correct: "DDP's all-reduce is RS + AG; ZeRO-2 runs RS on grads and AG on params"
+    wrong:
+      - "ZeRO-2 compresses gradients to half size, cancelling the extra all-gather"
+      - "ZeRO-2 skips the all-gather because each rank only needs its own slice"
+      - "ZeRO-2 reduces gradients only every P steps, so its cost is amortised"
+    explanation: |
+      A bandwidth-optimal all-reduce *is* a reduce-scatter ($N$ per rank) followed by an all-gather ($N$). ZeRO-2 stops after the reduce-scatter, because each rank needs only its gradient slice. It then all-gathers the *updated parameters* instead of the summed gradients, so the total is still $2N$. The all-gather can't be skipped: the next forward needs the full weights, since ZeRO-2 doesn't shard them.
+    source: 'ZeRO §7.1–7.2.1'
+
+  - id: q4
+    prompt: |
+      Which statement about ZeRO is **false**?
+    correct: "ZeRO-3 shards activations across the data-parallel ranks"
+    wrong:
+      - "ZeRO-1 shards the fp32 master weights along with Adam's m and v"
+      - "ZeRO-2 frees non-owned gradient slices after each reduce-scatter"
+      - "ZeRO-3 sends 1.5× DDP's bytes per step, counting all collectives"
+    explanation: |
+      Activations differ across data-parallel ranks because each rank sees different examples, so there is no redundancy for ZeRO-DP to remove. Activation memory still scales with the per-GPU micro-batch. The other statements are true. ZeRO counts the fp32 master copy in $K=12$, so ZeRO-1 shards it. ZeRO-2 keeps only its own slice of each reduced bucket. ZeRO-3 moves $3N$ against $2N$.
+    source: 'Ultra-Scale Playbook "ZeRO (Zero Redundancy Optimizer)"; ZeRO §3.1, §5, §7'
+
+  - id: q5
+    prompt: |
+      Which statement correctly relates ZeRO-3 to DDP on H100s across nodes?
+    correct: "1.5× DDP's bytes, yet the same ~2,470 tokens/GPU threshold"
+    wrong:
+      - "Same bytes as DDP, and the same ~2,470 tokens/GPU threshold"
+      - "1.5× DDP's bytes, so a ~3,700 tokens/GPU threshold instead"
+      - "1.5× DDP's bytes, but a ~1,650 tokens/GPU threshold as fwd adds FLOPs"
+    explanation: |
+      The forward all-gather ($2n$ bytes per layer) faces $2n(B/P)$ forward FLOPs, and the backward's all-gather + reduce-scatter ($4n$ bytes) faces $4n(B/P)$ FLOPs. Every phase has bytes/FLOP $=1/(B/P)$, the same as DDP's backward, so the condition $B/P>C/W$ is unchanged. Scaling the threshold by 1.5 forgets that the extra bytes come with the forward's extra compute to hide behind. Lowering it double-counts that compute, since DDP has the same forward FLOPs.
+    source: 'Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"; ZeRO §7.2.2'
+
+  - id: q6
+    prompt: |
+      A run with 8,192 tokens per GPU across H100 nodes switches from ZeRO-2 to ZeRO-3, with prefetching enabled. What happens to step time and memory?
+    correct: "Step time about the same; ~2N bytes per GPU freed"
+    wrong:
+      - "Steps ~1.5× slower, since comm volume rises by 1.5×"
+      - "Steps faster, since each GPU holds fewer weights"
+      - "Steps ~3× slower, as every layer is gathered twice"
+    explanation: |
+      8,192 tokens per GPU is far above $C/W\approx2{,}470$. Every phase stays compute-bound, so the extra all-gathers hide behind compute, apart from small first-gather and last-reduce-scatter edges. ZeRO-3 removes the replicated bf16 weights, $2N(1-1/P)$ bytes per GPU. 1.5× slower would be right only if communication were fully exposed. Holding fewer weights doesn't make the matmuls faster.
+    source: 'Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"; Ultra-Scale Playbook "ZeRO-3: adding parameter partitioning"'
+
+  - id: q7
+    prompt: |
+      For a 7B model with bf16 weights and gradients, how many bytes does each rank send per step under ZeRO-3 (large $P$)?
+    correct: "About 42 GB"
+    wrong:
+      - "About 28 GB"
+      - "About 21 GB"
+      - "About 14 GB"
+    explanation: |
+      ZeRO-3 runs an all-gather in the forward, another in the backward, and a reduce-scatter of gradients, each moving about $N$ elements: $3\times7\text{e}9\times2$ bytes $=42$ GB. 28 GB is DDP, ZeRO-1 or ZeRO-2 ($2N$ elements). 21 GB mixes up elements and bytes for a $3N$ count of 1-byte values. 14 GB is a single collective.
+    source: 'ZeRO §7.2.2'
+
+  - id: q8
+    prompt: |
+      ZeRO-Offload puts some model states and computation on the CPU. Which split does it use, and why?
+    correct: "fp32 state and Adam step on CPU: O(N) work, unlike O(N·B) fwd/bwd"
+    wrong:
+      - "bf16 weights on CPU, streamed per layer: frees the most GPU memory"
+      - "Activations on CPU, because they dominate memory for large LLMs"
+      - "Forward and backward of the largest layers, which need most memory"
+    explanation: |
+      Forward and backward cost $O(N\cdot B)$ FLOPs and must stay on the GPU. The update costs $O(N)$, so the CPU can afford it. Keeping the fp32 master weights, $m$ and $v$ next to the update, and the bf16 weights next to forward and backward, achieves the minimum PCIe traffic of $4N$ bytes per step (gradients down, weights up). Streaming the bf16 weights would add $2N$ per pass. ZeRO-Offload targets model states, not activations.
+    source: 'Ren et al. 2021 §3.1–3.4'
+
+  - id: q9
+    prompt: |
+      A 7B model under ZeRO-3 on 64 GPUs (1.75 GB of model states per GPU) still OOMs with 4 sequences of 8k tokens per GPU. Which change addresses the cause?
+    correct: "Activation checkpointing or a smaller micro-batch"
+    wrong:
+      - "Doubling the GPUs to 128 to shard model states further"
+      - "Switching to ZeRO-2 to stop gathering weights each layer"
+      - "Offloading the optimizer state to the CPU with ZeRO-Offload"
+    explanation: |
+      With model states at 1.75 GB, what fills the GPU must be activations, which grow with micro-batch × sequence length. ZeRO doesn't shard activations, because they differ across ranks. More GPUs only shrink the already-small 1.75 GB. ZeRO-2 *adds* about 14 GB of replicated weights. Offloading the optimizer saves about 1.3 GB. Checkpointing, a smaller micro-batch with accumulation, or sequence/context parallelism are the levers.
+    source: 'Ultra-Scale Playbook "ZeRO-3: adding parameter partitioning"; ZeRO §3.2'
+
+  - id: q10
+    prompt: |
+      Why is ZeRO-1, rather than ZeRO-3, the usual partner for pipeline parallelism?
+    correct: "ZeRO-3 would re-gather weights for every micro-batch"
+    wrong:
+      - "ZeRO-1 shards activations between pipeline stages"
+      - "PP already shards optimizer state, so ZeRO-3 adds nothing"
+      - "ZeRO-3's reduce-scatter can't run inside a stage group"
+    explanation: |
+      A pipeline runs many micro-batches through each stage per step. ZeRO-3 would all-gather that stage's weights for each micro-batch's forward and backward, unless it keeps them resident, which undoes the saving. ZeRO-1 touches only the optimizer state once per step, so it composes cleanly. PP splits layers across stages, but each data-parallel replica of a stage still holds full states for its layers, so ZeRO has plenty left to shard.
+    source: 'Ultra-Scale Playbook "Pipeline parallelism vs. ZeRO-3"'
+
+  - id: q11
+    prompt: |
+      In ZeRO-1's memory formula $4N+12N/P$, what does the unsharded $4N$ term consist of?
+    correct: "Replicated bf16 weights (2N) and bf16 grads (2N)"
+    wrong:
+      - "Replicated fp32 master weights, 4 bytes per parameter"
+      - "Adam's m and v kept in bf16, 2 bytes each per parameter"
+      - "The all-gather buffer plus the gradient bucket buffers"
+    explanation: |
+      ZeRO-1 shards only the $K=12$ bytes of optimizer state (fp32 master weights, $m$, $v$), giving $12N/P$. The bf16 weights used in forward and backward, and the full local bf16 gradient, stay replicated: $2N+2N$. The fp32 master weights are exactly what ZeRO-1 *does* shard. Buffers are residual memory and aren't part of the model-state formula.
+    source: 'ZeRO §3.1, §5.1'
+
+  - id: q12
+    prompt: |
+      Comparing ZeRO-3 with tensor parallelism (TP) for a 70B model, which statement is right?
+    correct: "ZeRO-3 sends weights; TP sends and splits activations"
+    wrong:
+      - "ZeRO-3 also splits activations, so TP is unnecessary"
+      - "Both send the same bytes; only code complexity differs"
+      - "TP traffic is batch-independent, so it suits cross-node"
+    explanation: |
+      ZeRO-3 gathers *weights*: its traffic is fixed per step, and each GPU computes whole layers on its own examples, so it needs a large per-GPU batch to hide that traffic. TP splits each layer's matmuls and exchanges *activations*. Its traffic grows with tokens, but it divides activation memory, which ZeRO can't. That activation traffic is why TP is kept on NVLink inside a node, not run across nodes.
+    source: 'Ultra-Scale Playbook "ZeRO-3: adding parameter partitioning" (closing comparison with TP); Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)", "Tensor Parallelism"'
+
+cards:
+  - id: f1
+    front: Per-GPU model-state memory (mixed-precision Adam) for DDP, ZeRO-1, ZeRO-2 and ZeRO-3?
+    back: |
+      $$\begin{aligned}\text{DDP}&:\ 16N\\ \text{ZeRO-1}&:\ 4N+12N/P\\ \text{ZeRO-2}&:\ 2N+14N/P\\ \text{ZeRO-3}&:\ 16N/P\end{aligned}$$
+
+      $N$ = parameters (Ψ in the paper), $P$ = data-parallel degree ($N_d$). The large-$P$ limits are 4N, 2N and 0.
+    source: 'ZeRO §5.1–5.3'
+
+  - id: f2
+    front: The ZeRO paper's 7.5B model on 64 GPUs, model-state memory per stage?
+    back: |
+      120 GB (DDP) → 31.4 GB (ZeRO-1) → 16.6 GB (ZeRO-2) → 1.9 GB (ZeRO-3).
+    source: 'ZeRO Fig. 1, §5.1–5.3'
+
+  - id: f3
+    front: Communication volume per rank per step for DDP and the ZeRO stages, and which collectives make it up?
+    back: |
+      - DDP: all-reduce = RS + AG, $2N$.
+      - ZeRO-1/2: RS of gradients + AG of updated parameters, $2N$.
+      - ZeRO-3: AG (forward) + AG (backward) + RS (gradients), $3N$ = 1.5×.
+
+      Multiply by 2 bytes for bf16.
+    source: 'ZeRO §7.1–7.2'
+
+  - id: f4
+    front: What happens to one layer in ZeRO-3 during the forward and backward passes?
+    back: |
+      - **Forward:** all-gather the weight slices (prefetched during the previous layer), compute, free the full weights.
+      - **Backward:** re-gather the weights (prefetched), compute input and weight gradients, free the weights, reduce-scatter the weight gradients so each rank keeps its slice.
+      - **Update:** local, on each rank's slice. No parameter all-gather afterwards.
+    source: 'ZeRO §5.3, §7.2.2; Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"'
+
+  - id: f5
+    front: What does ZeRO-R add, and what does ZeRO-DP leave unsharded?
+    back: |
+      - **ZeRO-DP leaves:** activations, which differ across data-parallel ranks.
+      - **ZeRO-R adds:**
+        - $P_a$: activation checkpoints partitioned across *tensor-parallel* ranks and all-gathered before recompute (optionally offloaded to CPU);
+        - constant-size fused buffers;
+        - memory defragmentation.
+    source: 'ZeRO §6.1–6.3'
+
+  - id: f6
+    front: In ZeRO-Offload, what lives on the CPU, and what crosses PCIe each step?
+    back: |
+      - **CPU:** fp32 master weights, Adam's $m$ and $v$, and the optimizer step ($O(N)$ work).
+      - **GPU:** bf16 weights, forward and backward ($O(N\cdot B)$).
+      - **PCIe per step:** bf16 gradients down ($2N$) and updated bf16 weights up ($2N$), $4N$ bytes, the proven minimum. Gradient transfers overlap the backward.
+    source: 'Ren et al. 2021 §3, §4.1'
+
+  - id: f7
+    type: open
+    front: Explain ZeRO stages 1–3 to an interviewer and derive each stage's memory.
+    back: |
+      1. **Baseline.** DDP holds $2N$ (bf16 weights) + $2N$ (bf16 gradients) + $12N$ (fp32 master, $m$, $v$) = $16N$ on every rank, and runs the same update $P$ times.
+      2. **Idea.** Rank $p$ owns $1/P$ of the parameters and keeps optimizer state only for those.
+      3. **ZeRO-1.** Shard the 12N. Step: backward → reduce-scatter gradients → update own slice → all-gather bf16 parameters. Memory $4N+12N/P$.
+      4. **ZeRO-2.** Also keep only your gradient slice: bucketed reduce-scatter during the backward, freeing the rest. Memory $2N+14N/P$.
+      5. **ZeRO-3.** Also shard the weights. All-gather each layer just in time (forward and backward), free it after use, reduce-scatter gradients. Memory $16N/P$ plus the working set.
+      6. **Communication.** $2N$, $2N$, $3N$ against DDP's $2N$, with the same compute-bound threshold.
+      7. **Caveats.** Activations aren't sharded. Prefetching is needed. ZeRO-3 adds per-layer latency.
+    source: 'ZeRO §5, §7; Ultra-Scale Playbook "ZeRO (Zero Redundancy Optimizer)"'
+
+  - id: f8
+    type: open
+    front: The ZeRO paper says stage 3 costs 1.5× DDP's communication; the Scaling Book says all ZeRO stages "have the same cost". Reconcile them.
+    back: |
+      - **ZeRO counts volume per step:** $3N$ vs $2N$, which is 1.5×.
+      - **The Scaling Book compares communication with the compute it overlaps.** For a layer with $n$ parameters and $B/P$ tokens per GPU:
+        - forward all-gather $2n$ bytes against $2n(B/P)$ FLOPs;
+        - backward AG + RS $4n$ bytes against $4n(B/P)$ FLOPs;
+        - DDP's backward all-reduce, $\approx4n$ bytes against $4n(B/P)$ FLOPs.
+      - Every phase has $T_{\text{comm}}/T_{\text{comp}}=C/(W\,B/P)$, so the threshold $B/P>C/W$ is unchanged (about 2,470 tokens per GPU across H100 nodes).
+      - **Intuition.** The extra bytes come with the forward's compute to hide behind, which DDP leaves idle.
+      - **Consequences.** Above the threshold ZeRO-3 is nearly free in time. Below it, its exposed communication is about 1.5× ZeRO-2's.
+      - **Assumptions.** Prefetching, per-layer overlap, latency negligible.
+    source: 'Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"; ZeRO §7.2.2'
+
+  - id: f9
+    type: open
+    front: "Estimate: a 13B GPT-style model (h = 5120, L = 40, V = 32k, FlashAttention), 4k context, ZeRO-3 on 64 H100s across 8 nodes, 16k tokens per GPU, full recompute. Memory per GPU? Step time at 40% MFU? Is the communication hidden?"
+    back: |
+      - **Model states:** $16\times13\text{e}9/64=3.25$ GB.
+      - **Activations with full recompute:** keep each layer's input, $2sbh$ bytes with $b=4$ sequences: $2\cdot4096\cdot4\cdot5120\cdot40\approx6.7$ GB. Add one layer's recompute working set, $\approx34sbh\approx2.9$ GB.
+      - **Other buffers:** gathered weights for about 2 layers, $2\times(12h^2\times2\text{ B})\approx1.3$ GB; fp32 logits $4sbV\approx2.1$ GB, plus their gradient.
+      - **Memory total:** roughly 18 GB, so it fits easily. You could drop full recompute for selective recompute.
+      - **Step time:** $6\cdot13\text{e}9\cdot16384/(0.4\cdot989\text{e}12)\approx3.2$ s.
+      - **Communication:** $3\cdot2N\cdot\frac{63}{64}\approx77$ GB per rank, about 0.19 s at 400 GB/s per node, far below 3.2 s. 16k tokens per GPU is well above $C/W\approx2{,}470$, so it is hidden given prefetching.
+      - **Caveats.** MFU counts the 6N model FLOPs only; recompute uses extra hardware FLOPs. Achieved bandwidth is below peak.
+    source: 'ZeRO §5.3, §7.2.2; Scaling Book Part 12 "Data Parallelism"'
+
+  - id: f10
+    type: open
+    front: How would you choose between ZeRO-1, ZeRO-2, ZeRO-3 and offload for a new training job?
+    back: |
+      1. **Budget the memory.** Compute $16N$ and compare $4N$ and $2N$ with GPU memory, leaving room for activations.
+      2. **ZeRO-1** if $4N+12N/P$ fits. It is the simplest partner for pipeline parallelism. ZeRO-2 also works with PP if you accept a reduce-scatter per micro-batch, or hold full gradients until the last one.
+      3. **ZeRO-2** in general. Same $2N$ volume, more memory saved; the Playbook calls it usually the best of the first two.
+      4. **ZeRO-3** if $2N$ (bf16 weights) is a large fraction of GPU memory. Check that $B/P>C/W$ and that prefetching works. Watch latency at very large $P$ (the Playbook suggests not going far past ~512).
+      5. **Offload** only when GPUs are scarce (fine-tuning on one node): $4N$ bytes over PCIe per step need multi-second steps to hide.
+      6. **Activations** are a separate problem: checkpointing, or TP/SP/CP.
+    source: 'Ultra-Scale Playbook "ZeRO (Zero Redundancy Optimizer)", "Pipeline parallelism vs. ZeRO-3"; Ren et al. 2021 §3'
+
+reading:
+  - title: "Rajbhandari et al. 2020, ZeRO: Memory Optimizations Toward Training Trillion Parameter Models, §3, §5–7"
+    url: https://arxiv.org/abs/1910.02054
+    kind: paper
+    note: The original. Model-state accounting (K = 12), the three stages with Fig. 1's numbers, ZeRO-R, and the 2Ψ / 3Ψ communication analysis.
+  - title: "Ultra-Scale Playbook: ZeRO (Zero Redundancy Optimizer)"
+    url: https://huggingface.co/spaces/nanotron/ultrascale-playbook
+    kind: book
+    note: Step-by-step diagrams of each stage's collectives, the prefetching picture, and measured memory per stage for an 8B model.
+  - title: "How To Scale Your Model, Part 5: Fully-Sharded Data Parallelism"
+    url: https://jax-ml.github.io/scaling-book/training/
+    kind: book
+    note: The FSDP algorithm in sharding notation, and why ZeRO-3's compute-bound threshold equals data parallelism's.
+  - title: "Ren et al. 2021, ZeRO-Offload: Democratizing Billion-Scale Model Training, §3–4"
+    url: https://arxiv.org/abs/2101.06840
+    kind: paper
+    note: The data-flow-graph argument for which states go to the CPU, the 4M PCIe minimum, and the single-GPU schedule.

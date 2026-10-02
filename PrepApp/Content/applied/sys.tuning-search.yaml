@@ -1,0 +1,447 @@
+id: sys.tuning-search
+area: applied
+title: "Tuning Playbook: Search and Reading Studies"
+summary: Why quasi-random search beats grid search, when Bayesian optimisation pays off, and how to read a finished study before trusting it.
+order: 320
+level: intermediate
+tags: [tuning, hyperparameter-search, bayesian-optimization, tuning-playbook]
+prereqs: [sys.tuning-process]
+
+explainer:
+  - title: "The search problem, and why log scales"
+    body: |
+      In the previous lesson, each study "optimises away" the nuisance hyperparameters. This lesson covers how to choose the trials, and how to tell whether the search was good enough to trust.
+
+      **What makes hyperparameter search unusual:**
+      - Each trial is a full training run, so it is expensive, and many run *in parallel*. There are few chances to learn from earlier trials before launching new ones.
+      - The outcome is noisy: the same configuration with a different seed gives a different result.
+      - Some trials are *infeasible*: they diverge or produce NaNs.
+      - The objective can change after the fact. You may first rank by best validation error, then later by final error, training loss or another metric.
+
+      **The options:** grid search, uniform random search, quasi-random search (deliberately evenly spread points, defined below), and adaptive black-box methods such as Bayesian optimisation (BO) or evolutionary search.
+
+      **Parameterise on log scales.** For the learning rate, weight decay, $1-\beta_1$, $1-\beta_2$ and Adam's $\epsilon$, the effect of a change is multiplicative: going from $10^{-4}$ to $2\times10^{-4}$ matters about as much as going from $10^{-2}$ to $2\times10^{-2}$. Sample $\log_{10}\eta$ uniformly, not $\eta$.
+
+      A uniform draw on $[10^{-5}, 10^{-1}]$ lands above $10^{-2}$ with probability
+
+      $$\frac{0.1-0.01}{0.1-10^{-5}}\approx 0.90,$$
+
+      so 90% of the trials would cover one decade out of four. A log-uniform draw gives each decade 25%. Choi et al. likewise search $\eta$, $1-\gamma$, $1-\beta_1$, $1-\beta_2$ and $\epsilon$ on log scales.
+    source: Tuning Playbook §"Creating a set of studies", FAQ "Why use quasi-random search…"; Choi et al. 2019 §4
+
+  - title: "Why grid search wastes trials"
+    body: |
+      ![Nine trials each. Projected onto the axis that matters, the grid tests 3 values; quasi-random tests 9.](sys.tuning-search/grid-vs-quasirandom)
+
+      **Low effective dimensionality.** Bergstra & Bengio's key observation is that the validation error usually depends strongly on only a few hyperparameters. If $f(x,y)\approx g(x)$, the function has *effective dimension* 1 even though we search in 2-D. Which hyperparameters matter varies from dataset to dataset, so we can't simply drop the others in advance.
+
+      **What a grid does.** A grid with $s$ values per axis in $d$ dimensions costs $N=s^d$ trials but tests only
+
+      $$s = N^{1/d}$$
+
+      distinct values of *each* hyperparameter. In the figure, 9 trials give 3 distinct values of the important hyperparameter; 6 of the 9 trials only vary an axis that doesn't matter. Random points, by contrast, almost surely have $N$ distinct coordinates on every axis.
+
+      **Turning this into a hit probability.** Suppose the good values of the important hyperparameter form an interval of width $w$ (as a fraction of its range), at an unknown position.
+      - *Grid:* its $s$ values are spaced $1/s$ apart, so for $w<1/s$ a randomly placed interval contains one of them with probability $s\,w$.
+      - *Random:* each trial's coordinate on that axis is uniform, so it misses with probability $1-w$, and all $N$ miss with probability $(1-w)^N$.
+
+      Example: $w=0.05$, $N=81$, $d=4$, so $s=81^{1/4}=3$:
+
+      $$\begin{aligned}P_{grid}&\approx3\times0.05=0.15\\ P_{random}&=1-0.95^{81}\approx0.984\end{aligned}$$
+
+      **When a grid is fine.** In 1–2 dimensions, or for a few categorical values, a grid is acceptable. The failure is specific to *axis-aligned* structure: a good region rotated away from the axes would be found about as often by a grid as by random points.
+    source: Bergstra & Bengio 2012 §1 (Fig. 1), §4; Tuning Playbook FAQ "Where can I find an implementation of quasi-random search?"
+
+  - title: "Random vs quasi-random search"
+    body: |
+      **How many random trials are enough?** The same argument works in the full space. Call a trial "good" if it lands in the best fraction $q$ of the search space's volume. Each uniform trial misses with probability $1-q$, so:
+
+      $$P(\text{at least one good}) = 1-(1-q)^N.$$
+
+      For $q=0.05$: $N=20$ gives 0.64 and $N=60$ gives 0.954. This does not depend on the number of dimensions. The caveat is that the top 5% *by volume* may still be well short of the optimum.
+
+      **The weakness of pure random search is clumping.** Independent points form clusters and leave holes, and a narrow good region can fall into a hole. The *discrepancy* of $N$ points measures this: over all axis-aligned boxes, the worst-case gap between the fraction of points inside a box and the box's volume. i.i.d. points have discrepancy of order $N^{-1/2}$. **Low-discrepancy** (quasi-random) sequences reach order $(\log N)^d/N$, so they leave smaller holes.
+
+      **Halton** uses the *radical inverse*: write the index $i$ in base $b$ and mirror its digits about the radix point. In base 2, $i=1,2,3,4,5$ (binary 1, 10, 11, 100, 101) map to
+
+      $$\tfrac12,\ \tfrac14,\ \tfrac34,\ \tfrac18,\ \tfrac58,\ \dots$$
+
+      Each new point lands in a large remaining gap. A $d$-dimensional Halton point uses a different prime base per coordinate (2, 3, 5, …). The bases must be coprime: with equal bases two coordinates would be identical, putting every point on a diagonal. Implementations add a random shift and digit scrambling, so a study has a seed but stays evenly spread. The playbook calls this a "jittered, shuffled grid": it explores as uniformly as a grid but has random-search-like projections.
+
+      **Evidence.** In Bergstra & Bengio's simulation of finding a target occupying 1% of the cube, Sobol (another low-discrepancy sequence) beat random search by a few percentage points, most clearly at 100–300 trials. Latin hypercubes were no better than random, and grids were worst for elongated targets. Without a quasi-random implementation, uniform random search is a slightly less efficient substitute.
+    source: Bergstra & Bengio 2012 §4; Tuning Playbook FAQ "Why use quasi-random search…", "Where can I find an implementation of quasi-random search?"
+
+  - title: "Quasi-random for exploration, Bayesian optimisation for exploitation"
+    body: |
+      Adaptive methods such as BO fit a model of the *response surface* (validation error as a function of the hyperparameters) to finished trials and propose new ones where improvement looks likely. So why does the playbook prefer quasi-random search while *exploring*? Each advantage follows from the search being **non-adaptive** (the trials don't depend on earlier results):
+      1. **The objective can change after the fact.** Trials were not chosen to optimise any one metric, so you can re-rank by final error, training loss or another metric without rerunning anything.
+      2. **Reproducible.** Any implementation with the same uniformity properties gives statistically equivalent studies. An old BO study may be impossible to reproduce once the tool's internals change.
+      3. **Interpretable.** Uniform coverage means a best point at the boundary really signals a bad boundary. An adaptive method deliberately neglects regions after unlucky early trials, so its sampling pattern is not evidence about the space.
+      4. **Parallel and sequential give the same results.** Adaptive methods get worse when many trials launch at once, since there is less feedback to adapt to.
+      5. **Infeasible trials don't distort later sampling.** Some BO tools mishandle divergent points when choosing where to sample next.
+      6. **Simple, and strong.** Anecdotally, beating random search given *twice the budget* is hard for adaptive methods, especially at high parallelism.
+
+      **When BO wins.** Once exploration has settled which hyperparameters matter and their sensible ranges, the goal becomes a single best configuration. Insight no longer matters, so BO (e.g. Open-Source Vizier) should take the final, largest study. It is also attractive whenever only a few trials can run at once but many can run in sequence. If the space still contains divergent points, use a method that handles them, e.g. BO with unknown constraints (Gelbart et al.) or marking trials infeasible.
+
+      **After exploration**, also check the test set. Folding the validation set into training and retraining is only appropriate for a one-off workload (e.g. a competition) with no future launches.
+    source: Tuning Playbook FAQ "Why use quasi-random search…", §"After exploration concludes"
+
+  - title: "Reading a study: axis plots and search-space boundaries"
+    body: |
+      ![Illustrative studies (simulated trials). Left: the best trials pile up at the upper LR boundary, so the space must be extended. Right: the best point is inside, and above ~0.1 every trial diverges.](sys.tuning-search/axis-plot-boundaries)
+
+      Before using a study to answer its question, check that the study itself is sound. The playbook's checklist:
+      - **Is the search space large enough?**
+      - **Were enough points sampled?**
+      - **What fraction of trials was infeasible?**
+      - **Are there optimisation problems, or problematic overfitting in the best trials' curves?** (See the diagnostics lesson.)
+
+      **The basic hyperparameter axis plot** shows each trial as one point: the validation objective (usually the *best* value reached during training) against one hyperparameter. Make one per varied hyperparameter.
+
+      **Boundary check.** If the best points sit near an edge of the range, a better point probably lies beyond it, so rerun with the range extended until the best point is comfortably inside. Uniform (quasi-random) sampling is what makes this inference valid.
+
+      **Infeasible trials.** Mark divergent or NaN trials (e.g. with ×). Two patterns matter:
+      - **A cliff:** all trials diverge above some LR, and the best trials sit right at its edge. The model is probably *unstable*, and fixing that (warmup, clipping, normalization) may unlock better higher LRs.
+      - **A large infeasible fraction overall** wastes budget. Reparameterise the space (e.g. narrow the LR range, or search a ratio such as $\alpha/\epsilon$), and consider that it may be a **bug**.
+
+      **Automate these plots.** The harder a plot is to make, the less often anyone looks at it. Generate axis plots for every varied hyperparameter, and training curves for every trial, automatically.
+    source: Tuning Playbook §"Extracting insight from experimental results", §"Identifying bad search space boundaries", §"Automate generically useful plots"
+
+  - title: "Have we sampled enough? Bootstrapping the trial budget"
+    body: |
+      ![Illustrative: 100 simulated trials, resampled. The boxes narrow slowly; even at 20 trials, lucky and unlucky studies (whiskers) differ by more than the assumed seed noise (green).](sys.tuning-search/trial-budget-bootstrap)
+
+      There is no general answer to "how many trials?", but a finished study can tell you how much luck was involved.
+
+      **Bootstrap procedure.**
+      1. Take the $M$ completed trials (say 100).
+      2. For a smaller budget $k$, draw $k$ trials with replacement and record the best. Repeat thousands of times.
+      3. Plot the distribution of "best of $k$" against $k$ as box plots.
+
+      **Why the spread is large at small $k$.** The best of $k$ is an *order statistic* (the maximum or minimum of a sample), so it is noisy when $k$ is small. By the same argument as before, the chance that it falls in the top 10% of trials is $1-0.9^k$: about 0.65 for $k=10$ and 0.88 for $k=20$. So a 10-trial study misses the top decile about one time in three.
+
+      **What to compare against.** The relevant yardstick is the retrain (seed) variance of a single configuration. In the playbook's real ResNet-50/ImageNet study (100 trials), retraining varied by about ±0.1% on a ~23% error rate. The interquartile range of best-of-6 was far wider than of best-of-20, and even at 20 trials a lucky study and an unlucky one differed by more than that seed noise.
+
+      **Caveats.** Resampling can never beat the study's own best, so the bootstrap is informative only for $k\ll M$ (the $k=30,50$ boxes sit near the floor for this reason). Divergent trials cost budget in a real study, so a fair bootstrap keeps them in the pool as failures.
+
+      **Consequence.** With few trials, the *study* is the dominant source of noise. Two scientific values each tuned with 6 trials can differ simply because one study got luckier draws. In practice, sample what you can afford, then calibrate your confidence by counting how many points land in the good region of the axis plots.
+    source: Tuning Playbook FAQ "How many trials are needed to get good results with quasi-random search?", §"Not sampling enough points in the search space"
+
+  - title: "Isolation plots, sources of variance, and adopting a change"
+    body: |
+      ![Illustrative isolation plot (simulated trials): the best trial in each weight-decay bucket (LR optimised away), compared with an equally tuned no-decay baseline.](sys.tuning-search/isolation-plot)
+
+      **Isolation plot.** For the scientific hyperparameter on the x-axis, plot the *best* trial over the nuisance hyperparameters at each x. This is an apples-to-apples comparison after optimising the nuisance away. With quasi-random data and a continuous x, approximate it by bucketing x and taking the best trial in each bucket. To decide whether to include weight decay at all, compare the curve's minimum against a no-decay baseline whose LR was *equally well tuned*.
+
+      **Three sources of variation** can make a winning change fail to repeat:
+      - **Trial (retrain) variance:** same hyperparameters, different seeds. It comes from initialisation, data order, dropout masks, augmentation and nondeterministic parallel arithmetic.
+      - **Study variance:** the hyperparameter search itself is random. A different quasi-random seed can select different hyperparameters. This matters most for general claims ("weight decay helps"), and it can be larger or smaller than trial variance.
+      - **Data variance:** the random train/validation/test split and the data-generation process.
+
+      **A yardstick.** Rerun the best trial of each arm $n$ times. If one run has seed std $\sigma$, the difference of two $n$-run means has standard error $\sigma\sqrt{2/n}$. With $\sigma=0.1\%$ and $n=5$ that is $0.063\%$. A $0.3\%$ gain is then about 4.7 standard errors, while $0.1\%$ is only 1.6.
+
+      **The decision.** Seed variance alone can make identical configurations differ "significantly" on a fixed validation set, so don't rely on one test. Equally, don't demand certainty. If the change beats the baseline after accounting for both arms' retrain variance, adopt it, **but only if the gain outweighs the complexity it adds.**
+    source: Tuning Playbook §"Detecting whether a change is useful with isolation plots", §"Determining whether to adopt a training pipeline change or hyperparameter configuration"
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Grid or random search?"* Random or quasi-random in more than 2 dimensions. Effective dimension is low, so a grid tests only $N^{1/d}$ values of the axis that matters, while random points test $N$.
+      - *"Why not always Bayesian optimisation?"* During exploration you want non-adaptive, uniform sampling: you can re-rank by a new metric, reproduce studies, read boundaries, run everything in parallel, and absorb divergent trials. BO is for the final exploitation study, or when few trials can run at once.
+      - *"How many random trials to land in the top 5% with 95% probability?"* $1-0.95^N\ge0.95$ gives $N\ge\ln0.05/\ln0.95\approx58.4$, so 59 (about 60).
+      - *"Your best LR is at the top of the range. What now?"* Extend the range. If everything above it diverges, suspect instability and try warmup or clipping rather than accepting a capped LR.
+      - *"Why log-uniform for the LR?"* The effects are multiplicative. Linear sampling on $[10^{-5},10^{-1}]$ puts 90% of trials in the top decade.
+      - *"How do you decide a change is real?"* Isolation plot against an equally tuned baseline, then reruns with several seeds; compare the gap to $\sigma\sqrt{2/n}$; weigh the gain against the complexity.
+      - *"What is study variance?"* Variation in the selected configuration and its score caused by the randomness of the search itself. With few trials it can exceed seed variance.
+    source: Tuning Playbook FAQs on quasi-random search; Bergstra & Bengio 2012 §1, §4
+
+  - title: "Key results"
+    body: |
+      - Search $\eta$, weight decay, $1-\beta$ and $\epsilon$ on **log scales**.
+      - A grid tests $N^{1/d}$ distinct values per axis; random or quasi-random points test $N$. That wins under low effective dimensionality.
+      - Random-search coverage:
+
+      $$P(\text{hit top-}q)=1-(1-q)^N$$
+
+      ($q=0.05$, $N=60$ gives 0.954; independent of dimension).
+      - Quasi-random (shifted, scrambled Halton/Sobol) = uniform coverage without clumping, "a jittered, shuffled grid".
+      - **Explore with quasi-random search** (non-adaptive: re-rankable, reproducible, interpretable, parallel, robust to divergence). **Exploit with BO** at the end.
+      - Read every study: best point inside the bounds? Enough points in the good region? Infeasible fraction? Curves OK?
+      - An infeasible cliff right next to the best LR points to instability. A large infeasible fraction points to reparameterising, or a bug.
+      - Bootstrap best-of-$k$ to see study luck. Compare the spread to seed noise.
+      - Isolation plot = best over the nuisance per scientific value. Adopt changes that beat retrain noise ($\sigma\sqrt{2/n}$ for a difference of means) and are worth their complexity.
+    source: Tuning Playbook §"Extracting insight from experimental results", FAQs; Bergstra & Bengio 2012
+
+quiz:
+  - id: q1
+    prompt: |
+      A $3\times3\times3\times3$ grid (81 trials) and 81 quasi-random trials search the same 4-D space. Only the learning rate really matters. How many distinct learning rates does each test?
+    correct: Grid 3; quasi-random 81
+    wrong:
+      - Grid 81; quasi-random 81
+      - Grid 9; quasi-random 81
+      - Grid 3; quasi-random 9
+    explanation: |
+      A grid's distinct values per axis are $N^{1/d}=81^{1/4}=3$, and every LR value is repeated 27 times across axes that don't matter. Low-discrepancy points have distinct coordinates on every axis, so all 81 LRs differ.
+    source: Bergstra & Bengio 2012 §1
+
+  - id: q2
+    prompt: |
+      With uniform random search, what is the probability that at least one of 60 trials lands in the best 5% of the search space's volume?
+    correct: About 0.95
+    wrong:
+      - About 0.60
+      - Exactly 1.00, since 60 × 5% = 3
+      - It depends on the number of dimensions
+    explanation: |
+      $1-(1-0.05)^{60}=1-0.95^{60}\approx0.954$. Each trial misses independently with probability 0.95, whatever the dimension. "60 × 5% = 3" is the expected number of hits, not a guarantee of at least one.
+    source: Bergstra & Bengio 2012 §4
+
+  - id: q3
+    prompt: |
+      You sample the LR uniformly (linear scale) on $[10^{-5}, 10^{-1}]$. Roughly what fraction of trials lands in $[10^{-2}, 10^{-1}]$?
+    correct: About 90%
+    wrong:
+      - About 25%
+      - About 10%
+      - About 50%
+    explanation: |
+      $(0.1-0.01)/(0.1-0.00001)\approx0.90$. Under log-uniform sampling each of the four decades would get 25%, which is why LRs are searched on a log scale.
+    source: Tuning Playbook §"Creating a set of studies"; Choi et al. 2019 §4
+
+  - id: q4
+    prompt: |
+      You switch an exploration study from quasi-random search to an adaptive BO tool such as Vizier. Which capability do you lose?
+    correct: Re-ranking trials by a new metric without bias
+    wrong:
+      - Marking divergent trials as infeasible
+      - Searching the learning rate on a log scale
+      - Including a categorical hyperparameter such as the activation
+    explanation: |
+      BO chooses new trials using the current objective, so the sampled set is concentrated where *that* metric looked good, and is no longer a uniform sample for ranking by another metric. Vizier's BO can mark trials infeasible, search log-scaled parameters and handle categorical ones, so those survive the switch (though some BO tools handle infeasible points badly).
+    source: Tuning Playbook FAQ "Why use quasi-random search…"
+
+  - id: q5
+    prompt: |
+      ![Two basic axis plots (illustrative, simulated trials).](sys.tuning-search/axis-plot-quiz)
+
+      What should you do after **Study A**?
+    correct: Extend the LR range upward and run the study again
+    wrong:
+      - Adopt $10^{-2}$, since it is the best LR found
+      - Shrink the range around $10^{-2}$ to sample it more densely
+      - Switch to grid search, since random search missed the optimum
+    explanation: |
+      When the best points cluster at an edge, a better value probably lies beyond it. Extend until the best point is comfortably inside, as in Study B. Narrowing around the edge would lock in the bad boundary.
+    source: Tuning Playbook §"Identifying bad search space boundaries"
+
+  - id: q6
+    prompt: |
+      In an LR study, every trial above $3\times10^{-2}$ diverges, and the three best trials all sit between $2\times10^{-2}$ and $3\times10^{-2}$. What does the playbook suggest this indicates?
+    correct: Instability is capping the LR below possibly better values
+    wrong:
+      - The optimum has been found exactly, since it is bounded by divergence
+      - The search space is too wide and should be cut at $10^{-2}$
+      - The validation set is too small to distinguish the best trials
+    explanation: |
+      Any model diverges at a high enough LR, but if the best trials crowd against the divergence cliff, stability is what limits the LR. Warmup, clipping or architectural fixes may unlock higher LRs and better results.
+    source: Tuning Playbook §"Identifying bad search space boundaries", FAQ "How can optimization failures be debugged and mitigated?"
+
+  - id: q7
+    prompt: |
+      Half of the trials in a study return NaN losses. Which response does the playbook **not** suggest?
+    correct: Drop the NaN trials and report the best of the rest as a normal study
+    wrong:
+      - Reparameterise the search space to avoid sampling infeasible regions
+      - Check the training code for a bug that produces NaNs
+      - Narrow the range of the hyperparameter that drives divergence
+    explanation: |
+      A large infeasible fraction wastes budget, and the pattern carries information: it may reflect a badly shaped search space, or a bug. Silently dropping the NaNs hides both problems.
+    source: Tuning Playbook §"Extracting insight from experimental results"
+
+  - id: q8
+    prompt: |
+      Why does the playbook recommend Bayesian optimisation *after* exploration concludes?
+    correct: Only the single best configuration matters now, not insight
+    wrong:
+      - BO is non-adaptive, so its results are easier to reproduce later
+      - BO cannot be used until the test set has been evaluated
+      - Quasi-random search stops working once the search space is narrowed
+    explanation: |
+      Once you know which hyperparameters matter and their ranges, insight is no longer the goal. BO concentrates trials where improvement is likely, which is exactly the non-uniformity that made it unsuitable for reading the space during exploration. BO is the *adaptive* method.
+    source: Tuning Playbook §"After exploration concludes"
+
+  - id: q9
+    prompt: |
+      Two teams each run a 200-trial final (exploitation) study. Team A has 200 workers and runs one wave of 200. Team B has 4 workers and runs 50 sequential waves of 4. Which team gains more from BO over quasi-random search?
+    correct: Team B, since 49 of its 50 waves can use earlier results
+    wrong:
+      - Team A, since 200 simultaneous results give BO more data
+      - Neither, since BO's efficiency does not depend on parallelism
+      - Both equally, since they run the same number of trials
+    explanation: |
+      BO's edge comes from feedback: each new proposal uses finished trials. Team A's single wave is chosen before any result exists, so BO degenerates to its initial design, essentially non-adaptive. Team B can adapt 49 times. This is why the playbook finds 2×-budget random search hard to beat at high parallelism.
+    source: Tuning Playbook FAQ "Why use quasi-random search…"
+
+  - id: q10
+    prompt: |
+      Each arm's best configuration is rerun with $n=5$ seeds, and one run's seed std is $\sigma=0.1\%$. What is the standard error of the difference between the two arms' mean errors?
+    correct: About $0.063\%$
+    wrong:
+      - About $0.045\%$
+      - About $0.020\%$
+      - About $0.141\%$
+    explanation: |
+      Each mean has variance $\sigma^2/n$, and for independent arms the variances add: $\mathrm{SE}=\sigma\sqrt{2/n}=0.1\sqrt{0.4}\approx0.063\%$. $0.045\%$ ($\sigma/\sqrt n$) forgets the second arm. $0.141\%$ ($\sigma\sqrt2$) ignores averaging over seeds.
+    source: Tuning Playbook §"Determining whether to adopt a training pipeline change or hyperparameter configuration"
+
+  - id: q11
+    prompt: |
+      Two scientific values are each tuned with 6 quasi-random trials, and one wins by 0.4%. Seed noise is ±0.1%. What is the most likely concern?
+    correct: 'Study variance: best-of-6 is noisy enough to explain 0.4%'
+    wrong:
+      - 'Trial variance: 0.4% is four times the seed noise, so it must be real'
+      - 'Data variance: the validation split has certainly changed between studies'
+      - 'None: quasi-random search removes the luck from small studies'
+    explanation: |
+      The best of 6 trials is a noisy order statistic. In the playbook's bootstrap example, the spread of best-of-6 far exceeded seed noise. A difference this size needs more trials per study, or a check that both studies put many points in their good regions.
+    source: Tuning Playbook FAQ "How many trials are needed to get good results with quasi-random search?"
+
+  - id: q12
+    prompt: |
+      Which statement about the Halton sequence is **false**?
+    correct: Its points are independent draws, so it clumps exactly like random search
+    wrong:
+      - Coordinate $j$ uses the radical inverse in the $j$-th prime base
+      - In base 2 the first points are 1/2, 1/4, 3/4, 1/8, 5/8
+      - Practical versions add a random shift and scrambling so a study has a seed
+    explanation: |
+      Halton points are deterministic and deliberately spread out, so the fraction of points in any box tracks its volume closely: low discrepancy, of order $(\log N)^d/N$ versus about $N^{-1/2}$ for i.i.d. points. That is the advantage over random points, which clump and leave holes.
+    source: Bergstra & Bengio 2012 §4; Tuning Playbook FAQ "Where can I find an implementation of quasi-random search?"
+
+  - id: q13
+    prompt: |
+      You want to know whether to add weight decay at all. You have an isolation plot over weight decay (LR tuned per bucket). What is the correct comparison?
+    correct: The plot's minimum vs a no-decay baseline with its LR re-tuned
+    wrong:
+      - The plot's minimum against the original baseline at its old LR
+      - The plot's value at the default decay against the no-decay run
+      - The average over all buckets against the no-decay baseline
+    explanation: |
+      Both arms must have their nuisance hyperparameters optimised away. Comparing the tuned weight-decay arm with an untuned baseline would credit weight decay with the gains from re-tuning the LR.
+    source: Tuning Playbook §"Detecting whether a change is useful with isolation plots"
+
+  - id: q14
+    prompt: |
+      The good LR values occupy 5% of the LR axis, at an unknown position, and only the LR matters. With 81 trials in a 4-D space, what is the chance of at least one trial in the good LR interval, for a $3^4$ grid vs uniform random search?
+    correct: About 0.15 vs about 0.98
+    wrong:
+      - About 0.98 vs about 0.98, since both use 81 trials
+      - About 0.05 vs about 0.81
+      - About 0.33 vs about 0.98
+    explanation: |
+      The grid has $81^{1/4}=3$ LR values spaced $1/3$ apart, so a randomly placed interval of width 0.05 contains one with probability $3\times0.05=0.15$. Each random trial's LR is uniform, so all 81 miss with probability $0.95^{81}$, giving $1-0.95^{81}\approx0.984$. The grid wastes 78 of its trials repeating the same 3 LRs.
+    source: Bergstra & Bengio 2012 §1, §4
+
+cards:
+  - id: f1
+    front: Why does random search beat grid search in high dimensions (Bergstra & Bengio)?
+    back: |
+      Low effective dimensionality: the objective depends mostly on a few hyperparameters, and which ones varies by task. A grid of $N=s^d$ trials tests only $s=N^{1/d}$ values per axis. $N$ random points test $N$ distinct values on every axis.
+    source: Bergstra & Bengio 2012 §1
+
+  - id: f2
+    front: Probability that $N$ uniform random trials include one in the top fraction $q$. Value for $q=0.05$, $N=60$?
+    back: |
+      $$1-(1-q)^N$$
+
+      $1-0.95^{60}\approx0.954$. This is independent of dimension. About 59 trials are needed for 95%.
+    source: Bergstra & Bengio 2012 §4
+
+  - id: f3
+    front: How is the Halton sequence built?
+    back: |
+      Coordinate $j$ of point $i$ is the radical inverse of $i$ in the $j$-th prime base: write $i$ in base $b$ and mirror its digits about the point (base 2: 1/2, 1/4, 3/4, 1/8, 5/8, …). Practical versions add a random shift and scrambling. The result is evenly spread, "a jittered, shuffled grid".
+    source: Tuning Playbook FAQ "Where can I find an implementation of quasi-random search?"; Bergstra & Bengio 2012 §4
+
+  - id: f4
+    front: Six reasons the playbook prefers quasi-random search to BO during exploration.
+    back: |
+      1. The objective can be changed after the fact (non-adaptive).
+      2. Statistically reproducible.
+      3. Uniform coverage makes boundaries interpretable.
+      4. Parallel = sequential results.
+      5. Infeasible trials do no harm.
+      6. Simple, and hard to beat at 2× budget when parallelism is high.
+    source: Tuning Playbook FAQ "Why use quasi-random search…"
+
+  - id: f5
+    front: What is a basic hyperparameter axis plot, and what two things do you check on it?
+    back: |
+      One point per trial: the validation objective (best over training) against one hyperparameter.
+
+      Check (1) whether the best points sit near a boundary, in which case extend the range, and (2) the pattern of infeasible trials. A cliff next to the best points means instability; a large infeasible fraction means reparameterise, or a bug.
+    source: Tuning Playbook §"Identifying bad search space boundaries"
+
+  - id: f6
+    front: Define an isolation plot and how to approximate it from quasi-random data.
+    back: |
+      Performance of the *best* trial over the nuisance hyperparameters at each value of the scientific hyperparameter. Approximate it by bucketing the scientific axis and taking the best trial per bucket. Compare against an equally tuned baseline.
+    source: Tuning Playbook §"Detecting whether a change is useful with isolation plots"
+
+  - id: f7
+    front: Name the three sources of variation the playbook distinguishes.
+    back: |
+      - **Trial (retrain) variance**: same hyperparameters, different seeds (init, data order, dropout, augmentation, nondeterministic arithmetic).
+      - **Study variance**: randomness of the hyperparameter search itself.
+      - **Data variance**: random splits and the data-generation process.
+    source: Tuning Playbook §"Determining whether to adopt a training pipeline change or hyperparameter configuration"
+
+  - id: f8
+    type: open
+    front: "Explain to an interviewer how you would tell whether a study used enough trials."
+    back: |
+      - Look at the axis plots. Count how many points fall in the good region near the best. One lucky point is weak evidence; a well-populated basin is strong.
+      - Bootstrap: resample $k$ of the $M$ finished trials many times, record best-of-$k$, and plot its spread against $k$. If the spread at the current budget is large relative to seed noise, the study's luck dominates.
+      - Reason with order statistics: $P(\text{best-of-}k \text{ in top } q)=1-(1-q)^k$, e.g. 0.65 for the top 10% with 10 trials.
+      - Compare with retrain variance (the playbook's ResNet-50 example: ±0.1% seed noise, yet best-of-20 studies still varied by more).
+      - Remedies: more trials, fewer nuisance dimensions (fix weakly interacting ones), or narrower ranges once the boundaries are known.
+    source: Tuning Playbook FAQ "How many trials are needed…", §"Not sampling enough points in the search space"
+
+  - id: f9
+    type: open
+    front: "Compare grid search, random search, quasi-random search and Bayesian optimisation for tuning a neural network."
+    back: |
+      - **Grid**: simple and exhaustive, but tests only $N^{1/d}$ values per axis. Fine in 1–2 dimensions or for a few categorical values.
+      - **Random**: $N$ distinct values per axis, which exploits low effective dimension; trivially parallel. Clumps, leaving holes.
+      - **Quasi-random** (shifted Halton/Sobol): random's projections without the clumping; a few points better than random in Bergstra & Bengio's simulation. Non-adaptive, so studies can be re-ranked, reproduced and read for boundaries. The playbook's choice for exploration.
+      - **BO**: models the response surface and adapts. The most efficient when results can feed back (low parallelism, many sequential trials) and when only the final best configuration matters. Harder to interpret and reproduce; must handle divergent trials. The playbook's choice for exploitation.
+    source: Tuning Playbook FAQ "Why use quasi-random search…"; Bergstra & Bengio 2012 §4
+
+  - id: f10
+    type: open
+    front: "A colleague's new augmentation improves validation error by 0.15% in one run. Walk through deciding whether to adopt it."
+    back: |
+      1. Was the baseline equally tuned? Augmentation changes the optimal LR, regularization and step budget, so both arms need their nuisance hyperparameters optimised (separate studies, same budget).
+      2. Sanity-check both studies: best points inside the boundaries, enough good-region points, no problematic overfitting, curves still improving or not.
+      3. Compare the isolation-style best trials, then rerun each winner with several seeds. With $\sigma=0.1\%$ and 5 seeds, the SE of the difference is $\approx0.063\%$, so 0.15% is only ~2.4 SE.
+      4. Consider study variance if the claim is general ("this augmentation helps").
+      5. Adopt only if the gain is convincing *and* worth the complexity and possibly the extra steps (augmentation adds gradient variance).
+    source: Tuning Playbook §"Determining whether to adopt…", §"Detecting whether a change is useful with isolation plots"
+
+reading:
+  - title: "Bergstra & Bengio 2012, Random Search for Hyper-Parameter Optimization (JMLR)"
+    url: https://www.jmlr.org/papers/v13/bergstra12a.html
+    kind: paper
+    note: "§1 and Fig. 1 give the low-effective-dimension argument; §4 compares grids, random, Latin hypercube and Sobol."
+  - title: "Deep Learning Tuning Playbook: FAQ on quasi-random search"
+    url: https://github.com/google-research/tuning_playbook#why-use-quasi-random-search-instead-of-more-sophisticated-black-box-optimization-algorithms-during-the-exploration-phase-of-tuning
+    kind: docs
+    note: The six advantages, the 2×-budget footnote, and the bootstrap trial-budget figure.
+  - title: "Deep Learning Tuning Playbook: 'Extracting insight from experimental results'"
+    url: https://github.com/google-research/tuning_playbook#extracting-insight-from-experimental-results
+    kind: docs
+    note: The study checklist, axis plots, isolation plots, and the adoption criteria.
+  - title: "Open-Source Vizier (quasi-random and Bayesian optimisation)"
+    url: https://github.com/google/vizier
+    kind: docs
+    note: The implementation the playbook points to for both quasi-random search and BO.

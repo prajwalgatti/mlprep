@@ -1,0 +1,495 @@
+id: sys.flops-mfu
+area: applied
+title: "Counting FLOPs, MFU/HFU and estimating training time"
+summary: Derives the 6N FLOPs-per-token rule from the forward and backward matmuls, adds the attention term, defines model and hardware FLOPs utilisation, and turns them into training-time estimates you can sanity-check against published runs.
+order: 120
+level: core
+tags: [systems, flops, mfu, hfu, training-time, transformers, performance]
+prereqs: [sys.roofline]
+
+explainer:
+  - title: "The problem: is 3,000 tokens/s good?"
+    body: |
+      Your 7B-parameter model trains at 3,000 tokens per second per H100. Is that good or terrible? And before buying compute: how long will a 70B model take on 15 trillion tokens?
+
+      Raw throughput can't answer either question. Tokens/s depends on model size, so "3,000" means nothing without the model. We need three numbers:
+      1. **FLOPs per token** for this model in training. Derived on the next two cards.
+      2. **Peak FLOP/s** of the hardware. For H100 dense bf16, $C \approx 989$ TFLOP/s (`sys.gpu-basics`).
+      3. **Utilisation**: the fraction of peak actually turned into useful model FLOPs. This is MFU.
+
+      With those, throughput becomes a percentage you can compare across models and hardware, and training time becomes one division.
+
+      **Symbols used throughout.**
+      - $N$: number of model parameters (strictly, those used in matmuls; see the next card).
+      - $D$: number of training tokens.
+      - $L$, $h$, $s$, $V$: layers, hidden size, sequence length, vocabulary size.
+      - $n$: number of GPUs; $C$: peak FLOP/s per GPU.
+      - Note: here $D$ is a token count, not a hidden width as in `sys.roofline`.
+      - **FLOPs** counts floating-point operations; a multiply-add is 2. **FLOP/s** is a rate.
+    source: 'Chowdhery et al. 2022 (PaLM) §4.1, App. B; Scaling Book Part 1 §"Where Does the Time Go?"'
+
+  - title: "FLOPs of a matmul, forward and backward"
+    body: |
+      **One matmul.** $Y = XW$ with $X \in [b, k]$, $W \in [k, m]$. Each of the $bm$ outputs is a dot product of length $k$: $k$ multiplies and about $k$ adds. Total $2bkm$ FLOPs.
+
+      **Per token, per parameter.** In a network layer, $b$ is the number of tokens and $W$ holds $km$ parameters. So the forward costs $2 \times (\text{tokens}) \times (\text{parameters})$: **2 FLOPs per parameter per token**.
+
+      **The backward pass.** Given $G = \partial L/\partial Y$ (shape $[b, n]$), backprop needs two products:
+
+      $$\begin{aligned} \frac{\partial L}{\partial X} &= G\,W^\top \quad [b,m]\times[m,k] \\ \frac{\partial L}{\partial W} &= X^\top G \quad [k,b]\times[b,m] \end{aligned}$$
+
+      - $\partial L/\partial X$ is passed back to the previous layer; without it backprop stops.
+      - $\partial L/\partial W$ is the gradient the optimizer uses.
+
+      Each multiplies the same three dimensions $b, k, m$, so each costs $2bkm$. The backward is therefore $4bkm$, **twice the forward**, and training costs $6bkm$:
+
+      $$\text{training FLOPs} \approx 6 \times N \times D.$$
+
+      ![The forward matmul and the two backward matmuls. Each contracts a different dimension (k, m or the token dimension b), but all three cost 2bkm.](sys.flops-mfu/matmul-backward)
+
+      **What this counts and what it doesn't.**
+      - *Embedding lookups* are gathers, not matmuls: zero FLOPs. A separate (untied) LM head *is* a matmul and counts. With tied weights, count the matrix once, as the head.
+      - *The first layer* needs no $\partial L/\partial X$, a negligible saving in a deep net.
+      - *Elementwise ops, norms and softmax* have $O(\text{tokens}\times h)$ FLOPs, negligible next to $O(\text{tokens}\times h^2)$ matmuls. Not negligible in *time*, since they are memory-bound (`sys.roofline`).
+      - *The optimizer step* costs $O(N)$ per step, not per token, so it vanishes against $6N$ per token.
+
+      So "$N$" in $6N$ means parameters that take part in matmuls. For LLMs that is nearly all of them; input embeddings are the main exclusion.
+    source: 'Scaling Book Part 4 §"Counting Dots", §"Forward and reverse FLOPs"; Narayanan et al. 2021 Appendix (FLOPs); Chowdhery et al. 2022 App. B'
+
+  - title: "A transformer's FLOPs per token, and the attention term"
+    body: |
+      **Parameters per layer** (standard block, MLP width $4h$):
+      - Attention projections $W_Q, W_K, W_V, W_O$: $4h^2$.
+      - MLP up and down: $2 \times 4h^2 = 8h^2$.
+      - Total $12h^2$, so $N \approx 12Lh^2$ (plus $hV$ for the head). A gated MLP (SwiGLU) with width $F$ has $3hF$ instead of $8h^2$.
+
+      **The attention-score matmuls are not parameter matmuls.** For each query token, $QK^\top$ dots its query with $s$ keys of width $h$ (summed over heads): $2sh$ FLOPs. Weighting the $s$ values costs another $2sh$. That is $4sh$ forward per token per layer, ×3 for training:
+
+      $$\text{per token} \approx 6N + 12\,L\,s\,h.$$
+
+      This matches PaLM's $6N + 12LHQT$ ($H$ heads of size $Q$, so $HQ = h$, and $T = s$) and Megatron's $72BLsh^2(1 + \tfrac{s}{6h} + \dots)$ per batch.
+
+      **When does attention matter?** With $N \approx 12Lh^2$:
+
+      $$\frac{12Lsh}{6 \cdot 12Lh^2} = \frac{s}{6h}.$$
+
+      In general it is $2sh/P_{layer}$, with $P_{layer}$ the matmul parameters per layer. A gated MLP with $F = 4h$ has $16h^2$ per layer and gives $s/(8h)$, the Scaling Book's version. Attention dominates only once $s$ exceeds several times $h$.
+
+      **Worked example** (7B-class, $L = 32$, $h = 4096$, $s = 4096$, $N = 7\times10^9$):
+      - $12Lsh = 12\cdot32\cdot4096\cdot4096 \approx 6.4\times10^9$.
+      - $6N = 4.2\times10^{10}$.
+      - Attention adds 15.3% *relative to* $6N$, i.e. 13.3% *of the total*. Say which one you mean.
+
+      ![Per-token training FLOPs for a 7B-class model (LLaMA-7B-like dims, gated MLP) vs sequence length. The parameter matmuls are constant; attention scores grow linearly in s and pass half the total near 25k tokens.](sys.flops-mfu/flops-breakdown)
+
+      **Conventions to state.** With a causal mask only half the score matrix is needed, and kernels like FlashAttention skip the masked half, so some authors halve $12Lsh$. The counts above, PaLM's and Megatron's do not halve. Kaplan et al. write a forward context term $2Lsh$, which is already half of the unhalved $4Lsh$ (i.e. causal), and then leave it out of their $C \approx 6N$ since it was small for their models. That explains many "my count disagrees with Kaplan's" puzzles. Always say which convention you use.
+    source: 'Scaling Book Part 4 §"MLPs", §"Attention", §"General rule of thumb", §"Fractional cost of attention with context length"; Korthikanti et al. 2022 App. A (eq. 7); Chowdhery et al. 2022 App. B; Kaplan et al. 2020 §2.1'
+
+  - title: "Model FLOPs utilisation (MFU)"
+    body: |
+      **Definition** (PaLM, 2022). MFU is the observed throughput in tokens/s divided by the throughput the system would reach if it ran the model's required FLOPs at peak:
+
+      $$\text{MFU} = \frac{\text{tokens/s} \times 6N}{n \cdot C}.$$
+
+      The numerator counts **model FLOPs**: what one forward and backward pass needs, whatever the implementation. Add $12Lsh$ to $6N$ if you include attention, and say so.
+
+      **Worked examples** (H100, $C = 989$ TFLOP/s per GPU):
+      - 7B at 3,000 tokens/s/GPU: $6 \cdot 7\text{e}9 \cdot 3000 / 989\text{e}12 \approx 12.7\%$. Poor.
+      - At 100% MFU this model would run at $989\text{e}12/4.2\text{e}10 \approx 23{,}500$ tokens/s/GPU. 40% MFU needs about 9,400.
+      - 70B at 400 tokens/s/GPU: $6 \cdot 70\text{e}9 \cdot 400 / 989\text{e}12 \approx 17\%$.
+
+      **Checking a published number.** PaLM 540B trained at 238.3k tokens/s on 6,144 TPU v4 chips (peak 275 TFLOP/s each):
+
+      $$\frac{238.3\text{e}3 \times 6 \times 540\text{e}9}{275\text{e}12 \times 6144} \approx 45.7\%.$$
+
+      Adding attention FLOPs gives PaLM's headline 46.2%.
+
+      **Why define it this way?** The numerator depends only on the model and the measured tokens/s; the denominator only on the published peak. Two runs with different code, recomputation or parallelism are compared on what matters, the speed of useful training.
+
+      **Getting it right.**
+      - Use the **dense** peak in the precision the matmuls actually run in. A spec sheet's "with sparsity" number halves your MFU; an fp8 peak for a bf16 run does the same.
+      - Use tokens/s **per GPU** with per-GPU peak, or totals with totals. Don't mix.
+      - For a mixture-of-experts model use the **active** parameters per token: only $k$ of $E$ experts run for each token.
+    source: 'Chowdhery et al. 2022 §4.1 (Table 3), App. B; Korthikanti et al. 2022 §6.3'
+
+  - title: "Hardware FLOPs utilisation (HFU) and recomputation"
+    body: |
+      **HFU** counts the FLOPs the hardware *actually executed* per step, including recomputation, divided by step time and peak. So HFU ≥ MFU, with equality when nothing is recomputed.
+
+      **Activation recomputation** (checkpointing, `sys.activation-checkpointing`) discards forward activations to save memory and recomputes them during the backward pass.
+      - **Full recomputation** reruns the whole forward: hardware FLOPs become $2N + 2N + 4N = 8N$ per token, so HFU $= \tfrac{4}{3}$ MFU.
+      - **Selective recomputation** (Korthikanti et al.) reruns only the cheap but memory-hungry score and value matmuls: one extra forward of them, $4sh$ per token per layer, against model FLOPs of $72h^2 + 12sh$. So hardware/model $\approx 1 + 4sh/72h^2 = 1 + s/(18h)$. (The paper prints $\approx 1 + s/6h$ in its eq. 9; its own term-by-term count gives $s/18h$. Either way it is about 1% for large models.) Their 1T-parameter run reached MFU 56.3%, HFU 57.0%.
+
+      **Why PaLM moved away from HFU.** HFU depends on implementation choices (how much is recomputed, how FLOPs are counted) and rewards wasted work. Recomputing more raises HFU without making training any faster. PaLM 540B: MFU 46.2%, HFU 57.8%, because it used rematerialisation.
+
+      **Predicting the effect of recomputation.** Suppose a run is compute-bound and you switch on full recomputation with nothing else changed. Each step does $8N$ instead of $6N$ FLOPs per token at the same efficiency, so step time grows by $4/3$. MFU falls to $3/4$ of its value; HFU stays the same. Teams accept this because the freed memory can allow a larger micro-batch, fewer pipeline bubbles or less model parallelism, which can more than repay the extra FLOPs. Narayanan et al. report up to 2× higher throughput with recomputation at large batch sizes than the best they achieved without it.
+
+      **Reading old papers.** Narayanan et al. report 140 TFLOP/s per A100 for GPT-3 175B, counting the extra forward of full recomputation. That is HFU $140/312 \approx 44.9\%$, so MFU $\approx 44.9\% \times 6/8 \approx 33.7\%$. Always check which FLOPs a reported "TFLOP/s per GPU" includes.
+    source: 'Chowdhery et al. 2022 §4.1, App. B; Korthikanti et al. 2022 §6.3 (Table 5), App. A (eqs. 8–9); Narayanan et al. 2021 §5.1 (eq. 3), §5.6 (Fig. 17); Scaling Book Part 4 §"Gradient checkpointing"'
+
+  - title: "Estimating training time"
+    body: |
+      Total model FLOPs are $6ND$ (plus attention). The cluster delivers $n \cdot C \cdot \text{MFU}$ useful FLOP/s. So
+
+      $$T_{train} = \frac{6\,N\,D}{n \cdot C \cdot \text{MFU}}.$$
+
+      **Worked example: 70B on 15T tokens, 16,384 H100s at 40% MFU.**
+
+      $$\begin{aligned} 6ND &= 6 \cdot 7\text{e}10 \cdot 1.5\text{e}13 \\ &= 6.3\times10^{24} \text{ FLOPs} \\ n\,C\,\text{MFU} &= 16384 \cdot 989\text{e}12 \cdot 0.4 \\ &\approx 6.5\times10^{18} \text{ FLOP/s} \\ T &\approx 9.7\times10^5 \text{ s} \approx 11.2 \text{ days} \end{aligned}$$
+
+      **Narayanan's formula.** Megatron-LM writes $T \approx 8TP/(nX)$, with $T$ tokens, $P$ parameters and $X$ the achieved FLOP/s per GPU. The 8 instead of 6 is the recomputation forward: $X$ counts hardware FLOPs. For GPT-3 (175B, 300B tokens, 1,024 A100s at $X = 140$ TFLOP/s):
+
+      $$\begin{aligned} T &= \frac{8 \cdot 3\text{e}11 \cdot 1.75\text{e}11}{1024 \cdot 1.4\text{e}14} \\ &\approx 2.9\times10^6 \text{ s} \approx 33.9 \text{ days}, \end{aligned}$$
+
+      matching the paper's 34 days. It is the same formula as ours, since $8/X = 6/(\tfrac{6}{8}X)$ and $\tfrac{6}{8}X$ is the model FLOP/s.
+
+      **Using it in reverse.** Given a deadline, solve for $n$ or the MFU you must hit. A 7B model on 1.4T tokens in 7 days on 256 H100s needs $6 \cdot 7\text{e}9 \cdot 1.4\text{e}12 / (256 \cdot 989\text{e}12 \cdot 604{,}800) \approx 38\%$ MFU: feasible but not slack.
+
+      **Scope.** This is the time of uninterrupted training at a steady MFU. Real wall-clock adds evaluation, checkpointing, restarts after failures and slow warm-up phases. Llama 3 405B saw 466 job interruptions in a 54-day period, 419 of them unexpected. The FLOP budget itself, choosing $N$ and $D$ for a given compute, is `llm.scaling-laws`.
+    source: 'Narayanan et al. 2021 §5.1 (eq. 4); Chowdhery et al. 2022 App. B; Dubey et al. 2024 (Llama 3) §3.3.4'
+
+  - title: "Why MFU is never 100%"
+    body: |
+      MFU is useful model FLOPs over the time actually taken, so every second not spent on model matmuls at peak lowers it. The main losses:
+
+      1. **Kernel efficiency.** Even large matmuls reach roughly 80–85% of the H100 dense peak. Small or awkward shapes do worse (tile and wave quantisation).
+      2. **Recomputation.** Extra forward FLOPs take time but are not model FLOPs (they count in HFU only).
+      3. **Memory-bound ops.** LayerNorm, activations, softmax, dropout, residual adds and the optimizer update do almost no model FLOPs but stream lots of bytes. Fusion shrinks this.
+      4. **Exposed communication.** Collectives not hidden behind compute: tensor-parallel all-reduces on the critical path, data-parallel gradient sync with too few tokens per GPU (`sys.roofline`).
+      5. **Pipeline bubbles.** Pipeline parallelism splits the model into $p$ sequential stages and each batch into $m$ micro-batches; stages sit idle while the pipeline fills and drains, a fraction $(p-1)/(m+p-1)$ of each step (`sys.pipeline-parallel`).
+      6. **Everything else.** Data loading stalls, host overhead, stragglers (the slowest GPU sets the pace for synchronous training), evaluation.
+
+      ![Illustrative step-time budget, not any published run's breakdown. Time is in units of the ideal compute time (model FLOPs at peak = 1). Assumed: matmuls at 85% of peak, full recomputation, memory-bound ops 0.30, exposed communication 0.15, pipeline bubble with p = 4, m = 32. Useful model FLOPs fill about 45% of the step.](sys.flops-mfu/step-time)
+
+      **Reference points** (each in its own setting):
+      - PaLM 540B on TPU v4: 46.2%.
+      - Megatron-Turing NLG 530B on A100s: 30.2% (PaLM's calculation).
+      - GPT-3 on V100s: 21.3% (PaLM's calculation).
+      - Korthikanti et al. 1T on A100s, no data parallelism: 56.3%.
+      - Llama 3 405B on up to 16k H100s: 38–43%.
+
+      So 35–55% is typical for large dense runs. MoE runs often sit lower, because all-to-all communication and load imbalance add exposed time.
+
+      **Raising MFU, cheapest first:** remove host syncs and input stalls; fuse memory-bound ops (`torch.compile`, fused kernels, FlashAttention); give each GPU enough tokens to hide communication; prefer selective over full recomputation; raise $m$ to shrink bubbles; pick shapes that are multiples of 64/128.
+    source: 'Chowdhery et al. 2022 §4.1 (Table 3), App. B; Korthikanti et al. 2022 §6.3; Dubey et al. 2024 (Llama 3) §3.3.2; Narayanan et al. 2021 §2.2.1; Scaling Book Part 1 §"Where Does the Time Go?" (80–85%)'
+
+  - title: "Inference and other pitfalls"
+    body: |
+      **Inference is $2N$ per token.** There is no backward pass, so a forward costs $2N$ (plus $4Lsh$ for attention over the context).
+
+      **MFU is the wrong yardstick for decoding.** Generating one token at batch size 1 reads every weight once for $2N$ FLOPs: intensity ≈ 1 FLOP per byte in bf16, far below the H100 ridge of ≈ 295. For a 7B model:
+
+      $$\begin{aligned} T &\ge \frac{14 \text{ GB}}{3.35 \text{ TB/s}} \approx 4.2 \text{ ms/token} \\ \text{MFU} &\approx \frac{2 \cdot 7\text{e}9 / 4.2\text{e-}3}{989\text{e}12} \approx 0.3\% \end{aligned}$$
+
+      That is the *best case*, not a bug. Report achieved memory bandwidth instead, and raise intensity by batching requests. Prefill (processing the prompt) is a large matmul over many tokens and can be compute-bound. Details are in `llm.kv-cache`.
+
+      **Common mistakes.**
+      - Using the sparse or the wrong-precision peak.
+      - Quoting a TFLOP/s-per-GPU figure that includes recomputation as if it were MFU, e.g. Megatron's 140 TFLOP/s.
+      - Counting total rather than active parameters for an MoE.
+      - Counting input-embedding parameters in $N$ (small for big models, but noticeable for small ones with large vocabularies).
+      - Mixing the "relative to $6N$" and "share of total" readings of the attention term.
+      - Forgetting that $6N$ is FLOPs per *token*: per step, multiply by tokens per step (global batch × sequence length), not by sequences.
+    source: 'Scaling Book Part 4 §"Forward and reverse FLOPs", §"Key-Value (KV) caching"; Chowdhery et al. 2022 App. B; Narayanan et al. 2021 §5.1'
+
+  - title: "What interviewers probe"
+    body: |
+      - *Derive 6N.* Forward $2bkm$ per matmul. Backward needs $\partial L/\partial X$ and $\partial L/\partial W$, each $2bkm$. Total $6bkm$, i.e. 6 FLOPs per parameter per token.
+      - *Compute MFU from 3,000 tokens/s/GPU for a 7B on H100.* $6\cdot7\text{e}9\cdot3000/989\text{e}12 \approx 12.7\%$.
+      - *Estimate days to train 70B on 15T tokens on 16k H100s.* $6.3\text{e}24 / (16384 \cdot 989\text{e}12 \cdot 0.4) \approx 11$ days.
+      - *MFU vs HFU?* HFU counts recomputation and other executed FLOPs; MFU only model FLOPs. Full recomputation makes HFU $= \tfrac43$ MFU.
+      - *Turn on full recomputation at fixed batch: what happens?* Step time ×4/3 if compute-bound; MFU ×3/4; HFU unchanged.
+      - *When does attention change the count?* When $s$ is comparable to $6h$ (standard MLP) or $8h$ (gated $F = 4h$).
+      - *Chained estimate:* 13B model, 4k context, 64 H100s, ZeRO-3 + full recomputation, 1M tokens per step, 40% MFU.
+        - Step time $= 6\cdot13\text{e}9\cdot10^6 / (0.4 \cdot 64 \cdot 989\text{e}12) \approx 3.1$ s.
+        - HFU $= 40\% \times 4/3 \approx 53\%$.
+        - Tokens per GPU $= 10^6/64 \approx 15{,}600$, far above the ≈ 2,470 needed to hide data-parallel traffic. ZeRO-3 moves about 1.5× DDP's bytes, but its forward all-gather overlaps the forward pass, so bytes per FLOP are the same in both phases and the threshold stays ≈ $C/W$ (`sys.zero`). Communication can be hidden.
+    source: 'Scaling Book Part 4 §"Forward and reverse FLOPs"; Chowdhery et al. 2022 App. B; Korthikanti et al. 2022 §6.3; Scaling Book Part 12 §"Rooflines for LLM Scaling on GPUs"'
+
+  - title: "Key results"
+    body: |
+      $$\text{matmul } [b,k]\times[k,m]: \; 2bkm \text{ FLOPs}$$
+
+      $$\text{train/token} \approx 6N + 12Lsh, \quad \text{infer} \approx 2N$$
+
+      $$\frac{\text{attention}}{6N} = \frac{s}{6h} \;\; (N \approx 12Lh^2)$$
+
+      $$\text{MFU} = \frac{\text{tokens/s}\cdot 6N}{n\,C}$$
+
+      $$T_{train} = \frac{6ND}{n\,C\,\text{MFU}}$$
+
+      - HFU includes recomputation: full recompute gives $8N$ per token, HFU $= \tfrac43$ MFU; selective ≈ $1 + s/18h$ (paper prints $s/6h$).
+      - Megatron's $8TP/(nX)$ is the same formula with recomputation-inclusive $X$.
+      - Typical large dense MFU 35–55% (PaLM 46.2%, Llama 3 405B 38–43%).
+      - Use dense, matching-precision peak; active params for MoE; MFU is meaningless for memory-bound decoding.
+    source: 'Scaling Book Part 4; Chowdhery et al. 2022 App. B; Korthikanti et al. 2022 §6.3, App. A; Narayanan et al. 2021 §5.1'
+
+quiz:
+  - id: q1
+    prompt: |
+      Why does the backward pass of a linear layer cost about twice its forward pass in FLOPs?
+    correct: It runs two forward-sized matmuls, for the input and weight gradients
+    wrong:
+      - The chain rule multiplies each Jacobian twice, once per direction of the graph
+      - It must first recompute the forward pass to recover the activations it needs
+      - Gradients are accumulated in fp32, which costs twice the FLOPs of bf16 math
+    explanation: |
+      Backprop needs $\partial L/\partial X = G W^\top$ to continue to earlier layers and $\partial L/\partial W = X^\top G$ for the update. Each uses the same three dimensions as $XW$, so each costs $2bkm$. Recomputing the forward is optional (checkpointing) and would add a third pass. Precision changes speed, not the FLOP count.
+    source: 'Scaling Book Part 4 §"Forward and reverse FLOPs"; Narayanan et al. 2021 Appendix'
+
+  - id: q2
+    prompt: |
+      A 13B-parameter dense model trains at 4,000 tokens/s per H100 (dense bf16 peak 989 TFLOP/s). Ignoring attention FLOPs, what is its MFU?
+    correct: About 32%
+    wrong:
+      - About 11%
+      - About 42%
+      - About 16%
+    explanation: |
+      $6 \times 13\text{e}9 \times 4000 / 989\text{e}12 \approx 0.315$. 11% uses $2N$, the inference cost. 42% uses $8N$, which would be HFU with full recomputation, not MFU. 16% divides by the spec sheet's 1,979 TFLOP/s "with sparsity" peak.
+    source: 'Chowdhery et al. 2022 App. B'
+
+  - id: q3
+    prompt: |
+      Roughly how long does it take to train an 8B dense model on 15T tokens using 2,048 H100s (989 TFLOP/s each) at 40% MFU, ignoring attention FLOPs?
+    correct: About 10 days
+    wrong:
+      - About 3.4 days
+      - About 14 days
+      - About 100 days
+    explanation: |
+      $6ND = 6\cdot8\text{e}9\cdot1.5\text{e}13 = 7.2\times10^{23}$ FLOPs. Delivered rate $2048\cdot989\text{e}12\cdot0.4 \approx 8.1\times10^{17}$ FLOP/s. That gives $8.9\times10^5$ s ≈ 10.3 days. 3.4 days uses $2ND$ (forward only). 14 days counts the recomputation FLOPs ($8ND$) as model FLOPs at the same 40%. 100 days is off by 10×.
+    source: 'Narayanan et al. 2021 §5.1; Chowdhery et al. 2022 App. B'
+
+  - id: q4
+    prompt: |
+      A run is compute-bound. You enable full activation recomputation and change nothing else (same batch, same parallelism, same kernel efficiency). What happens?
+    correct: Step time ×4/3; MFU ×3/4; HFU unchanged
+    wrong:
+      - Step time unchanged; MFU unchanged; HFU ×4/3
+      - Step time ×4/3; MFU unchanged; HFU ×3/4
+      - Step time ×4/3; MFU ×3/4; HFU ×3/4
+    explanation: |
+      Hardware FLOPs per token go from $6N$ to $8N$ at the same FLOP/s, so time grows by $8/6$. MFU counts only the $6N$ model FLOPs over the longer time: ×3/4. HFU counts all $8N$ over that time: unchanged. "Step time unchanged" would need the extra forward to be free, which it isn't when compute-bound. The memory saved only pays off if you then raise the batch or cut parallelism.
+    source: 'Korthikanti et al. 2022 §6.3; Chowdhery et al. 2022 §4.1'
+
+  - id: q5
+    prompt: |
+      Which statement about MFU and HFU is **false**?
+    correct: MFU counts recomputed FLOPs, since the hardware runs them
+    wrong:
+      - HFU is at least as large as MFU for the same training run
+      - An MoE's MFU should be computed from its active parameters per token
+      - Using a spec sheet's "with sparsity" peak roughly halves the reported MFU
+    explanation: |
+      MFU's numerator is the model FLOPs of one forward and backward pass, independent of implementation, so recomputation is excluded. HFU is the metric that counts it, hence HFU ≥ MFU. MoE tokens only run $k$ experts, so active parameters set the FLOPs. A doubled peak halves the ratio.
+    source: 'Chowdhery et al. 2022 §4.1, App. B; Korthikanti et al. 2022 §6.3'
+
+  - id: q6
+    prompt: |
+      A dense transformer has $h = 5120$, a standard $4h$ MLP (so $N \approx 12Lh^2$) and trains at $s = 8192$. Counting attention-score FLOPs as $12Lsh$ per token (no causal halving), how large are they relative to $6N$?
+    correct: About 27%
+    wrong:
+      - About 13%
+      - About 160%
+      - About 4%
+    explanation: |
+      The ratio is $12Lsh/(6\cdot12Lh^2) = s/(6h) = 8192/30720 \approx 0.27$. 13% halves it, the causal-kernel convention the question excludes. 160% is $s/h$, dropping the factor 6. 4% divides by $36h$ instead of $6h$.
+    source: 'Scaling Book Part 4 §"Fractional cost of attention with context length"; Korthikanti et al. 2022 App. A'
+
+  - id: q7
+    prompt: |
+      Megatron-LM reports 140 TFLOP/s per A100 (peak 312) for GPT-3 175B, counting the extra forward pass of full activation recomputation. What is the corresponding MFU?
+    correct: About 34%
+    wrong:
+      - About 45%
+      - About 60%
+      - About 22%
+    explanation: |
+      140/312 ≈ 44.9% is the HFU, because 140 TFLOP/s includes the $8N$-per-token recomputation work. Model FLOPs are $6N$, so MFU ≈ $44.9\% \times 6/8 \approx 33.7\%$. 60% scales the wrong way ($\times 4/3$). 22% roughly halves it.
+    source: 'Narayanan et al. 2021 §5.1 (eq. 3); Chowdhery et al. 2022 §4.1'
+
+  - id: q8
+    prompt: |
+      A 7B model decodes one token at a time at batch size 1 on an H100 and measures about 0.3% MFU. What is the right conclusion?
+    correct: Near the best possible; decoding is memory-bound, so judge it by bandwidth
+    wrong:
+      - The kernels are badly written; a good implementation should reach 30–40% MFU
+      - The GPU is overhead-bound; CUDA graphs would bring it close to peak FLOP/s
+      - Decoding uses fp32 accumulation, which runs at about 1% of the bf16 peak
+    explanation: |
+      Each token reads all 14 GB of bf16 weights for $2N = 1.4\times10^{10}$ FLOPs, intensity ≈ 1. The bandwidth bound is ≈ 4.2 ms/token, i.e. ≈ 3.4 TFLOP/s, about 0.3% of 989. Batching requests raises intensity; kernel tuning cannot. CUDA graphs remove launch gaps but cannot beat the bandwidth bound. Tensor Cores accumulate in fp32 at full speed.
+    source: 'Scaling Book Part 4 §"Key-Value (KV) caching"; NVIDIA Matrix Multiplication Background §2 (GEMV)'
+
+  - id: q9
+    prompt: |
+      You must train a 7B model on 1.4T tokens within 7 days on 256 H100s (989 TFLOP/s each). What MFU do you need, ignoring attention FLOPs?
+    correct: About 38%
+    wrong:
+      - About 19%
+      - About 51%
+      - About 77%
+    explanation: |
+      $6ND = 5.88\times10^{22}$. Seven days is 604,800 s, so the required delivered rate is $9.7\times10^{16}$ FLOP/s out of $256\times989\text{e}12 = 2.53\times10^{17}$: 38%. 51% uses $8N$. 19% halves the FLOPs. 77% doubles them.
+    source: 'Chowdhery et al. 2022 App. B; Narayanan et al. 2021 §5.1'
+
+  - id: q10
+    prompt: |
+      A mixture-of-experts model has 47B total parameters, of which 13B are active per token. It trains at 2,000 tokens/s per H100 (989 TFLOP/s). What MFU should you report?
+    correct: About 16%, using the 13B active parameters
+    wrong:
+      - About 57%, using all 47B parameters
+      - About 36%, averaging total and active parameters
+      - About 5%, using the active parameters and $2N$
+    explanation: |
+      Each token only runs through its selected experts, so model FLOPs per token are $6 \times 13\text{e}9$: $6\cdot13\text{e}9\cdot2000/989\text{e}12 \approx 15.8\%$. Using all 47B counts FLOPs that were never needed and inflates MFU to 57%. $2N$ is the inference cost.
+    source: 'Scaling Book Part 4 §"Sparsity and Mixture-of-Experts"; Chowdhery et al. 2022 App. B'
+
+  - id: q11
+    prompt: |
+      For a decoder-only LM with *untied* input and output embeddings, which parameters should be left out of $N$ when estimating training FLOPs as $6N$ per token?
+    correct: The input embedding table, since a lookup does no multiply-adds
+    wrong:
+      - The LM head, since its output is only used by the loss
+      - The attention output projections, since they follow the softmax
+      - The MLP down-projections, since they are memory-bound in practice
+    explanation: |
+      An embedding lookup copies a row; it has no multiply-adds, forward or backward. The LM head is a real $[tokens, h]\times[h, V]$ matmul with $6hV$ training FLOPs per token. Output and down-projections are ordinary parameter matmuls. Whether a matmul is memory-bound affects its time, not its FLOP count.
+    source: 'Narayanan et al. 2021 Appendix; Scaling Book Part 4 §"Other Operations"'
+
+  - id: q12
+    prompt: |
+      Using $6ND$, about how many FLOPs did it take to train GPT-3 (175B parameters, 300B tokens)?
+    correct: About $3.2\times10^{23}$
+    wrong:
+      - About $1.1\times10^{23}$
+      - About $4.2\times10^{23}$
+      - About $3.2\times10^{20}$
+    explanation: |
+      $6 \times 1.75\text{e}11 \times 3\text{e}11 = 3.15\times10^{23}$. $1.1\times10^{23}$ is $2ND$, a forward pass only. $4.2\times10^{23}$ is $8ND$, the hardware FLOPs with full recomputation. $10^{20}$ drops three orders of magnitude, e.g. by taking 300B as $3\times10^8$.
+    source: 'Narayanan et al. 2021 §5.1; Scaling Book Part 4 §"General rule of thumb"'
+
+cards:
+  - id: f1
+    front: FLOPs of a matmul $[b,k]\times[k,m]$, and the training cost per parameter per token?
+    back: |
+      $2bkm$ (one multiply and one add per term). Forward: 2 FLOPs per parameter per token. Backward: input grad + weight grad, 4 more. Training ≈ $6N$ per token, $6ND$ total.
+    source: 'Scaling Book Part 4 §"Counting Dots", §"Forward and reverse FLOPs"'
+
+  - id: f2
+    front: Per-token training FLOPs of a dense transformer including attention, and when attention matters?
+    back: |
+      $$6N + 12Lsh$$
+
+      With $N \approx 12Lh^2$ (standard $4h$ MLP), attention/$6N = s/(6h)$; for a gated MLP with $F = 4h$ it is $s/(8h)$. No causal halving in this count. Example: 7B-class at $s = 4096$: +15.3% relative to $6N$ (13.3% of total).
+    source: 'Scaling Book Part 4 §"Attention", §"Fractional cost of attention with context length"; Chowdhery et al. 2022 App. B'
+
+  - id: f3
+    front: Define MFU and give its formula.
+    back: |
+      Observed tokens/s divided by the tokens/s the system would reach doing only the model's forward+backward FLOPs at peak:
+
+      $$\text{MFU} = \frac{\text{tokens/s}\cdot(6N + 12Lsh)}{n\,C}$$
+
+      Drop $12Lsh$ if not counting attention, and say so. Use dense peak at the matmul precision, and active params for MoE.
+    source: 'Chowdhery et al. 2022 §4.1, App. B'
+
+  - id: f4
+    front: Define HFU. How do full and selective recomputation change hardware FLOPs?
+    back: |
+      HFU = FLOPs actually executed per step (including recomputation) / (step time × peak). HFU ≥ MFU.
+      - Full recompute: $8N$ per token, HFU $= \tfrac43$ MFU.
+      - Selective (score and value matmuls only): hardware/model ≈ $1 + s/(18h)$ from the term-by-term count (Korthikanti's eq. 9 prints $1 + s/6h$).
+      - Examples: PaLM MFU 46.2%, HFU 57.8%; Korthikanti 1T MFU 56.3%, HFU 57.0%.
+    source: 'Korthikanti et al. 2022 §6.3, App. A; Chowdhery et al. 2022 §4.1'
+
+  - id: f5
+    front: Training-time formula, and how Megatron's $8TP/(nX)$ relates to it?
+    back: |
+      $$T_{train} = \frac{6ND}{n\,C\,\text{MFU}}$$
+
+      Megatron's $8TP/(nX)$ uses achieved FLOP/s $X$ that includes the recomputation forward ($8N$ per token). Since $\tfrac{6}{8}X$ is the model FLOP/s, the two agree. GPT-3: 1,024 A100s at 140 TFLOP/s → ≈ 34 days.
+    source: 'Narayanan et al. 2021 §5.1 (eq. 4)'
+
+  - id: f6
+    front: Published MFU reference points for large dense runs?
+    back: |
+      - PaLM 540B (TPU v4): 46.2% (45.7% without attention).
+      - Megatron-Turing NLG 530B (A100): 30.2%.
+      - GPT-3 (V100): 21.3%.
+      - Korthikanti et al. 1T (A100, no DP): 56.3%.
+      - Llama 3 405B (H100): 38–43%.
+
+      Typical: 35–55%.
+    source: 'Chowdhery et al. 2022 Table 3, App. B; Korthikanti et al. 2022 §6.3; Dubey et al. 2024 §3.3.2'
+
+  - id: f7
+    type: open
+    front: Derive the 6N rule for training FLOPs and state what it leaves out.
+    back: |
+      1. A matmul $[b,k]\times[k,m]$ costs $2bkm$. With $b$ tokens and $km$ weights, that is 2 FLOPs per parameter per token.
+      2. Backward, given $G = \partial L/\partial Y$: $\partial L/\partial X = GW^\top$ ($[b,m]\times[m,k]$) and $\partial L/\partial W = X^\top G$ ($[k,b]\times[b,m]$), each $2bkm$.
+      3. Total $6bkm$. Summed over all weight matrices: $6N$ per token, $6ND$ per run.
+      4. **Left out**:
+         - attention-score matmuls ($12Lsh$ per token, not parameter matmuls);
+         - elementwise/norm/softmax FLOPs ($O(h)$ per token, negligible in FLOPs, not in time);
+         - embedding lookups (zero FLOPs);
+         - the optimizer step ($O(N)$ per step);
+         - recomputation (counted in HFU, not here).
+      5. **Conventions**: causal halving of attention, tied embeddings counted once, MoE uses active parameters.
+    source: 'Scaling Book Part 4 §"Forward and reverse FLOPs", §"General rule of thumb"; Chowdhery et al. 2022 App. B'
+
+  - id: f8
+    type: open
+    front: Estimate how long a 70B dense model takes to train on 15T tokens on 16,384 H100s, stating assumptions.
+    back: |
+      - **FLOPs**: $6ND = 6\cdot7\text{e}10\cdot1.5\text{e}13 = 6.3\times10^{24}$. Attention at 8k context adds roughly 10–20% for a model of this width; state whether you include it.
+      - **Rate**: H100 dense bf16 989 TFLOP/s; assume 40% MFU (typical 35–55%). $16384\cdot989\text{e}12\cdot0.4 \approx 6.5\times10^{18}$ FLOP/s.
+      - **Time**: $6.3\text{e}24/6.5\text{e}18 \approx 9.7\times10^5$ s ≈ 11 days of uninterrupted training.
+      - **Sanity**: at 40% MFU each GPU does about $0.4\cdot989\text{e}12/(6\cdot7\text{e}10) \approx 940$ tokens/s.
+      - **Caveats**: failures and restarts (Llama 3 saw 466 interruptions in 54 days), evaluation and checkpoint overhead, batch-size ramps. Real wall-clock is longer.
+    source: 'Chowdhery et al. 2022 App. B; Narayanan et al. 2021 §5.1; Dubey et al. 2024 §3.3.4'
+
+  - id: f9
+    type: open
+    front: "Chained estimate: 13B model, 4k context, 64 H100s, ZeRO-3 + full recomputation, 1M tokens per step, 40% MFU. Step time, HFU, and is communication hideable?"
+    back: |
+      - **Model FLOPs per step**: $6\cdot13\text{e}9\cdot10^6 = 7.8\times10^{16}$. Attention ($L = 40$, $h = 5120$, $s = 4096$) adds ≈ 13% if counted.
+      - **Step time** at 40% MFU: $7.8\text{e}16/(0.4\cdot64\cdot989\text{e}12) \approx 3.1$ s.
+      - **HFU**: full recompute → $8N$, so HFU $= 40\%\times4/3 \approx 53\%$.
+      - **Communication**: $10^6/64 \approx 15{,}600$ tokens per GPU. Data-parallel gradient sync hides behind the backward pass above ≈ 2,470 tokens/GPU across nodes (bf16, `sys.roofline`). ZeRO-3 adds parameter all-gathers (≈ 1.5× DDP's bytes), but the forward all-gather overlaps the forward pass, so the threshold stays ≈ $C/W$ (`sys.zero`). Large margin: communication should hide if overlap is implemented.
+      - **Caveat**: these are steady-state, perfect-overlap estimates.
+    source: 'Chowdhery et al. 2022 App. B; Korthikanti et al. 2022 §6.3; Scaling Book Part 12 §"Rooflines for LLM Scaling on GPUs"; Rajbhandari et al. 2020 §7'
+
+  - id: f10
+    type: open
+    front: Your large training run sits at 25% MFU on H100s. Explain where the other 75% could be going and what you'd do, in order.
+    back: |
+      **Decompose the step time** (profile one step):
+      1. Matmul kernel efficiency: at best 80–85% of peak. Check shapes for tile/wave quantisation (multiples of 64/128).
+      2. Recomputation: full recompute alone costs a quarter of MFU. Switch to selective if memory allows.
+      3. Memory-bound ops: norms, activations, softmax, optimizer. Fuse (`torch.compile`, fused kernels, FlashAttention).
+      4. Exposed communication: tokens per GPU vs $C/W$; TP across nodes; missing overlap of gradient sync.
+      5. Pipeline bubbles: $(p-1)/(m+p-1)$; raise micro-batches or use interleaved schedules.
+      6. Host and input: syncs (`.item()`), data-loader stalls, stragglers.
+
+      **Order**: fix the cheapest large items first (syncs, input, fusion), then the parallelism layout. Re-measure MFU after each change, keeping the FLOP convention fixed.
+    source: 'Chowdhery et al. 2022 §4.1; Korthikanti et al. 2022 §5–6; Narayanan et al. 2021 §2.2.1, §3; He 2022'
+
+reading:
+  - title: "Chowdhery et al. (2022), PaLM: Scaling Language Modeling with Pathways (§4.1, Appendix B)"
+    url: https://arxiv.org/abs/2204.02311
+    kind: paper
+    note: Introduces MFU, explains why HFU is a poor metric, and shows the full MFU calculation for PaLM and earlier models.
+  - title: "Korthikanti et al. (2022), Reducing Activation Recomputation in Large Transformer Models (§6.3, Appendix A)"
+    url: https://arxiv.org/abs/2205.05198
+    kind: paper
+    note: Exact model and hardware FLOP formulas for GPT-style models, and MFU/HFU results with selective recomputation.
+  - title: "Narayanan et al. (2021), Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (§5.1, Appendix)"
+    url: https://arxiv.org/abs/2104.04473
+    kind: paper
+    note: The 96Bslh² FLOP count with recomputation and the 8TP/(nX) training-time estimate, with GPT-3 and 1T examples.
+  - title: "Scaling Book Part 4: All the Transformer Math You Need to Know"
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    kind: book
+    note: Clean derivations of forward/backward FLOPs, per-layer parameter and FLOP tables, and the attention fraction vs context length.

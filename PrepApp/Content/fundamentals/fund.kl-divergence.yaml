@@ -1,0 +1,500 @@
+id: fund.kl-divergence
+area: fundamentals
+title: KL & Jensen–Shannon Divergences
+summary: KL divergence from coding cost to Gibbs' inequality, its properties and Gaussian closed form, forward vs reverse fits and which direction each method uses, and Jensen–Shannon with why it saturates in GANs.
+order: 100
+level: core
+tags: [information-theory, probability, divergences, variational-inference, generative-models]
+prereqs: [fund.information-theory]
+
+explainer:
+  - title: "The problem: how far is a model from the truth?"
+    body: |
+      Many ML problems need one number for how badly a distribution $q$ approximates a target $p$: a model vs the data, an approximate vs the true posterior, a fine-tuned policy vs its starting point. The previous lesson supplies one. Coding samples of $p$ with a code built for $q$ costs $H(p,q)$ on average, while the best possible code costs $H(p)$. The excess is the **Kullback–Leibler (KL) divergence**:
+
+      $$\begin{aligned} \mathrm{KL}(p\|q) &= H(p,q)-H(p) \\ &= \sum_x p(x)\log\frac{p(x)}{q(x)} \\ &= \mathbb{E}_{x\sim p}\Big[\log\frac{p(x)}{q(x)}\Big]. \end{aligned}$$
+
+      For densities, replace the sum with $\int p\log(p/q)\,dx$. Read it as the average log-likelihood ratio between $p$ and $q$ on samples drawn from $p$. It is measured in nats with $\ln$ and in bits with $\log_2$.
+
+      **Conventions at zero.**
+      - A term with $p(x)=0$ contributes 0, since $t\log t\to0$.
+      - A term with $p(x)>0$ and $q(x)=0$ contributes $+\infty$.
+      - So $\mathrm{KL}(p\|q)<\infty$ requires $q>0$ everywhere $p>0$: the support of $p$ must lie inside the support of $q$.
+
+      **Worked example** with $p=(\tfrac12,\tfrac12)$ and $q=(0.9,0.1)$:
+
+      $$\begin{aligned} \mathrm{KL}(p\|q) &= \tfrac12\ln\tfrac{0.5}{0.9}+\tfrac12\ln\tfrac{0.5}{0.1} \\ &= \tfrac12(-0.588)+\tfrac12(1.609) \\ &= 0.511\ \text{nats} \end{aligned}$$
+
+      $$\begin{aligned} \mathrm{KL}(q\|p) &= 0.9\ln1.8+0.1\ln0.2 \\ &= 0.529-0.161=0.368\ \text{nats} \end{aligned}$$
+
+      Two things to notice. First, individual terms can be negative ($-0.588$); only the total is guaranteed to be non-negative. Second, the two directions differ. $\mathrm{KL}(p\|q)$ averages over $p$, so it is dominated by the outcome $p$ thinks is common but $q$ thinks is rare: $q$ gives the second outcome only 0.1.
+    source: Murphy PML1 §6.2.1–6.2.2; Goodfellow DL §3.13; MacKay ITILA §2.6
+
+  - title: "KL ≥ 0: Gibbs' inequality"
+    body: |
+      **Claim.** $\mathrm{KL}(p\|q)\ge0$, with equality iff $p=q$ (almost everywhere, for densities).
+
+      **Proof.** Let $A=\{x:p(x)>0\}$ be the support of $p$. Use Jensen for the concave log, $\mathbb{E}\log Y\le\log\mathbb{E}Y$, with $Y=q(X)/p(X)$ and $X\sim p$:
+
+      $$\begin{aligned} -\mathrm{KL}(p\|q) &= \sum_{x\in A}p(x)\log\frac{q(x)}{p(x)} \\ &\le \log\sum_{x\in A}p(x)\frac{q(x)}{p(x)} \\ &= \log\sum_{x\in A}q(x) \\ &\le \log 1 = 0. \end{aligned}$$
+
+      **Where equality can hold.**
+      - The first inequality is Jensen. Because log is *strictly* concave, it is tight only if $q/p$ is constant on $A$, i.e. $q=c\,p$ there.
+      - The second inequality holds because $q$ may put mass outside $A$. It is tight only if $\sum_{x\in A}q(x)=1$, which forces $c=1$.
+      - So $\mathrm{KL}=0$ exactly when $q=p$.
+
+      **A one-line alternative.** The tangent bound $\log t\le t-1$ gives $\sum_A p\log\frac qp\le\sum_A p\big(\frac qp-1\big)=\sum_A q-1\le0$. The same bound underlies the $k_3$ KL estimator used in RLHF and GRPO.
+
+      **Why the inequality matters.** It is behind $H(p,q)\ge H(p)$, $I(X;Y)\ge0$, the maximum-entropy results, and every bound of the form "drop a KL term to get an inequality", such as the ELBO.
+
+      **Evidence view.** By Bayes' rule, after observing $x$ the log-odds of hypothesis $P$ over $Q$ rise by $\log\frac{p(x)}{q(x)}$, the *weight of evidence*. So $\mathrm{KL}(p\|q)$ is the expected evidence per sample in favour of $P$ when $P$ is true. Non-negativity says that, on average, data push you towards the truth. With $n$ i.i.d. samples, the expected log-likelihood ratio is $n\,\mathrm{KL}(p\|q)$, so a larger KL means $P$ and $Q$ can be told apart with fewer samples.
+    source: MacKay ITILA §2.6–2.7; Murphy PML1 §6.2.4; Murphy PML2 §5.1.2.2, §5.1.3.3
+
+  - title: Properties
+    body: |
+      **Asymmetric, and not a metric.** The worked example gave $0.511\neq0.368$. KL also breaks the triangle inequality: it behaves like a *squared* distance, so going via a midpoint can be "shorter" than going directly. The Gaussian card gives a two-line example.
+
+      **Infinite on support mismatch.** If $p$ puts mass where $q$ has none, $\mathrm{KL}(p\|q)=\infty$. Two distributions on non-aligned low-dimensional manifolds have infinite KL in both directions, however close the manifolds are.
+
+      **Invariant to invertible reparameterizations.** Let $y=f(x)$ with $f$ invertible. Both densities pick up the *same* Jacobian factor: $p_Y(y)=p_X(x)\,|dx/dy|$ and $q_Y(y)=q_X(x)\,|dx/dy|$. The factor cancels in the ratio, so
+
+      $$\frac{p_Y(y)}{q_Y(y)}=\frac{p_X(x)}{q_X(x)}\ \Rightarrow\ \mathrm{KL}(p_Y\|q_Y)=\mathrm{KL}(p_X\|q_X).$$
+
+      Differential entropy, by contrast, shifts by $\log|a|$ under $x\mapsto ax$. KL measures the distributions, not the coordinates.
+
+      **Chain rule.** Split $\log\frac{p(x,y)}{q(x,y)}=\log\frac{p(x)}{q(x)}+\log\frac{p(y\mid x)}{q(y\mid x)}$ and take $\mathbb{E}_p$:
+
+      $$\begin{aligned} \mathrm{KL}(p(x,y)\|q(x,y)) &= \mathrm{KL}(p(x)\|q(x)) \\ &\ +\mathbb{E}_{p(x)}\mathrm{KL}(p(y\mid x)\|q(y\mid x)). \end{aligned}$$
+
+      Consequences:
+      - For independent factors, KLs **add**. For example, a diagonal-Gaussian VAE's KL is a sum over latent dimensions, and $n$ i.i.d. copies give $n\,\mathrm{KL}$.
+      - The conditional term is $\ge0$, so marginalizing can only *lower* KL: $\mathrm{KL}(p(x,y)\|q(x,y))\ge\mathrm{KL}(p(x)\|q(x))$. More generally, passing both distributions through the same noisy channel cannot increase KL (the data processing inequality for KL).
+    source: Murphy PML2 §5.1.2.3, §5.1.2.5, §5.1.3.2, §5.1.5.2; Arjovsky & Bottou 2017 Thm 2.3
+
+  - title: "Gaussian KL in closed form"
+    body: |
+      **Univariate derivation.** Let $p=\mathcal N(\mu_1,\sigma_1^2)$ and $q=\mathcal N(\mu_2,\sigma_2^2)$. The log-ratio is
+
+      $$\begin{aligned} \log\frac{p(x)}{q(x)} &= \log\frac{\sigma_2}{\sigma_1}-\frac{(x-\mu_1)^2}{2\sigma_1^2} \\ &\quad+\frac{(x-\mu_2)^2}{2\sigma_2^2}. \end{aligned}$$
+
+      Take $\mathbb{E}_p$. By definition, $\mathbb{E}_p(x-\mu_1)^2=\sigma_1^2$. Writing $x-\mu_2=(x-\mu_1)+(\mu_1-\mu_2)$, the cross term has mean 0, so $\mathbb{E}_p(x-\mu_2)^2=\sigma_1^2+(\mu_1-\mu_2)^2$. Therefore
+
+      $$\begin{aligned} \mathrm{KL}(p\|q) &= \log\frac{\sigma_2}{\sigma_1}+\frac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2} \\ &\quad-\frac12. \end{aligned}$$
+
+      It has three parts: a log ratio of widths, a variance ratio, and the mean gap measured in units of $q$'s standard deviation.
+
+      **Special cases.**
+      - *Equal variances:* $\mathrm{KL}=\frac{(\mu_1-\mu_2)^2}{2\sigma^2}$. This is symmetric and is a squared distance, so the triangle inequality fails: $\mathcal N(0,1)\to\mathcal N(2,1)$ costs 2, but going via $\mathcal N(1,1)$ costs $0.5+0.5$.
+      - *The VAE term*, with $q=\mathcal N(0,1)$, per latent dimension:
+
+      $$\mathrm{KL}=\tfrac12\big(\mu^2+\sigma^2-1-\log\sigma^2\big).$$
+
+      With $\mu=1,\sigma=1$ it equals $0.5$.
+
+      - *Variance mismatch:* $\mathrm{KL}(\mathcal N(0,1)\|\mathcal N(0,2^2))=\ln2+\tfrac18-\tfrac12=0.318$, but the reverse is $-\ln2+2-\tfrac12=0.807$. A model that is too wide is cheap under $\mathrm{KL}(p\|q)$. A model that is too narrow is expensive.
+
+      ![The integrands behind 0.318 and 0.807. Each can go negative. $q\log(q/p)$ keeps growing in the tails, where the narrow $p$ is tiny.](fund.kl-divergence/kl-asymmetry)
+
+      **Multivariate** ($d$ dimensions). The tool is the trace trick: for a random vector $z$, $\mathbb{E}[z^\top Az]=\mathrm{tr}(A\,\mathrm{Cov}\,z)+(\mathbb{E}z)^\top A\,\mathbb{E}z$. Applied to $q$'s quadratic form under $p$, it gives $\mathbb{E}_p[(x-\mu_2)^\top\Sigma_2^{-1}(x-\mu_2)]=\mathrm{tr}(\Sigma_2^{-1}\Sigma_1)+\Delta^\top\Sigma_2^{-1}\Delta$, where $\Delta=\mu_2-\mu_1$. Applied to $p$'s own quadratic form, it gives $\mathrm{tr}(I)=d$. Together:
+
+      $$\begin{aligned} \mathrm{KL} = \tfrac12\Big[&\mathrm{tr}(\Sigma_2^{-1}\Sigma_1)+\Delta^\top\Sigma_2^{-1}\Delta \\ &-d+\log\tfrac{\det\Sigma_2}{\det\Sigma_1}\Big]. \end{aligned}$$
+
+      The trace compares spreads, the quadratic form is a Mahalanobis mean gap, the log-det is a volume ratio, and $-d$ is $p$'s own quadratic term, which makes the total zero when $p=q$.
+    source: Murphy PML1 §6.2.3; Murphy PML2 §5.1.8.1; Bishop PRML Ex. 1.30
+
+  - title: "Forward vs reverse KL: mass-covering vs mode-seeking"
+    body: |
+      Fix a target $p$ and fit $q$ from a family that can't match $p$ exactly, say single Gaussians. The answer depends on the direction.
+
+      - **Forward** $\mathrm{KL}(p\|q)=\mathbb{E}_p[\log p-\log q]$ averages over $p$. It blows up wherever $p>0$ but $q\to0$, so $q$ must cover all of $p$'s mass (*zero-avoiding*). Mass that $q$ puts where $p=0$ costs almost nothing, because those points have weight $p(x)=0$.
+      - **Reverse** $\mathrm{KL}(q\|p)=\mathbb{E}_q[\log q-\log p]$ averages over $q$. It blows up wherever $q>0$ but $p\to0$, so $q$ stays out of low-density regions (*zero-forcing*). Missing part of $p$ is cheap.
+
+      ![Equal-weight mixture of $\mathcal N(\pm2,0.6^2)$. Forward KL gives $\mathcal N(0,4.36)$, peaked where $p$ has almost no mass. Reverse KL hugs one mode.](fund.kl-divergence/forward-vs-reverse)
+
+      **Forward KL is moment matching.** The $H(p)$ part is constant, so we minimize $\mathbb{E}_p[-\log q]=\tfrac12\log(2\pi s^2)+\frac{\mathbb{E}_p(X-m)^2}{2s^2}$ for $q=\mathcal N(m,s^2)$. Setting $\partial/\partial m=0$ gives $m=\mathbb{E}_pX$. Setting $\partial/\partial s=0$ then gives $s^2=\mathrm{Var}_p X$. For the mixture above, $m=0$ and $s^2=0.6^2+2^2=4.36$. In general, for an exponential-family $q$, the forward-KL optimum matches the expected sufficient statistics of $p$.
+
+      **Reverse KL picks a mode.** If $q$ sits on a well-separated component $k$ of weight $w_k$ and has its shape, then $p\approx w_k p_k$ where $q$ has mass, so
+
+      $$\mathrm{KL}(q\|p)\approx\mathbb{E}_q\Big[\log\frac{q}{w_kp_k}\Big]=-\log w_k.$$
+
+      With equal weights, both modes give $\ln2\approx0.69$. These are two separate optima, and the optimizer finds the one nearer its initialization. The moment-matched Gaussian scores 1.27 here, because it pays for its mass in the gap. With unequal weights the heavier mode wins: $-\ln0.7=0.36$ vs $-\ln0.3=1.20$.
+
+      **Caveats.**
+      - If the modes are not well separated, reverse KL can also blur them.
+      - For a factorized Gaussian $q$ fit to a correlated Gaussian $p$, forward KL gives variances that are too broad and reverse KL too narrow (see q2 and f6).
+
+    source: Murphy PML1 §6.2.6; Murphy PML2 §5.1.4.1–5.1.4.3; Bishop PRML §10.1.2; Goodfellow DL §3.13 (Fig. 3.6)
+
+  - title: "Which direction where, and why"
+    body: |
+      The direction is usually forced by which distribution you can **sample from** and which you can **evaluate**.
+
+      **Maximum likelihood and classic distillation: forward.** We have samples from $p_{\text{data}}$ but no formula for it. $\mathrm{KL}(p_{\text{data}}\|q_\theta)=-H(p_{\text{data}})+\mathbb{E}_{p_{\text{data}}}[-\log q_\theta]$ needs only data samples and $\log q_\theta$, and minimizing it is MLE. *Classic* distillation (a teacher $p$ into a student $q$ with soft-label cross-entropy) is also forward KL, pushing the student to cover everything the teacher considers plausible. For LLM students, MiniLLM and GKD instead minimize reverse KL on the student's own samples, so its limited capacity goes to the teacher's main modes (llm.distillation).
+
+      **Variational inference: reverse.** We want the posterior $p(z\mid x)=p(x,z)/p(x)$, but $p(x)$ is an intractable integral, and we cannot sample the posterior either. Reverse KL avoids both problems:
+
+      $$\begin{aligned} \mathrm{KL}(q\|p(\cdot\mid x)) &= \mathbb{E}_q[\log q(z)-\log p(x,z)] \\ &\quad+\log p(x). \end{aligned}$$
+
+      $\log p(x)$ does not depend on $q$, so we minimize $\mathbb{E}_q[\log q-\log p(x,z)]$ (the negative ELBO, gen.latent-variables-elbo). That needs only samples from $q$ and the *unnormalized* joint, whereas forward KL would need expectations under the posterior. The price is mode-seeking, overconfident posteriors.
+
+      **RLHF: reverse.** The usual objective is reward $-\beta\,\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})$, estimated on the policy's own samples. It punishes text the reference model finds unlikely, but does not force the policy to cover everything the reference might say.
+
+      **GANs: implicitly reverse-ish.** Arjovsky & Bottou show that with the discriminator at its optimum and held fixed, the popular non-saturating generator step follows $\nabla_\theta[\mathrm{KL}(P_g\|P_r)-2\,\mathrm{JSD}(P_g,P_r)]$ ($P_g$: generator, $P_r$: data). The reverse-KL term makes off-data samples costly and missed modes cheap, so it *predicts* sharp samples and **mode dropping**. But GANs trained to approximately minimize *forward* KL (via f-GAN) still give sharp samples and still use only a few modes, fewer than reverse KL would favour. So Goodfellow (2016, §3.2.5) attributes mode collapse mainly to the training dynamics, not to the divergence.
+    source: Murphy PML2 §5.1.4, §5.1.6; Bishop PRML §10.1.2; Arjovsky & Bottou 2017 §2.2 (Thm 2.5); Goodfellow 2016 (GAN tutorial) §3.2.5; Gu et al. 2023 (MiniLLM); Agarwal et al. 2023 (GKD) §2
+
+  - title: "Jensen–Shannon divergence"
+    body: |
+      KL is asymmetric and becomes infinite when the supports don't nest. A fix is to compare each distribution with their **mixture** $M=\tfrac12(P+Q)$, which is positive wherever either one is:
+
+      $$\mathrm{JSD}(P,Q)=\tfrac12\mathrm{KL}(P\|M)+\tfrac12\mathrm{KL}(Q\|M).$$
+
+      It is symmetric by construction. It is always finite, because $p/m\le2$ makes every log-ratio at most $\log 2$.
+
+      **JSD is a mutual information.** Flip a fair coin $Z$. If $Z=1$, draw $X\sim P$; otherwise draw $X\sim Q$. The marginal of $X$ is $M$. Then
+
+      $$\begin{aligned} I(X;Z) &= \mathbb{E}\Big[\log\frac{p(x\mid z)}{p(x)}\Big] \\ &= \textstyle\sum_z p(z)\,\mathrm{KL}(p(x\mid z)\|M) \\ &= \tfrac12\mathrm{KL}(P\|M)+\tfrac12\mathrm{KL}(Q\|M). \end{aligned}$$
+
+      So JSD measures how much one sample tells you about which distribution produced it. Three facts follow at once:
+      - **Bounds:** $0\le\mathrm{JSD}=H(Z)-H(Z\mid X)\le H(Z)=\log2$. In bits the maximum is 1.
+      - **The maximum** $\log2$ is reached iff $H(Z\mid X)=0$, i.e. one sample always reveals its source. That happens iff the supports are disjoint.
+      - **The optimal discriminator.** The best classifier of $Z$ from $x$ is $P(Z{=}1\mid x)=\frac{p(x)}{p(x)+q(x)}$, which is exactly the optimal GAN discriminator.
+
+      JSD is also an $f$-divergence.
+
+      **Metric:** JSD itself fails the triangle inequality (e.g. $\mathrm{JSD}(\delta_0,\mathrm{Bern}(\tfrac12))=0.216$, and twice that is less than $\mathrm{JSD}(\delta_0,\delta_1)=\log2$), but $\sqrt{\mathrm{JSD}}$ satisfies it and is a true metric (Endres & Schindelin, 2003).
+
+      **Small examples.** $P=(1,0)$ and $Q=(0,1)$ give $M=(\tfrac12,\tfrac12)$ and $\mathrm{JSD}=\log2$. $P=(\tfrac12,\tfrac12)$ and $Q=(0.9,0.1)$ give $\mathrm{JSD}=0.102$ nats, much smaller than either KL direction (0.511 and 0.368).
+    source: Murphy PML2 §26.2.2 (pdf p.931); Goodfellow et al. 2014 Prop. 1; Nowozin et al. 2016 Table 1
+
+  - title: "Why JSD saturates: GANs and disjoint supports"
+    body: |
+      With the optimal discriminator, the original minimax GAN's generator minimizes
+
+      $$C(G)=-\log4+2\,\mathrm{JSD}(p_{\text{data}},p_g)$$
+
+      in nats (gen.gans derives this). Training the generator is therefore JSD minimization, and JSD has a blind spot.
+
+      **Two point masses.** Let $P_0=\delta_0$ and $P_\theta=\delta_\theta$. For any $\theta\neq0$ the supports are disjoint, so:
+      - $\mathrm{JSD}=\log2$, whether $\theta=0.01$ or $\theta=10$.
+      - $\mathrm{KL}=\infty$ in both directions, and total variation is 1.
+      - The Wasserstein-1 distance, the minimum expected distance needed to transport $P_\theta$'s mass onto $P_0$, is $W_1=|\theta|$.
+
+      JSD is constant in $\theta$, so its gradient is zero and gives no hint which way to move. $W_1$ shrinks smoothly as $\theta\to0$.
+
+      ![Left: JSD jumps to log 2 for any shift of a point mass. For narrow Gaussians it saturates within about one unit of shift. Right: $W_1$ keeps decreasing all the way to zero. Computed numerically.](fund.kl-divergence/js-saturation)
+
+      **This is not just a toy.** Natural images, and a generator's outputs, concentrate near low-dimensional manifolds in pixel space. Two such manifolds in general position overlap only on a set of measure zero. Then JSD $=\log2$ and both KLs are infinite (Arjovsky & Bottou, Thm 2.3). A near-perfect discriminator exists, and the generator's gradient through it vanishes (Thm 2.4). Even when narrow distributions overlap slightly, JSD sits just below $\log2$ and its gradient is tiny, as the Gaussian curve shows.
+
+      **Remedies, previewed.**
+      - The non-saturating generator loss restores gradients but brings the reverse-KL mode-dropping pressure from the "which direction" card.
+      - Adding noise to both distributions makes their supports overlap.
+      - Replacing JSD with $W_1$ gives a loss that is continuous in $\theta$ (WGAN; see gen.wgan).
+    source: Goodfellow et al. 2014 Thm 1; Arjovsky & Bottou 2017 §2.1–2.2 (Thm 2.3, 2.4); Arjovsky, Chintala & Bottou 2017 §2 (Example 1)
+
+  - title: "Pitfalls and what interviewers probe"
+    body: |
+      **Pitfalls**
+      - **Argument order in PyTorch.** In PyTorch 2.x, `nn.KLDivLoss()(input, target)` expects `input` as the model's *log*-probabilities and `target` as probabilities. It computes $\sum\text{target}\,(\log\text{target}-\text{input})=\mathrm{KL}(\text{target}\|\text{model})$. Use `reduction='batchmean'` for the true per-example KL, because `'mean'` also divides by the number of classes (PyTorch warns it will change in a future major release).
+      - **Hard zeros.** A model that assigns exactly 0 to an observed outcome (for example after top-$k$ truncation) has infinite forward KL. Smooth, or add a small $\epsilon$ mixture.
+      - **Units.** The JSD maximum is $\log2$ nats, which is 1 bit. The GAN constant $-\log4$ is in nats.
+      - **Direction names.** Write $\mathrm{KL}(p\|q)$ explicitly rather than "forward" or "reverse".
+
+      **Probes**
+      - *Is KL a distance?* No. It is asymmetric, breaks the triangle inequality, and can be infinite. $\sqrt{\mathrm{JSD}}$ is a metric, and $W_1$ is a metric.
+      - *Why is minimizing cross-entropy the same as minimizing KL?* $H(p,q)=H(p)+\mathrm{KL}(p\|q)$, and $H(p)$ is fixed.
+      - *Why does VI use $\mathrm{KL}(q\|p)$?* The expectation is under the tractable $q$, and $\log p(x)$ drops out as a constant, which gives the ELBO.
+      - *Derive $\mathrm{KL}(\mathcal N(\mu,\sigma^2)\|\mathcal N(0,1))$.* $\tfrac12(\mu^2+\sigma^2-1-\log\sigma^2)$, via $\mathbb{E}_p(x-\mu_2)^2=\sigma_1^2+(\mu_1-\mu_2)^2$.
+      - *Why did early GANs stall?* JSD is constant at $\log2$ on disjoint supports, so it gives no gradient.
+    source: PyTorch docs (torch.nn.KLDivLoss), checked in PyTorch 2.1; Murphy PML2 §5.1; Arjovsky & Bottou 2017 §2
+
+  - title: Key results
+    body: |
+      $$\mathrm{KL}(p\|q)=\mathbb{E}_p\log\tfrac pq=H(p,q)-H(p)\ \ge0$$
+
+      - Equality iff $p=q$ (Gibbs, via Jensen).
+      - $\infty$ if $p>0$ where $q=0$. Asymmetric, no triangle inequality. Invariant to invertible maps of $x$.
+
+      $$\begin{aligned} \mathrm{KL}(p(x,y)\|q(x,y)) &= \mathrm{KL}(p(x)\|q(x)) \\ &+\mathbb{E}_{p(x)}\mathrm{KL}(p(y|x)\|q(y|x)) \end{aligned}$$
+
+      $$\begin{aligned} \mathrm{KL}(\mathcal N_1\|\mathcal N_2) &= \log\tfrac{\sigma_2}{\sigma_1}+\tfrac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\tfrac12 \end{aligned}$$
+
+      $$\mathrm{KL}(\mathcal N(\mu,\sigma^2)\|\mathcal N(0,1))=\tfrac12(\mu^2+\sigma^2-1-\log\sigma^2)$$
+
+      - $\mathrm{KL}(p\|q)$ is mass-covering (moment matching). $\mathrm{KL}(q\|p)$ is mode-seeking ($\approx-\log w_k$ on mode $k$).
+      - MLE and classic distillation use forward KL. VI, the RLHF penalty and on-policy LLM distillation (MiniLLM, GKD) use reverse KL.
+
+      $$\begin{aligned} \mathrm{JSD} &= \tfrac12\mathrm{KL}(P\|M)+\tfrac12\mathrm{KL}(Q\|M) \\ &= I(X;Z)\in[0,\log2] \end{aligned}$$
+
+      - JSD $=\log2$ iff the supports are disjoint. $C(G)=-\log4+2\,\mathrm{JSD}$.
+    source: Murphy PML1 §6.2; Murphy PML2 §5.1; Goodfellow et al. 2014 Thm 1; Gu et al. 2023; Agarwal et al. 2023
+
+quiz:
+  - id: q2
+    prompt: |
+      Variational inference fits a fully factorized Gaussian $q(z_1)q(z_2)$ to a correlated 2-D Gaussian posterior $p$ by minimizing $\mathrm{KL}(q\|p)$. Compared with $p$'s true marginals, the result has:
+    correct: Correct means, but variances that are too small
+    wrong:
+      - Correct means, and variances equal to the marginals
+      - Correct means, but variances that are too large
+      - Means pulled toward zero, and variances too large
+    explanation: |
+      Reverse KL is zero-forcing. $q$ must avoid the low-density corners that a broad axis-aligned Gaussian would cover, so it shrinks to variances $1/\Lambda_{ii}\le\Sigma_{ii}$, where $\Lambda=\Sigma^{-1}$ is the precision matrix. Matching the marginal variances exactly is what *forward* KL does (moment matching), and that leaves $q$ too broad. Both directions get the means right here.
+    source: Murphy PML2 §5.1.4.2–5.1.4.3; Bishop PRML §10.1.2
+
+  - id: q3
+    prompt: |
+      Over two outcomes, $p=(1,0)$ and $q=(\tfrac12,\tfrac12)$. In bits, what are $\mathrm{KL}(p\|q)$ and $\mathrm{KL}(q\|p)$?
+    correct: 1 bit and $\infty$
+    wrong:
+      - $\infty$ and 1 bit
+      - 1 bit and 1 bit
+      - 0.5 bits and $\infty$
+    explanation: |
+      $\mathrm{KL}(p\|q)=1\cdot\log_2\frac{1}{1/2}=1$, and the $0\log0$ term is 0. $\mathrm{KL}(q\|p)$ contains $\tfrac12\log_2\frac{1/2}{0}=\infty$, because $q$ puts mass where $p$ has none. Swapping the two values gets the support condition backwards: KL is infinite when the *first* argument has mass outside the support of the second.
+    source: Murphy PML2 §5.1.2.1
+
+  - id: q7
+    prompt: |
+      A VAE encoder outputs $\mu=1$ and $\sigma=0.5$ for one latent dimension. What is $\mathrm{KL}(\mathcal N(\mu,\sigma^2)\|\mathcal N(0,1))$?
+    correct: About 0.818 nats
+    wrong:
+      - 0.5 nats
+      - 0.125 nats
+      - About 0.597 nats
+    explanation: |
+      $\tfrac12(\mu^2+\sigma^2-1-\log\sigma^2)=\tfrac12(1+0.25-1+1.386)=0.818$. Getting 0.5 means counting only the mean term $\mu^2/2$. Getting 0.125 means dropping $-\log\sigma^2$, the term that penalizes a too-narrow posterior. 0.597 comes from plugging in $\sigma=0.5$ where $\sigma^2$ belongs.
+    rev: 2
+    source: Murphy PML1 §6.2.3
+
+  - id: q8
+    prompt: |
+      RLHF commonly penalizes $\beta\,\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})$. What does this direction of KL do?
+    correct: Penalizes probability on outputs the reference finds unlikely
+    wrong:
+      - Forces the policy to cover every output the reference can produce
+      - Is estimated with samples drawn from $\pi_{\text{ref}}$, not the policy
+      - Is symmetric, so the direction is a matter of convention
+    explanation: |
+      $\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})=\mathbb{E}_{y\sim\pi_\theta}[\log\pi_\theta(y)-\log\pi_{\text{ref}}(y)]$. This is the reverse, mode-seeking direction, estimated on the policy's own samples. It blows up when the policy generates text the reference finds very unlikely. It does not force the policy to cover all of the reference's outputs; that would be $\mathrm{KL}(\pi_{\text{ref}}\|\pi_\theta)$.
+    source: Murphy PML2 §5.1.4.1; Schulman 2020 (KL approx blog)
+
+  - id: q9
+    prompt: |
+      For $p=(0.5,0.5)$ and $q=(0.8,0.2)$, what are $\mathrm{KL}(p\|q)$ and $\mathrm{KL}(q\|p)$ in nats?
+    correct: 0.223 and 0.193
+    wrong:
+      - 0.193 and 0.223
+      - 0.208 and 0.208
+      - 0.322 and 0.278
+    explanation: |
+      $\mathrm{KL}(p\|q)=0.5\ln\frac{0.5}{0.8}+0.5\ln\frac{0.5}{0.2}=0.223$. $\mathrm{KL}(q\|p)=0.8\ln1.6+0.2\ln0.4=0.193$. The forward direction is larger because $p$ gives weight to the outcome that $q$ underrates (0.2). "0.208 and 0.208" assumes symmetry. "0.322 and 0.278" are the same values in bits.
+    source: Murphy PML1 §6.2.1
+
+  - id: q10
+    prompt: |
+      The grey density is a target $p$ with weights 0.7 and 0.3 on two well-separated modes. Curves A, B and C are candidate Gaussians $q$.
+
+      ![Three candidate Gaussian fits to a bimodal target.](fund.kl-divergence/reverse-quiz)
+
+      Which curve is the global minimizer of $\mathrm{KL}(q\|p)$ over Gaussians?
+    correct: B
+    wrong:
+      - A
+      - C
+      - B and C tie, since each sits on one mode
+    explanation: |
+      Reverse KL is mode-seeking. A $q$ that sits on mode $k$ costs about $-\log w_k$: $-\ln0.7=0.36$ for B and $-\ln0.3=1.20$ for C, so C is only a local minimum. A is the moment-matched Gaussian, which is the *forward*-KL optimum. Under reverse KL it pays heavily (about 1.28 nats) for the mass it puts between the modes. B and C don't tie: the cost depends on the weight of the mode each one covers.
+    source: Murphy PML1 §6.2.6; Bishop PRML §10.1.2
+
+  - id: q11
+    prompt: |
+      Which statement is **false**?
+    correct: JSD between $\mathcal N(0,1)$ and $\mathcal N(4,1)$ is exactly $\log2$
+    wrong:
+      - KL between two Gaussians with equal variances is symmetric
+      - KL is unchanged if both distributions pass through the same invertible map
+      - KL between two joint distributions is at least the KL between their marginals
+    explanation: |
+      Gaussians have full support, so they always overlap and JSD stays strictly below $\log2$. Numerically it is about 0.633 nats here, against $\log2=0.693$. JSD reaches $\log2$ only for disjoint supports. The others are true: with equal variances, KL is $(\mu_1-\mu_2)^2/2\sigma^2$; the Jacobians cancel in the ratio; and the chain rule adds a non-negative conditional term.
+    source: Murphy PML2 §5.1.2.3, §5.1.5.2, §5.1.8.1; Arjovsky & Bottou 2017 Thm 2.3
+
+  - id: q12
+    prompt: |
+      $P_0=\delta_0$ is a point mass at 0, and $P_\theta=\delta_\theta$. For $\theta=0.01$ and for $\theta=10$, what are $\mathrm{JSD}(P_0,P_\theta)$ and $W_1(P_0,P_\theta)$?
+    correct: JSD $=\log2$ for both; $W_1=0.01$ and $10$
+    wrong:
+      - JSD $\approx0$ and $\log2$; $W_1=0.01$ and $10$
+      - JSD $=\infty$ for both; $W_1=0.01$ and $10$
+      - JSD $=\log2$ for both; $W_1=1$ for both
+    explanation: |
+      For any $\theta\neq0$ the supports are disjoint, so JSD is at its maximum $\log2$ no matter how close the points are, and it gives zero gradient. $W_1$ is the distance the mass must move, $|\theta|$. KL, not JSD, is infinite here. "1 for both" is the total variation distance, which saturates like JSD.
+    source: Arjovsky, Chintala & Bottou 2017 §2 (Example 1)
+
+  - id: q13
+    prompt: |
+      The proof of Gibbs' inequality, summing over the support $A$ of $p$:
+
+      $$\begin{aligned} -\mathrm{KL} &= \textstyle\sum_A p\log\tfrac qp \\ &\le \log\textstyle\sum_A q \;\le\; 0 \end{aligned}$$
+
+      What justifies the **second** inequality?
+    correct: $q$ can place mass outside $A$, so $\sum_A q\le1$
+    wrong:
+      - Jensen's inequality applied to the concave $\log$
+      - The bound $\log t\le t-1$ applied termwise
+      - $q\le p$ holds everywhere on the support of $p$
+    explanation: |
+      The first inequality is Jensen, $\mathbb{E}_p\log(q/p)\le\log\mathbb{E}_p(q/p)=\log\sum_Aq$. The second needs only $\sum_Aq\le\sum_xq=1$, because $q$ may have mass where $p=0$. Equality there forces $c=1$ in $q=cp$. "$q\le p$ on $A$" is false in general, since both sum to at most 1 and $q$ can exceed $p$ at some points.
+    source: Murphy PML1 §6.2.4; MacKay ITILA §2.6
+
+  - id: q16
+    prompt: |
+      A fair coin $Z$ chooses between $P$ and $Q$, and then $X$ is drawn from the chosen distribution. What is $I(X;Z)$?
+    correct: $\mathrm{JSD}(P,Q)$
+    wrong:
+      - $\tfrac12\mathrm{KL}(P\|Q)+\tfrac12\mathrm{KL}(Q\|P)$
+      - $\mathrm{KL}(P\|Q)$
+      - $\log2$ for any $P\neq Q$
+    explanation: |
+      The marginal of $X$ is $M=\tfrac12(P+Q)$, and $I(X;Z)=\sum_zp(z)\mathrm{KL}(p(x\mid z)\|p(x))=\tfrac12\mathrm{KL}(P\|M)+\tfrac12\mathrm{KL}(Q\|M)$. The divergences are taken to the mixture, not to each other. The symmetrized-KL option can be infinite, but an MI here can't exceed $H(Z)=\log2$. $\log2$ is reached only when the supports are disjoint.
+    source: Murphy PML1 §6.3.1; Murphy PML2 §26.2.2
+
+  - id: q17
+    prompt: |
+      $p=\tfrac12\mathcal N(-2,1)+\tfrac12\mathcal N(2,1)$. You fit a single Gaussian $q$ by minimizing $\mathrm{KL}(p\|q)$. What do you get?
+    correct: $\mathcal N(0,5)$
+    wrong:
+      - $\mathcal N(0,1)$
+      - $\mathcal N(2,1)$
+      - $\mathcal N(0,4)$
+    explanation: |
+      Forward KL to a Gaussian matches moments: the mean is 0, and the variance is the within-component variance plus the spread of the means, $1+4=5$. $\mathcal N(2,1)$ sits on one mode, which is the reverse-KL behaviour. $\mathcal N(0,4)$ forgets the within-component variance.
+    source: Murphy PML2 §5.1.4.2
+
+  - id: q18
+    prompt: |
+      Arjovsky & Bottou show that, with the optimal discriminator held fixed, the non-saturating GAN generator step follows $\nabla_\theta[\mathrm{KL}(P_g\|P_r)-2\,\mathrm{JSD}(P_g,P_r)]$, where $P_g$ is the generator's distribution and $P_r$ the data. Which failure does the KL term predict?
+    correct: Mode dropping, because missing real modes costs little
+    wrong:
+      - Blurry samples that average across real modes
+      - Samples spread over every mode, including spurious ones
+      - Divergence to infinity, because KL is unbounded above
+    explanation: |
+      $\mathrm{KL}(P_g\|P_r)$ takes its expectation under the generator. Producing samples where real data has no mass is very costly, while ignoring real modes costs almost nothing. That is the mode-seeking direction, so the generator collapses onto a subset of modes. Blur and mode averaging come from the opposite, mass-covering direction $\mathrm{KL}(P_r\|P_g)$, which is the one maximum likelihood uses. The question asks what the term *predicts*: Goodfellow (2016, §3.2.5) notes that GANs trained on forward KL still drop modes, which points to the training dynamics as the main cause.
+    source: Arjovsky & Bottou 2017 §2.2 (Thm 2.5); Goodfellow 2016 (GAN tutorial) §3.2.5
+
+cards:
+  - id: f1
+    front: Define KL divergence and give its relationship to cross-entropy.
+    back: |
+      $$\mathrm{KL}(p\|q)=\mathbb{E}_p\Big[\log\frac pq\Big]=H(p,q)-H(p)$$
+
+      It is the extra code length paid for using $q$'s code on $p$'s data. It is $\ge0$, zero iff $p=q$, asymmetric, and infinite if $p>0$ anywhere $q=0$.
+    source: Murphy PML1 §6.2.1–6.2.2
+
+  - id: f2
+    front: Forward vs reverse KL. Which is mode-covering, which is mode-seeking, and where is each used?
+    back: |
+      - **Forward** $\mathrm{KL}(p\|q)$ is mass-covering (zero-avoiding), and for exponential families it moment-matches. Used by MLE, cross-entropy training and *classic* (soft-label) distillation.
+      - **Reverse** $\mathrm{KL}(q\|p)$ is mode-seeking (zero-forcing) and underestimates variance. Used by VI (the ELBO), the RLHF penalty $\mathrm{KL}(\pi_\theta\|\pi_{\text{ref}})$, and on-policy LLM distillation (MiniLLM, GKD).
+    source: Murphy PML1 §6.2.6; Murphy PML2 §5.1.4
+
+  - id: f3
+    front: Define the Jensen–Shannon divergence, give its range, and state its mutual-information interpretation.
+    back: |
+      $$\mathrm{JSD}=\tfrac12\mathrm{KL}(P\|M)+\tfrac12\mathrm{KL}(Q\|M),\ M=\tfrac{P+Q}2$$
+
+      It is symmetric, lies in $[0,\log2]$ (1 bit), and equals $\log2$ iff the supports are disjoint. It is $I(X;Z)$, where a fair coin $Z$ picks $P$ or $Q$. $\sqrt{\mathrm{JSD}}$ is a metric.
+    source: Murphy PML2 §26.2.2; Goodfellow et al. 2014 Thm 1
+
+  - id: f4
+    front: Closed form of $\mathrm{KL}(\mathcal N(\mu,\sigma^2)\,\|\,\mathcal N(0,1))$ (the per-dimension VAE KL term)?
+    back: |
+      $$\tfrac12\big(\mu^2+\sigma^2-1-\log\sigma^2\big)$$
+
+      For a diagonal Gaussian, sum it over latent dimensions (KL is additive for independent factors). It is 0 only at $\mu=0$, $\sigma=1$.
+    source: Murphy PML1 §6.2.3
+
+  - id: f5
+    front: What does PyTorch's `nn.KLDivLoss()(input, target)` expect, and which KL does it compute?
+    back: |
+      In PyTorch 2.x, `input` must be the model's **log-probabilities** and `target` plain probabilities (unless you pass `log_target=True`). It computes $\sum p\,(\log p-\log q)=\mathrm{KL}(\text{target}\|\text{model})$. Use `reduction='batchmean'` for the true per-example KL, because the default `'mean'` also divides by the number of classes.
+    source: PyTorch docs (torch.nn.KLDivLoss), checked in PyTorch 2.1
+
+  - id: f6
+    type: open
+    front: Explain to an interviewer why MLE is forward-KL minimization, and why variational inference uses reverse KL instead.
+    back: |
+      **MLE is forward KL.** The average NLL is $\mathbb{E}_{p_{\text{data}}}[-\log p_\theta]=H(p_{\text{data}})+\mathrm{KL}(p_{\text{data}}\|p_\theta)$. The entropy is constant, so MLE minimizes forward KL. Forward KL needs expectations under the data, which is exactly what we have.
+
+      **VI uses reverse KL.** The posterior $p(z\mid x)=p(x,z)/p(x)$ has an intractable normalizer and cannot be sampled. Reverse KL takes expectations under our tractable $q$:
+
+      $$\mathrm{KL}(q\|p(\cdot|x))=\mathbb{E}_q[\log q-\log p(x,z)]+\log p(x)$$
+
+      $\log p(x)$ is constant in $q$, so minimizing reverse KL is maximizing the ELBO.
+
+      **The trade-off is behaviour.** Forward KL is mass-covering. Reverse KL is mode-seeking and underestimates uncertainty (e.g. factorized variances $1/\Lambda_{ii}$).
+    source: Murphy PML2 §5.1.4, §5.1.6; Bishop PRML §10.1.2
+
+  - id: f7
+    front: List the structural properties of KL (support, invariance, decomposition, processing) that interviewers expect you to know.
+    back: |
+      - Finite only if $\mathrm{supp}\,p\subseteq\mathrm{supp}\,q$.
+      - Not a metric: asymmetric, no triangle inequality. It behaves like a squared distance.
+      - Invariant to invertible maps of $x$, because the Jacobians cancel.
+      - Chain rule: $\mathrm{KL}(p_{xy}\|q_{xy})=\mathrm{KL}(p_x\|q_x)+\mathbb{E}_{p_x}\mathrm{KL}(p_{y|x}\|q_{y|x})$. So it is additive for independent factors.
+      - Marginalizing, or sending both distributions through the same channel, can't increase it.
+    source: Murphy PML2 §5.1.2.3, §5.1.2.5, §5.1.5.2
+
+  - id: f8
+    front: Give the KL between two univariate Gaussians and between two multivariate Gaussians.
+    back: |
+      $$\mathrm{KL}=\log\tfrac{\sigma_2}{\sigma_1}+\tfrac{\sigma_1^2+(\mu_1-\mu_2)^2}{2\sigma_2^2}-\tfrac12$$
+
+      $$\begin{aligned} \mathrm{KL}=\tfrac12\Big[&\mathrm{tr}(\Sigma_2^{-1}\Sigma_1)+\Delta^\top\Sigma_2^{-1}\Delta \\ &-d+\log\tfrac{|\Sigma_2|}{|\Sigma_1|}\Big] \end{aligned}$$
+
+      Here $\Delta=\mu_2-\mu_1$. The univariate formula comes from $\mathbb{E}_p(x-\mu_2)^2=\sigma_1^2+(\mu_1-\mu_2)^2$.
+    source: Murphy PML1 §6.2.3; Murphy PML2 §5.1.8.1
+
+  - id: f11
+    type: open
+    front: Prove that $\mathrm{KL}(p\|q)\ge0$, with equality iff $p=q$.
+    back: |
+      Let $A$ be the support of $p$. By Jensen on the concave log:
+
+      $$\begin{aligned} -\mathrm{KL} &= \textstyle\sum_A p\log\frac qp \\ &\le \log\textstyle\sum_A p\frac qp=\log\textstyle\sum_A q \\ &\le \log1=0. \end{aligned}$$
+
+      **Equality.** The log is strictly concave, so Jensen is tight iff $q/p$ is constant on $A$, i.e. $q=cp$. The second step is tight iff $q$ has no mass outside $A$, so $c=1$.
+
+      **Alternative.** $\log t\le t-1$ gives $\sum_Ap\log\frac qp\le\sum_Aq-1\le0$.
+
+      **Why it matters.** It gives $H(p,q)\ge H(p)$, $I\ge0$, maximum entropy, and the ELBO.
+    source: Murphy PML1 §6.2.4; MacKay ITILA §2.6–2.7
+
+  - id: f12
+    type: open
+    front: Explain why the original GAN objective can give vanishing generator gradients, using a minimal example, and what the Wasserstein distance changes.
+    back: |
+      - **The objective.** With the optimal discriminator, the generator minimizes $-\log4+2\,\mathrm{JSD}(p_{\text{data}},p_g)$.
+      - **Minimal example.** With point masses $\delta_0$ and $\delta_\theta$, every $\theta\neq0$ gives disjoint supports. Then JSD $=\log2$, KL $=\infty$ and TV $=1$, all constant in $\theta$, so the gradient is zero.
+      - **Why it happens in practice.** Data and generator distributions live near low-dimensional manifolds that overlap on a set of measure zero. JSD saturates, a perfect discriminator exists, and gradients through it vanish (Arjovsky & Bottou, Thms 2.3–2.4).
+      - **What Wasserstein changes.** $W_1$ measures how far mass must move. Here it is $|\theta|$, which is continuous with a useful gradient everywhere. That motivates WGAN.
+      - **Caveat.** The non-saturating loss fixes the vanishing gradient but optimizes $\mathrm{KL}(P_g\|P_r)-2\mathrm{JSD}$, which predicts mode dropping. But GANs trained on forward KL also drop modes (Goodfellow 2016, §3.2.5), so the training dynamics, not just the divergence, are to blame.
+    source: Arjovsky & Bottou 2017 §2; Arjovsky, Chintala & Bottou 2017 §2 (Example 1); Goodfellow et al. 2014 Thm 1; Goodfellow 2016 (GAN tutorial) §3.2.5
+
+reading:
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, §6.2 (KL divergence)"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: The definition, Gaussian KL, the Gibbs proof, KL and MLE, and forward vs reverse, in about five pages.
+  - title: "Murphy, Probabilistic Machine Learning: Advanced Topics, §5.1"
+    url: https://probml.github.io/pml-book/book2.html
+    kind: book
+    note: Goes deeper on reparameterization invariance, the chain rule, weight of evidence, and M- vs I-projection.
+  - title: "Bishop, Pattern Recognition and Machine Learning, §10.1.2"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: The classic pictures of KL(q‖p) vs KL(p‖q) on correlated and bimodal Gaussians, and why VI underestimates variance.
+  - title: "Arjovsky, Chintala & Bottou (2017), Wasserstein GAN, §2"
+    url: https://arxiv.org/abs/1701.07875
+    kind: paper
+    note: Example 1 (parallel lines) compares JSD, KL, TV and W1 on disjoint supports. Pair it with Arjovsky & Bottou 2017 (arXiv:1701.04862) for the manifold theorems.

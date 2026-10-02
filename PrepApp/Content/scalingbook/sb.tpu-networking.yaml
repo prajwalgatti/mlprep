@@ -1,0 +1,402 @@
+id: sb.tpu-networking
+area: scalingbook
+title: "TPUs II: Hosts, ICI Tori, Pods and DCN"
+summary: How TPU chips connect to hosts (PCIe), to each other (ICI in 2D/3D tori with wraparound), into pods and across pods (DCN); the bandwidth of each link, and worked estimates of transfer times.
+order: 40
+level: core
+tags: [scaling-book, tpu, networking, interconnect, hardware]
+prereqs: [sb.tpu-chip]
+
+explainer:
+  - title: "From chip to host: trays and PCIe"
+    source: Scaling Book ch. 2 (TPUs) §"What Is a TPU?", §"TPU specs", Question 3
+    body: |
+      Chips are grouped in **trays of 4**, and each tray connects to a CPU **host** over **PCIe**. On a TPU v4 or v5p a host drives one tray (a $2\times2\times1$ block of chips). On the inference chips v5e and v6e a host drives two trays, 8 chips in a $4\times2$ block. The host runs the Python program and feeds data.
+
+      PCIe is slow compared with HBM: about $1.6\times10^{10}$ B/s per chip ($3.2\times10^{10}$ on v6e). On a TPU v4 that is roughly 75× below its HBM bandwidth. Tensors *can* be offloaded to host DRAM, but bringing them back is expensive.
+
+      **Worked example** (book Q3). Keep a weight matrix $\text{bf16}[D, F]$ and activations $\text{bf16}[B, D]$ in host DRAM, and compute on one v6e chip ($9.2\times10^{14}$ FLOPs/s). Every byte must cross PCIe. Take $F = 4D$ and $B \ll D$:
+
+      $$\begin{aligned} T_\text{math} &= \frac{2BDF}{C} = \frac{8BD^2}{C} \\ T_\text{comms} &\approx \frac{2DF}{W_\text{pcie}} = \frac{8D^2}{W_\text{pcie}}. \end{aligned}$$
+
+      Compute-bound requires $B > C/W_\text{pcie} = 9.2\times10^{14}/1.6\times10^{10} \approx 57{,}500$ tokens. With the v6e's faster $3.2\times10^{10}$ PCIe it is still ≈ 28,750. Same roofline as lesson 2, but a link 50–100× slower than HBM pushes the ridge from hundreds to tens of thousands. That is why weights normally live in HBM.
+  - title: "ICI: chips wired to their neighbours"
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    body: |
+      Chips talk to each other directly over **ICI** (inter-chip interconnect) links that do not pass through the hosts.
+
+      - **2D torus** (4 neighbours each): TPU v2, v3, the inference chips v5e and v6e.
+      - **3D torus** (6 neighbours each): TPU v4 and v5p.
+
+      A **torus** is a grid whose edges wrap around: the last chip on each axis also links back to the first. The wraparound links matter for distance. On an axis of $N$ chips without them, the far end is $N - 1$ hops away; with them, no chip is more than $\lfloor N/2 \rfloor$ hops away.
+
+      ![Getting from chip (0,0) to chip (3,3): 6 hops on a 4×4 mesh, 2 hops on a 4×4 torus using the wraparound links](sb.tpu-networking/torus-hops)
+
+      TPUs also support a "twisted torus", which wraps with a twist (like a Möbius strip) to reduce the *average* distance further.
+
+      **Only nearest neighbours are connected.** A message between distant chips in a slice must hop through every chip in between. Chapter 3 shows that well-designed collectives (AllGather, ReduceScatter) are nonetheless limited by per-link bandwidth rather than by distance, because data flows around rings in parallel.
+  - title: Pods, cubes and slices
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking", Question 2
+    body: |
+      The largest ICI-connected unit is a **pod** (the maximum is called a superpod): $16\times16\times16$ chips for TPU v4, $16\times20\times28 = 8960$ for v5p. It is built from $4\times4\times4$ **cubes** joined by optical switches. These are reconfigurable connections with the same bandwidth as ICI, so cubes can be wired into large topologies that keep their wraparounds.
+
+      A job gets a **slice**: some sub-block of a pod. The caveats:
+
+      - **v4/v5p:** a slice has wraparound links only if it is made of whole cubes ($4\times4\times4$, $4\times4\times8$, …), since the optical switches provide them. A $2\times2\times4$ has none.
+      - **v5e/v6e:** a pod is one $16\times16$ 2D torus with wraparound on axes of size 16. An $8\times16$ slice wraps on the long axis only; a $4\times4$ has no wraparound. These pods cannot grow past $16\times16$.
+
+      Losing wraparounds typically **doubles** the time of most collectives, because data can no longer flow around a ring in both directions.
+
+      **Worked example** (book Q2). A full v5e pod has $256$ chips, $256/8 = 32$ hosts, 256 TensorCores (one per chip), $256 \times 1.97\times10^{14} \approx 5.0\times10^{16}$ FLOPs/s, and $256 \times 16 \text{ GiB} = 4$ TiB of HBM. A full v5p pod has 8960 chips, $8960/4 = 2240$ hosts, $17{,}920$ TensorCores (two per chip), $\approx 4.1\times10^{18}$ FLOPs/s and $8960 \times 96 \text{ GB} \approx 860$ TB of HBM.
+  - title: The bandwidth hierarchy
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking", §"Key Takeaways", §"TPU specs"
+    body: |
+      Each step outward from the TensorCore is slower. For a TPU v5e chip:
+
+      ![Bandwidth available to one v5e chip over each channel, log scale: each level is several times slower than the one above](sb.tpu-networking/bandwidth-ladder)
+
+      For a TPU v5p chip the book's numbers are: HBM $2.8\times10^{12}$ B/s; ICI $9\times10^{10}$ B/s per link per direction, with 3 axes; PCIe $\approx 1.6\times10^{10}$; DCN $6.25\times10^{9}$ per chip.
+
+      **One-way vs bidirectional.** An ICI link carries data both ways at once. The book quotes:
+
+      - **one-way** bandwidth: per link, per direction. $4.5\times10^{10}$ on v4p and v5e; $9\times10^{10}$ on v5p, v6e and TPU7x.
+      - **bidirectional** bandwidth: twice that, the total over both directions. Equivalently, it is what a chip can send out along one axis when that axis is a ring: one link's worth towards each of its two neighbours.
+
+      Bidirectional is the number that appears in ring collectives, but it is only usable when the axis forms a ring, i.e. has a wraparound.
+
+      **Per-hop latency.** Each ICI hop also costs about 1 µs regardless of size. On a v5e, $4.5\times10^{10} \text{ B/s} \times 1 \text{ µs} = 45$ kB, so sending much less than ~45 kB per hop is dominated by latency, not bandwidth.
+
+      The design rule that falls out: **keep the traffic on each channel proportional to its speed.** Heavy traffic stays in HBM, moderate traffic on ICI, and as little as possible on PCIe and DCN.
+  - title: Slices, multislice and DCN
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    body: |
+      Slices (sets of ICI-connected chips, defined above), for example in different pods, can be connected over **DCN**, the ordinary data-centre network between hosts. This is **multislice** training.
+
+      DCN is host-to-host, so moving a buffer from a chip in one slice to a chip in another takes four legs:
+
+      1. PCIe from HBM to the source host,
+      2. out of the host's network card (egress) onto the network,
+      3. into the target host (ingress),
+      4. PCIe into the target chip's HBM.
+
+      DCN bandwidth per chip is small: $6.25\times10^9$ B/s on v5p, $1.25\times10^{10}$ on v6e and TPU7x, $3.125\times10^9$ on v5e. That is 14× below a single v5e ICI link. Chapter 5 shows the consequence: across pods we usually run only data parallelism, whose communication is light enough.
+
+      **TPUs vs GPUs.** GPUs use switches instead of a torus. Within a node (8 H100s, or 72 GPUs in a GB200 NVL72) every GPU reaches every other in one hop; larger clusters need $O(\log N)$ switch hops. That makes arbitrary communication patterns easy. TPUs keep a constant number of links per chip and no expensive switches, so they are cheaper, simpler to wire, and scale to very large pods at constant per-chip bandwidth. The price is that distant chips are many hops apart and only regular, neighbour-friendly patterns run at full speed.
+  - title: "Worked example: one transfer across a slice"
+    source: Scaling Book ch. 2 (TPUs), Question 5
+    body: |
+      Send $\text{bf16}[8, 128, 8192]$ from chip $(0,0)$ to chip $(3,3)$ on a TPU v5e $4\times4$ slice, with about 1 µs latency per hop.
+
+      **Size:** $2 \times 8 \times 128 \times 8192 = 16{,}777{,}216$ bytes ≈ 16.8 MB.
+
+      **Topology:** a $4\times4$ v5e slice has no wraparound (no axis of size 16). The corner chip $(0,0)$ has only 2 neighbours, and the shortest path to $(3,3)$ is $3 + 3 = 6$ hops.
+
+      **Bandwidth:** split the array, sending half to the right and half down. Two outgoing links at $4.5\times10^{10}$ B/s each give $9\times10^{10}$ B/s:
+
+      $$\frac{1.68\times10^{7}}{9\times10^{10}} \approx 186 \ \text{µs}.$$
+
+      **Latency:** the first byte arrives after about $6 \times 1 = 6$ µs.
+
+      **Total:** the last byte also needs 6 hops after it leaves, so the time is about $186 + 6 \approx 192$ µs. The book rounds the bytes to $1.7\times10^7$ and gets $188 + 6 \approx 194$ µs. In general latency and bandwidth terms add; here latency is a 3% correction because each hop carries megabytes, far above the 45 kB crossover.
+
+      Note what does *not* appear: the distance does not divide the bandwidth. The intermediate chips forward data as it arrives, so the transfer is pipelined along the path.
+  - title: "Worked example: pulling it all together"
+    source: Scaling Book ch. 2 (TPUs), Question 6
+    body: |
+      A matrix $\text{int8}[128\cdot1024,\, 128\cdot1024]$ is sharded evenly over a v5e $4\times4$ slice but **offloaded to host DRAM**. We want all of it on chip $(0,0)$, multiplied by $\text{bf16}[8, 128\cdot1024]$.
+
+      **Size:** $(2^{17})^2$ bytes $= 16$ GiB $\approx 1.72\times10^{10}$ bytes. A $4\times4$ v5e slice spans 2 hosts, each holding half.
+
+      **Option 1, DCN.** Send host 1's half over DCN to host 0 (8 chips × $3.1\times10^9$ B/s ≈ 344 ms), then push the whole matrix into chip $(0,0)$ through its own single PCIe link, since the data must enter that chip from host 0 (≈ 1.1 s). Very slow.
+
+      **Option 2, PCIe then ICI.** Each chip loads its 1/16 from its own host (16 PCIe links in parallel), then the slice gathers onto $(0,0)$ over ICI.
+
+      - PCIe: $1.72\times10^{10}/(16 \times 1.6\times10^{10}) \approx 67$ ms.
+      - ICI: chip $(0,0)$ must receive 15/16 of the matrix over its only 2 links: $1.61\times10^{10}/(2\times4.5\times10^{10}) \approx 179$ ms.
+      - HBM → MXU: $1.72\times10^{10}/8.2\times10^{11} \approx 21$ ms.
+      - FLOPs: $2\cdot8\cdot(2^{17})^2 \approx 2.7\times10^{11}$, so ≈ 1.4 ms.
+
+      ![Stage times for option 2: the ICI gather into one chip is the bottleneck](sb.tpu-networking/challenge-stages)
+
+      With the stages overlapped, the slowest sets the pace: **at least ~180 ms**, realistically ~200 ms. (The book treats 16 GiB as $16\times10^9$ bytes, so it counts 15e9 bytes received and gets ≈ 167 ms.)
+  - title: "The same problem, done better"
+    source: Scaling Book ch. 2 (TPUs), Question 6; Scaling Book ch. 2 §"TPU specs"
+    body: |
+      Two observations improve on the book's answer to the previous card's problem.
+
+      **The matrix can't be resident on chip $(0,0)$.** It is exactly 16 GiB, and a v5e has 16 GiB of HBM in total, with nothing left for the vector, the output or the program. So overlapping the stages is not an optimization but a requirement: chip $(0,0)$ must consume chunks in its matmul as they arrive and discard them. The ~180 ms estimate already assumes this streaming.
+
+      **Move the compute to the data.** The matmul $\text{bf16}[8, 2^{17}]\cdot\text{int8}[2^{17}, 2^{17}]$ needs very little input (the 2 MB vector) and produces a small output ($[8, 2^{17}]$, about 2 MB in bf16). So instead of gathering the matrix, send the vector to every chip and let each multiply its own shard:
+
+      - PCIe load of the shard: ≈ 67 ms (as before, 16 links in parallel).
+      - HBM → MXU for one shard: $1.07\times10^9/8.2\times10^{11} \approx 1.3$ ms.
+      - Combining the partial outputs: a few MB per chip over ICI, well under a millisecond.
+
+      Total ≈ 70 ms, bound by PCIe, versus ≈ 180 ms for the gather. The general rule: when one operand is huge and the others are tiny, ship the tiny ones. Chapter 3's sharded-matmul rules formalize exactly this choice.
+  - title: What interviewers probe
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking", §"Key Takeaways"
+    body: |
+      - *How are TPUs connected?* Nearest-neighbour ICI in a 2D torus (v5e, v6e) or 3D torus (v4, v5p); pods of up to 8960 chips (v5p) from $4\times4\times4$ cubes with optical switches; DCN between pods.
+      - *What do wraparound links buy you?* Worst-case distance $N/2$ instead of $N-1$, and bidirectional rings. Missing them roughly doubles collective time.
+      - *Which slices have wraparounds?* v4/v5p: whole cubes only. v5e/v6e: only axes of length 16.
+      - *Order the bandwidths.* HBM (≈ 1–3 TB/s) > ICI (45–90 GB/s per link per direction) > PCIe (≈ 16 GB/s) > DCN (3–12 GB/s per chip).
+      - *One-way vs bidirectional bandwidth?* Bidirectional = both directions of an axis together, usable only around a ring.
+      - *TPU vs GPU networking?* Torus with constant links per chip (cheap, scales large, regular patterns) vs switched hierarchy (any-to-any in a node, $O(\log N)$ hops beyond, expensive switches).
+      - *Time to move X bytes?* hops × ~1 µs + bytes / (links used × per-link bandwidth). Latency matters below ~45 kB per hop.
+  - title: Key results
+    source: Scaling Book ch. 2 (TPUs) §"TPU specs", §"Key Takeaways"
+    body: |
+      $$\begin{aligned} T_\text{transfer} \approx\;& n_\text{hops}\cdot t_\text{hop} \\ &+ \frac{\text{bytes}}{\text{links} \times W_\text{link}} \end{aligned}$$
+
+      Weights streamed over PCIe to a v6e (at the book's assumed 1.6e10 B/s; ≈ 28,750 at the v6e's 3.2e10) are compute-bound only if
+
+      $$B > \frac{C}{W_\text{pcie}} \approx 57{,}500.$$
+
+      - Hosts: v4/v5p 4 chips ($2\times2\times1$); v5e/v6e 8 chips ($4\times2$).
+      - ICI one-way per link: 4.5e10 (v4p, v5e), 9e10 (v5p, v6e, TPU7x); bidirectional is 2×.
+      - PCIe ≈ 1.6e10 B/s per chip (v6e 3.2e10). DCN per chip: 3.125e9 (v5e), 6.25e9 (v5p), 1.25e10 (v6e, TPU7x).
+      - Pods: v4 $16^3$; v5p $16\times20\times28 = 8960$; v5e/v6e $16\times16$.
+      - Wraparounds: whole $4\times4\times4$ cubes on v4/v5p; axes of 16 on v5e/v6e. Without them collectives take ≈ 2×.
+      - Per-hop latency ≈ 1 µs → latency-bound below ≈ 45 kB per hop on v5e.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 2 (TPUs), Question 3
+    prompt: |
+      Weights $\text{bf16}[D, 4D]$ and activations $\text{bf16}[B, D]$ live in host DRAM and stream over PCIe ($1.6\times10^{10}$ B/s) to one TPU v6e ($9.2\times10^{14}$ FLOPs/s). With $B \ll D$, roughly what batch is needed to be compute-bound?
+    correct: About 57,500 tokens
+    wrong:
+      - About 240 tokens
+      - About 575 tokens
+      - About 14,000 tokens
+    explanation: |
+      $T_\text{math} = 8BD^2/C$ and $T_\text{comms} \approx 8D^2/W_\text{pcie}$ (weight bytes dominate), so $B > C/W_\text{pcie} = 9.2\times10^{14}/1.6\times10^{10} \approx 57{,}500$. 575 is the v6e's HBM ridge; PCIe is ~100× slower than HBM, so the ridge is ~100× higher.
+  - id: q2
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking", Question 5
+    prompt: |
+      How many ICI hops separate chip $(0,0)$ from chip $(3,3)$ on a $4\times4$ grid without wraparound, and on a $4\times4$ torus with wraparound?
+    correct: 6 hops without, 2 hops with
+    wrong:
+      - 6 hops without, 4 hops with
+      - 3 hops without, 2 hops with
+      - 9 hops without, 3 hops with
+    explanation: |
+      Without wraparound each axis needs 3 hops, so $3 + 3 = 6$. With wraparound, index 3 is adjacent to index 0 on each axis, so one hop per axis: 2 total. In general the worst case per axis drops from $N-1$ to $\lfloor N/2\rfloor$.
+  - id: q3
+    source: Scaling Book ch. 2 (TPUs), Question 5
+    prompt: |
+      Send 16.8 MB from chip $(0,0)$ to chip $(3,3)$ on a TPU v5e $4\times4$ slice ($4.5\times10^{10}$ B/s per link per direction, ≈ 1 µs per hop), splitting the data across both outgoing links. About how long does the transfer take?
+    correct: About 190 µs
+    wrong:
+      - About 375 µs
+      - About 1.1 ms
+      - About 6 µs
+    explanation: |
+      Two links give $9\times10^{10}$ B/s, so $1.68\times10^7/9\times10^{10} \approx 186$ µs, plus about 6 µs for the 6 hops: ≈ 192 µs. Using one link gives ≈ 375 µs. Multiplying by the 6 hops (≈ 1.1 ms) is wrong because forwarding is pipelined. 6 µs is only the latency of the first byte.
+  - id: q4
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    prompt: |
+      Which of these slices has wraparound links on **every** axis?
+    correct: TPU v5p $4\times4\times8$
+    wrong:
+      - TPU v5p $2\times2\times4$
+      - TPU v5e $8\times16$
+      - TPU v5e $4\times4$
+    explanation: |
+      On v4/v5p, wraparounds come from the optical switches and exist for slices made of whole $4\times4\times4$ cubes, which $4\times4\times8$ is. A $2\times2\times4$ has none. On v5e, only axes of length 16 wrap, so $8\times16$ wraps on one axis and $4\times4$ on none.
+  - id: q5
+    source: Scaling Book ch. 2 (TPUs), Question 2
+    prompt: |
+      A full TPU v5p pod is $16\times20\times28$ chips, with 4 chips per host and 2 TensorCores per chip. How many hosts and TensorCores does it have?
+    correct: 2240 hosts and 17,920 TensorCores
+    wrong:
+      - 8960 hosts and 8960 TensorCores
+      - 2240 hosts and 8960 TensorCores
+      - 1120 hosts and 17,920 TensorCores
+    explanation: |
+      $16\cdot20\cdot28 = 8960$ chips. Hosts: $8960/4 = 2240$. Cores: $8960\times2 = 17{,}920$. 1120 hosts would assume 8 chips per host, which is the v5e/v6e arrangement.
+  - id: q7
+    source: Scaling Book ch. 2 (TPUs) §"TPU specs"
+    prompt: |
+      The spec table lists TPU v5p ICI as $9\times10^{10}$ B/s one-way and $1.8\times10^{11}$ B/s bidirectional per link. What does the bidirectional figure mean?
+    correct: Both directions of an axis combined, usable when the axis is a ring
+    wrong:
+      - The one-way rate of two parallel links between one pair of chips
+      - The sum of all 6 ICI links of a v5p chip together
+      - A peak burst rate reached only for messages under 45 kB
+    explanation: |
+      Bidirectional bandwidth counts both directions of an axis: with a wraparound, a chip can push data to both neighbours on the axis at once. Without a ring, collectives can't use both directions efficiently. All 6 links together would be $6\times9\times10^{10} = 5.4\times10^{11}$ B/s.
+  - id: q8
+    source: Scaling Book ch. 2 (TPUs), Question 6
+    prompt: |
+      A 16 GiB int8 matrix is sharded across the host DRAM of a v5e $4\times4$ slice. Each chip loads its shard over its own PCIe link, then the slice streams everything onto chip $(0,0)$, which consumes chunks in a small matmul as they arrive. Which stage limits the total time?
+    correct: The ICI gather into chip (0,0), about 180 ms
+    wrong:
+      - The PCIe loads, about 67 ms
+      - Streaming the matrix from HBM into the MXU, about 21 ms
+      - The matmul FLOPs, about 1.4 ms
+    explanation: |
+      Chip $(0,0)$ is a corner of a slice without wraparound, so it has only 2 ICI links. Receiving 15/16 of $1.72\times10^{10}$ bytes at $2\times4.5\times10^{10}$ B/s takes ≈ 179 ms. PCIe runs over 16 links in parallel (≈ 67 ms), HBM is far faster (≈ 21 ms), and the FLOPs are negligible.
+  - id: q9
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    prompt: |
+      Which statement best captures the difference between TPU and GPU interconnects?
+    correct: 'Constant links per chip: cheap to scale, but far chips are many hops apart'
+    wrong:
+      - TPUs route all chip-to-chip traffic through their host CPUs, while GPUs use direct links
+      - GPUs connect each GPU only to its nearest neighbours, while TPUs use switches for any-to-any links
+      - TPU pods are capped at 8 chips per ICI domain, just like an 8-GPU node
+    explanation: |
+      ICI links go directly between neighbouring chips in a torus, with no switches, which keeps cost per chip constant and lets pods reach thousands of chips. GPUs use switches: one hop within an NVLink node, $O(\log N)$ hops beyond. ICI does not go through hosts.
+  - id: q10
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    prompt: |
+      Why is communication between two slices (multislice) so much slower than within a slice?
+    correct: It crosses DCN host to host, plus PCIe at both ends
+    wrong:
+      - The optical switches between slices add about 1 ms of latency per hop
+      - Slices use different number formats, so data must be converted
+      - Only one chip per slice is allowed to communicate with other slices
+    explanation: |
+      DCN connects hosts, not chips: HBM → PCIe → source host NIC → network → target host → PCIe → HBM. Per-chip DCN bandwidth is a few GB/s, an order of magnitude below an ICI link. The optical switches connect cubes within a pod at full ICI bandwidth.
+  - id: q11
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"; Scaling Book ch. 3 §"Case 2"
+    prompt: |
+      A TPU v5e ICI link moves $4.5\times10^{10}$ B/s per direction, and each hop has about 1 µs of fixed latency. Below roughly what message size per hop does latency, rather than bandwidth, dominate?
+    correct: About 45 kB
+    wrong:
+      - About 45 MB
+      - About 4.5 kB
+      - About 450 kB
+    explanation: |
+      Bandwidth time equals latency when $\text{bytes}/4.5\times10^{10} = 10^{-6}$ s, i.e. $\text{bytes} = 4.5\times10^{4}$ ≈ 45 kB. Much smaller messages are latency-bound, which matters for small activations during inference.
+  - id: q14
+    source: Scaling Book ch. 2 (TPUs), Question 5; Scaling Book ch. 2 §"TPU Networking"
+    prompt: |
+      Repeat the 16.8 MB transfer, but on a full TPU v5e $16\times16$ pod (wraparound on both axes), from chip $(0,0)$ to chip $(8,8)$. Links are $4.5\times10^{10}$ B/s per direction with ≈ 1 µs per hop. Roughly how long does it take?
+    correct: About 110 µs
+    wrong:
+      - About 200 µs
+      - About 16 µs
+      - About 3 ms
+    explanation: |
+      Chip 8 is exactly half-way round each ring, so every path is $8 + 8 = 16$ hops: about 16 µs of latency. But with wraparound the source can send in all 4 directions and the destination receive from all 4, so the bandwidth term is $1.68\times10^7/(4\times4.5\times10^{10}) \approx 93$ µs. Total ≈ 109 µs. 200 µs assumes only 2 links as in the $4\times4$ case; 3 ms wrongly multiplies the bandwidth time by the hop count.
+  - id: q15
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking", §"TPU specs"
+    prompt: |
+      Two TPU v5e chips must exchange 1 GB each. How long does that take over DCN ($3.125\times10^9$ B/s per chip) compared with one ICI link ($4.5\times10^{10}$ B/s per direction)?
+    correct: ≈ 320 ms over DCN vs ≈ 22 ms over ICI
+    wrong:
+      - ≈ 320 ms over DCN vs ≈ 1.2 ms over ICI
+      - ≈ 32 ms over DCN vs ≈ 22 ms over ICI
+      - ≈ 62 ms over DCN vs ≈ 22 ms over ICI
+    explanation: |
+      DCN: $10^9/3.125\times10^9 = 0.32$ s. ICI: $10^9/4.5\times10^{10} \approx 22$ ms, about 14× faster. 1.2 ms divides by the HBM bandwidth instead of ICI. 62 ms uses the PCIe rate ($1.6\times10^{10}$), which is only one leg of the DCN path. This 14× gap is why only light traffic, such as data-parallel gradient reductions, crosses DCN.
+  - id: q13
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    prompt: |
+      You want to train on 1024 TPU v5e chips. What must the system use, given the v5e pod design?
+    correct: DCN between four 256-chip pods; a v5e torus stops at 16×16
+    wrong:
+      - Optical switches to join four v5e pods into one larger ICI torus
+      - PCIe links between neighbouring hosts to extend the torus
+      - A 32×32 v5e torus, which is the v5e's maximum pod size
+    explanation: |
+      v5e and v6e pods are fixed $16\times16$ = 256-chip tori. Beyond that, pods talk over the data-centre network. Optical reconfiguration is a v4/v5p feature for joining $4\times4\times4$ cubes within a pod.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    front: ICI topology by TPU generation?
+    back: |
+      2D torus, 4 neighbours: v2, v3, v5e, v6e. 3D torus, 6 neighbours: v4, v5p. Links go chip to chip, not through hosts.
+  - id: f2
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking", §"TPU specs"
+    front: Maximum pod sizes for TPU v4, v5p and v5e/v6e?
+    back: |
+      v4: $16\times16\times16$ (4096). v5p: $16\times20\times28$ (8960). v5e/v6e: $16\times16$ (256), connected beyond that only by DCN.
+  - id: f3
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    front: When does a TPU slice have wraparound links?
+    back: |
+      v4/v5p: when made of whole $4\times4\times4$ cubes (optical switches provide the wrap). v5e/v6e: on axes of length 16 only. Without wraparound, collectives take about 2× longer.
+  - id: f4
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking", §"TPU specs"
+    front: TPU v5p per-chip bandwidths for HBM, ICI, PCIe and DCN?
+    back: |
+      HBM $2.8\times10^{12}$; ICI $9\times10^{10}$ per link per direction ($1.8\times10^{11}$ bidirectional), 3 axes; PCIe ≈ $1.6\times10^{10}$; DCN $6.25\times10^9$ B/s.
+  - id: f5
+    source: Scaling Book ch. 2 (TPUs) §"TPU specs"
+    front: TPU v5e per-chip bandwidths for HBM, ICI, PCIe and DCN?
+    back: |
+      HBM $8.2\times10^{11}$; ICI $4.5\times10^{10}$ per link per direction ($9\times10^{10}$ bidirectional), 2 axes; PCIe ≈ $1.6\times10^{10}$; DCN $3.125\times10^9$ B/s.
+  - id: f6
+    source: Scaling Book ch. 2 (TPUs), Question 5
+    front: Model for the time of a point-to-point transfer over ICI?
+    back: |
+      $$T \approx n_\text{hops}\cdot t_\text{hop} + \frac{\text{bytes}}{\text{links}\times W_\text{link}}$$
+
+      $t_\text{hop} \approx 1$ µs. Forwarding is pipelined, so bandwidth is not divided by the hop count.
+  - id: f7
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    front: What path does data take between two TPU slices over DCN?
+    back: |
+      HBM → PCIe → source host NIC (egress) → data-centre network → target host (ingress) → PCIe → HBM.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    front: Compare TPU and GPU interconnect designs and their trade-offs.
+    back: |
+      - TPU: ICI torus (2D/3D), direct links to nearest neighbours, constant links per chip, wraparounds; pods of thousands of chips; DCN between pods.
+      - GPU: switched hierarchy. NVLink all-to-all within a node (8, or 72 in NVL72), InfiniBand/Ethernet switches beyond, $O(\log N)$ hops.
+      - TPU pros: cheaper (no big switches), simple wiring, per-chip bandwidth constant at any scale.
+      - TPU cons: distant chips are many hops apart; only regular patterns (rings along axes) run at full speed.
+      - GPU pros: arbitrary patterns within a node in one hop. Cons: costly switches, lower bandwidth past the node.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 2 (TPUs), Question 6
+    front: A 16 GiB int8 matrix is sharded across the host DRAM of a v5e 4×4 slice and needed on chip (0,0). Plan the data movement and estimate the time.
+    back: |
+      - Avoid DCN: host-to-host then one chip's PCIe link is slowest (≈ 0.3 s + ≈ 1 s).
+      - Load each 1/16 shard over its own PCIe link: $1.72\times10^{10}/(16\times1.6\times10^{10}) \approx 67$ ms.
+      - Gather onto (0,0) over ICI: no wraparound on 4×4, corner has 2 links; 15/16 of the bytes at $9\times10^{10}$ B/s ≈ 179 ms.
+      - HBM → MXU ≈ 21 ms; FLOPs ≈ 1.4 ms.
+      - The matrix (exactly 16 GiB) can't be resident on (0,0), whose HBM is 16 GiB, so chunks must be consumed as they arrive; overlapped, the slowest stage binds: ≈ 180 ms, ~200 ms in practice.
+      - Better if the task allows: compute where the data lands. Each chip multiplies its shard after its PCIe load (≈ 67 ms + ≈ 1.3 ms HBM), then only MB-sized partial outputs cross ICI: ≈ 70 ms, PCIe-bound.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 2 (TPUs) §"TPU Networking"
+    front: Explain what wraparound links are, why they matter, and which TPU slices have them.
+    back: |
+      - Links that connect the last chip on an axis back to the first, turning the grid into a torus.
+      - Worst-case distance per axis drops from $N-1$ to $\lfloor N/2\rfloor$ hops.
+      - Each axis becomes a ring, so collectives can send in both directions and use bidirectional bandwidth; without them, collectives take ≈ 2× as long.
+      - v4/v5p: provided by optical switches for whole $4\times4\times4$ cubes (e.g. 4×4×4, 4×4×8), not 2×2×4.
+      - v5e/v6e: on axes of length 16 only (8×16 wraps on its long axis; 4×4 has none).
+  - id: f11
+    type: open
+    source: Scaling Book ch. 2 (TPUs) §"Key Takeaways", Question 3
+    front: Why should the communication on each channel be proportional to its speed? Illustrate with the TPU bandwidth hierarchy.
+    back: |
+      - Each channel has its own roofline: an op is compute-bound only if FLOPs per byte crossing that channel exceed $C/W_\text{channel}$.
+      - v5e ridges: HBM ≈ 240; one ICI link ≈ 4400; PCIe ≈ 12,000; DCN ≈ 63,000.
+      - Example: streaming weights over PCIe needs ≈ 57,500 tokens per step on a v6e (vs ≈ 575 from HBM).
+      - So keep weights in HBM, use ICI for traffic that scales with activations or sharded weights, and send only infrequent, aggregated traffic (e.g. data-parallel gradients) over DCN.
+
+reading:
+  - title: "Scaling Book ch. 2: How to Think About TPUs"
+    url: https://jax-ml.github.io/scaling-book/tpus/
+    kind: book
+    note: '"TPU Networking", the spec tables and Worked Problems 1–6, which this lesson works through.'
+  - title: "Jouppi et al. (2023), TPU v4: An Optically Reconfigurable Supercomputer"
+    url: https://arxiv.org/abs/2304.01433
+    kind: paper
+    note: How the 4×4×4 cubes, optical circuit switches and twisted tori of TPU v4 pods are built, and why.
+  - title: "Google Cloud docs: TPU v5p system architecture"
+    url: https://cloud.google.com/tpu/docs/v5p
+    kind: docs
+    note: Official v5p chip, ICI and pod specifications (the book's v5p numbers come from here).
+  - title: "Google Cloud docs: TPU v5e"
+    url: https://cloud.google.com/tpu/docs/v5e
+    kind: docs
+    note: v5e slice shapes, hosts and topology options, useful for checking which slices have wraparound.

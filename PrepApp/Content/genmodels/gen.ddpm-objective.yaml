@@ -1,0 +1,470 @@
+id: gen.ddpm-objective
+area: genmodels
+title: "Diffusion II: The ELBO & the ε-Prediction Loss"
+summary: Derives the DDPM training objective from maximum likelihood. Decomposes the ELBO into L_T, L_{t−1} and L_0 with the Bayes-on-x_0 trick, reduces each KL to a squared error, reparameterises the mean to predict noise, writes the per-step weight in SNR form, and explains what L_simple, learned variances and likelihood evaluation change.
+order: 110
+level: core
+tags: [diffusion, ddpm, elbo, generative-models, loss-weighting]
+prereqs: [gen.ddpm-forward-reverse]
+
+explainer:
+  - title: "The problem: maximum likelihood through 1000 latents"
+    source: "Ho et al. 2020 §2, eqs. (1), (3); Luo 2022, \"Variational Diffusion Models\" (p.8–9); CS229 notes ch.11, \"Jensen's inequality\""
+    body: |
+      Lesson I set up the model: a fixed noising chain $q$ and a learned Gaussian reverse chain
+
+      $$p_\theta(x_{0:T})=p(x_T)\prod_{t=1}^{T}p_\theta(x_{t-1}|x_t).$$
+
+      We want to fit $\theta$ by maximum likelihood, but $p_\theta(x_0)=\int p_\theta(x_{0:T})\,dx_{1:T}$ integrates over 1000 image-sized latents. That is intractable, exactly as in any latent-variable model.
+
+      **ELBO refresher** (from the ELBO lesson). Multiply and divide by any distribution over the latents; here the natural choice is the forward chain $q(x_{1:T}|x_0)$, which has no parameters. Jensen's inequality ($\log\mathbb E[Y]\ge\mathbb E[\log Y]$, because log is concave) then gives
+
+      $$\begin{aligned} \log p_\theta(x_0) &= \log\mathbb E_q\Big[\frac{p_\theta(x_{0:T})}{q(x_{1:T}|x_0)}\Big] \\ &\ge \mathbb E_q\Big[\log\frac{p_\theta(x_{0:T})}{q(x_{1:T}|x_0)}\Big]. \end{aligned}$$
+
+      We minimise $L:=-\text{ELBO}$. Plugging in both chains (lesson I's Markov factorisations):
+
+      $$L=\mathbb E_q\Big[-\log p(x_T)-\sum_{t\ge1}\log\frac{p_\theta(x_{t-1}|x_t)}{q(x_t|x_{t-1})}\Big].$$
+
+      This form is valid but awkward. Each ratio compares a reverse density over $x_{t-1}$ with a forward density over $x_t$, so no term is a KL divergence, and every term must be estimated by sampling whole trajectories, which is noisy. The fix is to rewrite the forward steps so that each term compares two distributions over the **same** variable, both Gaussian. The next two cards do it.
+
+      Notation is as in lesson I (Ho et al.): $\alpha_t=1-\beta_t$, $\bar\alpha_t=\prod_{s\le t}\alpha_s$, and $\sigma_t^2$ is the variance of $p_\theta(x_{t-1}|x_t)$. (Lesson III reuses $\alpha_t,\sigma_t$ with their VDM meanings, $\sqrt{\bar\alpha_t}$ and $\sqrt{1-\bar\alpha_t}$, and flags the switch.)
+  - title: "ELBO derivation I: the Bayes-on-x₀ trick"
+    source: "Ho et al. 2020 App. A, eqs. (17)–(20); Murphy PML2 §25.2.3; Luo 2022, \"Variational Diffusion Models\" (p.9–10)"
+    body: |
+      Split off the $t=1$ term, which has no $x_{t-2}$ partner:
+
+      $$\begin{aligned} L=\mathbb E_q\Big[&-\log p(x_T)-\log\frac{p_\theta(x_0|x_1)}{q(x_1|x_0)} \\ &-\sum_{t=2}^{T}\log\frac{p_\theta(x_{t-1}|x_t)}{q(x_t|x_{t-1})}\Big]. \end{aligned}$$
+
+      **The trick.** For $t\ge2$, use the Markov property to add $x_0$ to the conditioning for free, then Bayes' rule to flip the direction:
+
+      $$\begin{aligned} q(x_t|x_{t-1}) &= q(x_t|x_{t-1},x_0) \\ &= \frac{q(x_{t-1}|x_t,x_0)\,q(x_t|x_0)}{q(x_{t-1}|x_0)}. \end{aligned}$$
+
+      Every factor on the right is a Gaussian we know from lesson I: the posterior $q(x_{t-1}|x_t,x_0)$ and two closed-form marginals.
+
+      Substitute into the sum. The log of a product splits, so each $t\ge2$ term becomes
+
+      $$\log\frac{p_\theta(x_{t-1}|x_t)}{q(x_{t-1}|x_t,x_0)}+\log\frac{q(x_{t-1}|x_0)}{q(x_t|x_0)}.$$
+
+      The first piece now compares the model's reverse step with the true posterior, both distributions over $x_{t-1}$. The second piece has no parameters, and summed over $t$ it collapses, as the next card shows.
+
+      **Why the trick is allowed:** it is an exact identity, not an approximation. Conditioning on $x_0$ is harmless because we are inside $\mathbb E_{q(x_{1:T}|x_0)}$, where $x_0$ is given anyway.
+  - title: "ELBO derivation II: telescope and read off the KLs"
+    source: "Ho et al. 2020 eq. (5), App. A eqs. (21)–(22), §3.1, §4; Luo 2022, \"Variational Diffusion Models\" (p.10)"
+    body: |
+      **Telescope.** Summed over $t=2,\dots,T$, the parameter-free pieces cancel in pairs:
+
+      $$\sum_{t=2}^{T}\log\frac{q(x_{t-1}|x_0)}{q(x_t|x_0)}=\log\frac{q(x_1|x_0)}{q(x_T|x_0)}.$$
+
+      The $q(x_1|x_0)$ cancels the denominator of the $t=1$ term. Collecting what is left:
+
+      $$\begin{aligned} L=\mathbb E_q\Big[&-\log\frac{p(x_T)}{q(x_T|x_0)}-\log p_\theta(x_0|x_1) \\ &-\sum_{t=2}^{T}\log\frac{p_\theta(x_{t-1}|x_t)}{q(x_{t-1}|x_t,x_0)}\Big]. \end{aligned}$$
+
+      **Read off KLs.** An expected log-ratio $\mathbb E_{q(y)}[\log q(y)/p(y)]$ is $\mathrm{KL}(q\|p)$. Taking the expectation over $x_{t-1}$ inside, given $x_t$:
+
+      $$\begin{aligned} L &= L_T+\textstyle\sum_{t=2}^{T}L_{t-1}+L_0, \\ L_T &= \mathrm{KL}\big(q(x_T|x_0)\,\|\,p(x_T)\big), \\ L_{t-1} &= \mathbb E_{q(x_t|x_0)}\mathrm{KL}\big(q(x_{t-1}|x_t,x_0) \\ &\qquad\|\,p_\theta(x_{t-1}|x_t)\big), \\ L_0 &= -\mathbb E_{q(x_1|x_0)}\log p_\theta(x_0|x_1). \end{aligned}$$
+
+      **What each term means.**
+
+      - $L_T$ (prior matching): how far the fully noised data is from $N(0,I)$. With fixed $\beta_t$ it has no parameters; for $x_0=1$ under Ho's schedule it is about $\frac12\bar\alpha_T\approx2.0\times10^{-5}$ nats per dimension.
+      - $L_{t-1}$ (denoising matching): the model's reverse step should match the true posterior given the clean image.
+      - $L_0$ (reconstruction): the last step's likelihood of the data.
+
+      **Why this beats the naive form.** Each $L_{t-1}$ is a KL between two Gaussians, computable in closed form. The only sampling left is one $x_t\sim q(x_t|x_0)$ per term. Ho calls this a Rao–Blackwellized estimate: part of the expectation is done analytically, so its variance is lower. Indexing varies: Ho's $L_{t-1}$ is the term for step $t$, which Luo and others call $L_t$.
+  - title: "Each L_{t−1} is a squared error on the mean"
+    source: "Ho et al. 2020 eq. (8); Luo 2022, \"Variational Diffusion Models\" (p.13), eq. (86); Bishop PRML §1.5.5"
+    body: |
+      **Refresher: KL between isotropic Gaussians.** Take $q=N(\mu_1,s^2I)$ and $p=N(\mu_2,\sigma^2I)$ in $d$ dimensions. Then $\mathrm{KL}(q\|p)=\mathbb E_q[\log q-\log p]$, and the two expectations needed are $\mathbb E_q\|y-\mu_1\|^2=ds^2$ and $\mathbb E_q\|y-\mu_2\|^2=ds^2+\|\mu_1-\mu_2\|^2$. So
+
+      $$\begin{aligned} \mathrm{KL} &= \frac{\|\mu_1-\mu_2\|^2}{2\sigma^2} \\ &\quad+\frac d2\Big(\frac{s^2}{\sigma^2}-1-\log\frac{s^2}{\sigma^2}\Big). \end{aligned}$$
+
+      The mean part is a squared error; the variance part depends only on the two variances.
+
+      **Apply it to $L_{t-1}$.** Here $q(x_{t-1}|x_t,x_0)=N(\tilde\mu_t,\tilde\beta_tI)$ and $p_\theta(x_{t-1}|x_t)=N(\mu_\theta(x_t,t),\sigma_t^2I)$ with $\sigma_t^2$ fixed. The variance part is a constant $C$, which is 0 when $\sigma_t^2=\tilde\beta_t$:
+
+      $$L_{t-1}=\mathbb E_q\Big[\frac{1}{2\sigma_t^2}\big\|\tilde\mu_t(x_t,x_0)-\mu_\theta(x_t,t)\big\|^2\Big]+C.$$
+
+      So each term is a **regression**: from the noisy $x_t$ alone, predict the posterior mean, which depends on the $x_0$ the network never sees.
+
+      **Refresher: what regression on a noisy target learns.** Minimising $\mathbb E\|Y-f(X)\|^2$ over all functions gives $f(X)=\mathbb E[Y|X]$, the conditional mean. So the optimal $\mu_\theta(x_t,t)$ is $\mathbb E[\tilde\mu_t|x_t]$: the posterior mean averaged over all clean images that could have produced $x_t$. The randomness of the target does not bias the optimum; it only adds an irreducible error.
+
+      The most direct design has the network output $\mu_\theta$ itself. Ho found a better one.
+  - title: Predict the noise instead
+    source: "Ho et al. 2020 §3.2, eqs. (9)–(12), Alg. 2; Murphy PML2 §25.2.3"
+    body: |
+      **Rewrite the target.** Since $x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$, we can write $x_0=(x_t-\sqrt{1-\bar\alpha_t}\,\epsilon)/\sqrt{\bar\alpha_t}$ and substitute into $\tilde\mu_t$ from lesson I. Use $\sqrt{\bar\alpha_{t-1}}/\sqrt{\bar\alpha_t}=1/\sqrt{\alpha_t}$. The coefficient of $x_t$ becomes
+
+      $$\frac{\beta_t+\alpha_t(1-\bar\alpha_{t-1})}{\sqrt{\alpha_t}(1-\bar\alpha_t)}=\frac{1}{\sqrt{\alpha_t}},$$
+
+      because the numerator is $1-\alpha_t+\alpha_t-\bar\alpha_t=1-\bar\alpha_t$. The coefficient of $\epsilon$ is $-\beta_t/(\sqrt{\alpha_t}\sqrt{1-\bar\alpha_t})$. So
+
+      $$\tilde\mu_t=\frac{x_t}{\sqrt{\alpha_t}}-\frac{\beta_t\,\epsilon}{\sqrt{\alpha_t}\sqrt{1-\bar\alpha_t}}.$$
+
+      The target is $x_t$ (known) minus a known multiple of the noise that was added. Only $\epsilon$ is unknown.
+
+      **Parameterise the model the same way**, with a network $\epsilon_\theta(x_t,t)$ that predicts the noise:
+
+      $$\begin{aligned} \mu_\theta &= \frac{x_t}{\sqrt{\alpha_t}} \\ &\quad-\frac{\beta_t}{\sqrt{\alpha_t}\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta(x_t,t). \end{aligned}$$
+
+      Then $x_t$ cancels in the difference:
+
+      $$\tilde\mu_t-\mu_\theta=\frac{\beta_t}{\sqrt{\alpha_t}\sqrt{1-\bar\alpha_t}}\big(\epsilon_\theta-\epsilon\big),$$
+
+      and the KL term becomes a weighted noise-prediction error (Ho eq. 12):
+
+      $$\begin{aligned} L_{t-1}-C &= \frac{\beta_t^2}{2\sigma_t^2\alpha_t(1-\bar\alpha_t)} \\ &\quad\times\mathbb E\big\|\epsilon-\epsilon_\theta(x_t,t)\big\|^2. \end{aligned}$$
+
+      The sampler of lesson I becomes Ho's Algorithm 2: $x_{t-1}=\frac{1}{\sqrt{\alpha_t}}\big(x_t-\frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\epsilon_\theta(x_t,t)\big)+\sigma_tz$.
+
+      Nothing about the model changed; this is a reparameterisation. A noise prediction also implies a clean-image estimate, $\hat x_0=(x_t-\sqrt{1-\bar\alpha_t}\,\epsilon_\theta)/\sqrt{\bar\alpha_t}$. Lesson III compares the targets ($\epsilon$, $x_0$, $v$, score) in detail.
+  - title: The weight in SNR form
+    source: "Luo 2022, \"Learning Diffusion Noise Parameters\" (p.14), eqs. (101)–(110); Kingma et al. 2021 §4, eq. (13)"
+    body: |
+      Take $\sigma_t^2=\tilde\beta_t$ and write $\mathrm{SNR}(t)=\bar\alpha_t/(1-\bar\alpha_t)$. Ho's weight has a cleaner meaning in these terms.
+
+      **On the $x_0$-error.** If the network's mean uses an estimate $\hat x_0$, then $\tilde\mu_t-\mu_\theta=\frac{\sqrt{\bar\alpha_{t-1}}\beta_t}{1-\bar\alpha_t}(x_0-\hat x_0)$, so the weight is that coefficient squared over $2\tilde\beta_t$:
+
+      $$\frac{\bar\alpha_{t-1}\beta_t}{2(1-\bar\alpha_{t-1})(1-\bar\alpha_t)}.$$
+
+      Now compute the SNR drop over one step:
+
+      $$\begin{aligned} \mathrm{SNR}(t-1)-\mathrm{SNR}(t) &= \frac{\bar\alpha_{t-1}(1-\bar\alpha_t)-\bar\alpha_t(1-\bar\alpha_{t-1})}{(1-\bar\alpha_{t-1})(1-\bar\alpha_t)} \\ &= \frac{\bar\alpha_{t-1}-\bar\alpha_t}{(1-\bar\alpha_{t-1})(1-\bar\alpha_t)}, \end{aligned}$$
+
+      and $\bar\alpha_{t-1}-\bar\alpha_t=\bar\alpha_{t-1}\beta_t$. So the weight is exactly $\frac12\big(\mathrm{SNR}(t-1)-\mathrm{SNR}(t)\big)$.
+
+      **On the $\epsilon$-error.** From $x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon$, an $x_0$-error equals the $\epsilon$-error times $\sqrt{1-\bar\alpha_t}/\sqrt{\bar\alpha_t}$, so $\|x_0-\hat x_0\|^2=\|\epsilon-\hat\epsilon\|^2/\mathrm{SNR}(t)$. Dividing:
+
+      $$\begin{aligned} w_t &= \frac12\Big(\frac{\mathrm{SNR}(t-1)}{\mathrm{SNR}(t)}-1\Big) \\ &= \frac{\beta_t}{2\alpha_t(1-\bar\alpha_{t-1})}, \end{aligned}$$
+
+      which is Ho's $\frac{\beta_t^2}{2\tilde\beta_t\alpha_t(1-\bar\alpha_t)}$ after substituting $\tilde\beta_t$.
+
+      **Meaning:** the true ELBO weights each step by how much SNR is lost across it. VDM (§4) writes its discrete loss in exactly this form; lesson III takes the continuous limit.
+
+      ![The ELBO's per-step weight on the ε-error (σ_t² = β̃_t solid, β_t dashed) vs L_simple's flat weight, drawn at the ELBO's average. The ELBO puts about 100× more weight on t = 2 than on t = 500](gen.ddpm-objective/elbo-vs-simple-weights)
+
+      Under Ho's schedule $w_t$ is 0.60 at $t=2$, 0.086 at $t=10$, a minimum of 0.0050 near $t=350$, 0.0055 at $t=500$, and 0.010 at $t=1000$. If $\sigma_t^2=\beta_t$ instead, the constant differs and the small-$t$ weights shrink (0.27 at $t=2$).
+  - title: "L_simple: drop the weights"
+    source: "Ho et al. 2020 §3.4, eq. (14), Alg. 1, §4.2 Table 2; Kingma & Gao 2023 §3"
+    body: |
+      Ho's actual training loss throws the weights away and samples $t$ uniformly:
+
+      $$L_{\text{simple}}=\mathbb E_{t,x_0,\epsilon}\big\|\epsilon-\epsilon_\theta(x_t,t)\big\|^2,$$
+
+      with $x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon$. Training (Ho's Algorithm 1) is a few lines:
+
+      ```python
+      x0 = sample_data()
+      t = randint(1, T)
+      eps = randn_like(x0)
+      xt = sqrt(abar[t])*x0 + sqrt(1-abar[t])*eps
+      loss = ((eps - eps_model(xt, t))**2).mean()
+      ```
+
+      The $t=1$ case stands in for $L_0$ (the decoder's integral approximated by density times bin width); $L_T$ is dropped because it has no parameters.
+
+      **Its implicit weighting.** Relative to the true bound, step $t$'s KL is multiplied by $1/w_t$. Since $w_t$ is about 100× larger at $t=2$ than in the middle of the chain, $L_{\text{simple}}$ **down-weights small $t$**, the nearly clean inputs where denoising is easy, and spends effort on the harder, noisier steps. So $L_{\text{simple}}$ is a *reweighted* ELBO, not the ELBO.
+
+      **Why reweighting does not change what is learned, in principle.** Each $t$ is a separate regression whose minimiser is $\epsilon^*(x_t,t)=\mathbb E[\epsilon|x_t]$, whatever positive weight it gets. With a network flexible enough to represent every $t$ separately, all positive weightings share the same optimum. In practice capacity and optimisation are finite, so the weighting decides which noise levels get modelled best.
+
+      **The empirical trade-off** (Ho Table 2, CIFAR-10, $\epsilon$-prediction, fixed isotropic $\Sigma$):
+
+      - True bound $L$: FID 13.51, NLL ≤ 3.70 bits/dim.
+      - $L_{\text{simple}}$: FID 3.17, NLL ≤ 3.75 bits/dim.
+
+      Better samples, slightly worse likelihood. Predicting $\tilde\mu$ directly worked only with the true bound; with an unweighted MSE on $\tilde\mu$ it was unstable.
+  - title: Where the likelihood lives, and learning the variance
+    source: "Nichol & Dhariwal 2021 §3.1, §3.3, eqs. (15)–(18), Fig. 2; Ho et al. 2020 §3.3, eq. (13)"
+    body: |
+      The bound's nats are concentrated at small $t$. A computable toy shows why: for 1-D data $x_0\sim N(0,0.5^2)$ and the optimal model with $\sigma_t^2=\tilde\beta_t$, each $L_{t-1}$ equals the SNR-form weight times the irreducible error $\mathrm{Var}(x_0|x_t)=1/(4+\mathrm{SNR}(t))$.
+
+      ![Per-step KL terms of the optimal model for synthetic 1-D Gaussian data, linear schedule. 43% of the bound comes from t ≤ 10 and 87% from t ≤ 100](gen.ddpm-objective/elbo-terms)
+
+      Nichol & Dhariwal's Fig. 2 shows the same on ImageNet 64×64: the first few steps contribute most. That is exactly where $L_{\text{simple}}$ down-weights the loss and where $\beta_t$ and $\tilde\beta_t$ differ, so the fixed variance costs likelihood.
+
+      **Learned variances** (Nichol §3.1). The network outputs $v$ per dimension, and
+
+      $$\Sigma_\theta=\exp\big(v\log\beta_t+(1-v)\log\tilde\beta_t\big),$$
+
+      an interpolation in the log domain between the two extremes. $L_{\text{simple}}$ ignores $\Sigma_\theta$, so they add the bound back with a small weight: $L_{\text{hybrid}}=L_{\text{simple}}+0.001\,L_{\text{vlb}}$, with a stop-gradient on $\mu_\theta$ inside $L_{\text{vlb}}$ so that it trains only the variance. This improves likelihood and lets the model sample well with fewer steps.
+
+      **Optimising the bound directly is noisy** (Nichol §3.3), because its terms differ by orders of magnitude across $t$. Importance-sampling $t$ with $p_t\propto\sqrt{\mathbb E[L_t^2]}$ (from a running history of each term) reduces the gradient noise.
+
+      **Reporting likelihood.** Ho's $L_0$ is a discretised decoder: each 8-bit pixel gets the Gaussian probability mass of its bin (width $2/255$ on the $[-1,1]$ scale). The bound is then a lossless code length for discrete data, reported as bits/dim $=L/(D\ln2)$ for $D$ dimensions.
+  - title: What interviewers probe
+    source: Ho et al. 2020 §3, App. A; Nichol & Dhariwal 2021 §3; Kingma et al. 2021 §4
+    body: |
+      - *Derive the ELBO decomposition.* Jensen with $q(x_{1:T}|x_0)$; split off $t=1$; Markov plus Bayes on $q(x_t|x_{t-1})$; telescope the $q(\cdot|x_0)$ ratios; read off $L_T$, $L_{t-1}$, $L_0$.
+      - *Why condition on $x_0$?* It turns each term into a closed-form KL between Gaussians over the same variable, with lower-variance estimates.
+      - *Is $L_T$ trained?* No: with fixed $\beta_t$ it has no parameters (≈ $2\times10^{-5}$ nats for $x_0=1$).
+      - *Why does a KL become an MSE?* Fixed, matched isotropic variances leave only $\|\tilde\mu_t-\mu_\theta\|^2/2\sigma_t^2$.
+      - *Why predict $\epsilon$?* $\tilde\mu_t$ is $x_t$ minus a known multiple of $\epsilon$; predicting the residual noise gave the best samples (Ho Table 2).
+      - *What is Ho's weight?* $\beta_t^2/(2\sigma_t^2\alpha_t(1-\bar\alpha_t))$; with $\sigma_t^2=\tilde\beta_t$ it is $\frac12(\mathrm{SNR}(t-1)/\mathrm{SNR}(t)-1)$, i.e. $\frac12$ SNR drop per step on the $x_0$-error.
+      - *Is $L_{\text{simple}}$ the ELBO?* No: a reweighted bound that down-weights small $t$. Better FID, worse bits/dim.
+      - *Does the weighting change the optimum?* Not for an infinitely flexible network (each $t$'s optimum is $\mathbb E[\epsilon|x_t]$); in practice it allocates capacity.
+      - *Why is a DDPM stable to train?* Every term is a regression with a fixed target distribution: no adversary, no posterior collapse (the encoder is fixed).
+  - title: Key results
+    source: Ho et al. 2020 eqs. (5), (8), (11), (12), (14); Luo 2022 eq. (110); Nichol & Dhariwal 2021 eqs. (15)–(16)
+    body: |
+      $$\begin{aligned} L &= L_T+\textstyle\sum_{t=2}^{T}L_{t-1}+L_0, \\ L_T &= \mathrm{KL}\big(q(x_T|x_0)\,\|\,p(x_T)\big), \\ L_{t-1} &= \mathbb E_{q(x_t|x_0)}\mathrm{KL}\big(q(x_{t-1}|x_t,x_0) \\ &\qquad\|\,p_\theta(x_{t-1}|x_t)\big), \\ L_0 &= -\mathbb E_{q(x_1|x_0)}\log p_\theta(x_0|x_1). \end{aligned}$$
+
+      $$q(x_t|x_{t-1})=\frac{q(x_{t-1}|x_t,x_0)\,q(x_t|x_0)}{q(x_{t-1}|x_0)}$$
+
+      $$L_{t-1}=\mathbb E\,\frac{\|\tilde\mu_t-\mu_\theta\|^2}{2\sigma_t^2}+C$$
+
+      $$\mu_\theta=\frac{1}{\sqrt{\alpha_t}}\Big(x_t-\frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon_\theta\Big)$$
+
+      $$\begin{aligned} w_t &= \frac{\beta_t^2}{2\sigma_t^2\alpha_t(1-\bar\alpha_t)} \\ &= \frac12\Big(\frac{\mathrm{SNR}(t-1)}{\mathrm{SNR}(t)}-1\Big)\ \text{if }\sigma_t^2=\tilde\beta_t \end{aligned}$$
+
+      $$L_{\text{simple}}=\mathbb E_{t,x_0,\epsilon}\|\epsilon-\epsilon_\theta(x_t,t)\|^2$$
+
+      - On the $x_0$-error the ELBO weight is $\frac12(\mathrm{SNR}(t-1)-\mathrm{SNR}(t))$.
+      - $L_{\text{simple}}$ down-weights small $t$ relative to the bound: CIFAR-10 FID 3.17 vs 13.51, NLL 3.75 vs 3.70 bits/dim.
+      - Nichol: $\Sigma_\theta=\exp(v\log\beta_t+(1-v)\log\tilde\beta_t)$, $L_{\text{hybrid}}=L_{\text{simple}}+0.001L_{\text{vlb}}$.
+
+quiz:
+  - id: q1
+    source: Ho et al. 2020 §2, App. A; Murphy PML2 §25.2.3
+    prompt: |
+      In deriving the DDPM bound, $q(x_t|x_{t-1})$ is rewritten as $q(x_{t-1}|x_t,x_0)\,q(x_t|x_0)/q(x_{t-1}|x_0)$. What does this buy?
+    correct: Each term becomes a closed-form KL between Gaussians over x_{t−1}
+    wrong:
+      - It removes x_0 from the bound, so no data samples are needed
+      - It makes the bound tight, so the ELBO equals log p_θ(x_0)
+      - It turns L_T into a term that can be optimised over θ
+    explanation: |
+      After the rewrite and the telescoping, each $L_{t-1}$ compares $p_\theta(x_{t-1}|x_t)$ with the Gaussian posterior $q(x_{t-1}|x_t,x_0)$, so it is computed analytically and only $x_t$ is sampled. The rewrite is an exact identity: the bound's value and its gap are unchanged, and $x_0$ is still needed (it appears in the posterior).
+  - id: q2
+    source: Ho et al. 2020 eq. (5), §3.1
+    prompt: |
+      Which statement about the terms $L_T$, $L_{t-1}$ and $L_0$ of the DDPM bound is **false**?
+    correct: L_T must be minimised with respect to θ during training
+    wrong:
+      - L_0 measures how well the last reverse step explains x_0 from x_1
+      - Each L_{t−1} compares p_θ(x_{t−1}|x_t) with q(x_{t−1}|x_t, x_0)
+      - The three-term form is an exact rewrite of the same variational bound
+    explanation: |
+      $L_T=\mathrm{KL}(q(x_T|x_0)\|N(0,I))$ involves only the fixed forward process and the fixed prior, so with constant $\beta_t$ it has no parameters and is ignored in training (Ho §3.1). The other statements describe the decomposition correctly.
+  - id: q3
+    source: Ho et al. 2020 §4; Luo 2022, "Variational Diffusion Models" (p.10)
+    prompt: |
+      Under Ho's linear schedule $\bar\alpha_T\approx4.0\times10^{-5}$. For a single coordinate with $x_0=1$, roughly what is $L_T=\mathrm{KL}\big(N(\sqrt{\bar\alpha_T}x_0,1-\bar\alpha_T)\,\|\,N(0,1)\big)$?
+    correct: About 2 × 10⁻⁵ nats
+    wrong:
+      - About 4 × 10⁻⁵ nats
+      - About 6 × 10⁻³ nats
+      - About 0.5 nats
+    explanation: |
+      The general Gaussian KL gives $\frac12\big(\bar\alpha_Tx_0^2+(1-\bar\alpha_T)-1-\log(1-\bar\alpha_T)\big)\approx\frac12\bar\alpha_Tx_0^2\approx2.0\times10^{-5}$. $4\times10^{-5}$ forgets the $\frac12$; $6\times10^{-3}$ uses the unsquared mean shift $\sqrt{\bar\alpha_T}$.
+  - id: q4
+    source: "Ho et al. 2020 eq. (8); Luo 2022, \"Variational Diffusion Models\" (p.13)"
+    prompt: |
+      One coordinate at some step $t$, with $\sigma_t^2=\tilde\beta_t=0.01$. The posterior mean is $\tilde\mu_t=0.30$ and the model predicts $\mu_\theta=0.25$. What is the KL term $\mathrm{KL}(q(x_{t-1}|x_t,x_0)\|p_\theta(x_{t-1}|x_t))$?
+    correct: 0.125 nats
+    wrong:
+      - 0.25 nats
+      - 0.0125 nats
+      - 0.0025 nats
+    explanation: |
+      With equal variances the KL is $\|\tilde\mu_t-\mu_\theta\|^2/(2\sigma_t^2)=0.0025/0.02=0.125$. 0.25 drops the factor $\frac12$; 0.0125 divides by $2\sigma_t$ instead of $2\sigma_t^2$; 0.0025 is the raw squared error without the precision.
+  - id: q5
+    source: Ho et al. 2020 eqs. (9)–(11)
+    prompt: |
+      Substituting $x_0=(x_t-\sqrt{1-\bar\alpha_t}\,\epsilon)/\sqrt{\bar\alpha_t}$ into $\tilde\mu_t$, the coefficient of $x_t$ simplifies to $1/\sqrt{\alpha_t}$. Which identity does the key simplification?
+    correct: $\beta_t+\alpha_t(1-\bar\alpha_{t-1})=1-\bar\alpha_t$
+    wrong:
+      - $\bar\alpha_t+(1-\bar\alpha_t)=1$
+      - $\sqrt{\bar\alpha_t}=\sqrt{\alpha_t}\sqrt{\bar\alpha_{t-1}}$, with no other step
+      - $\tilde\beta_t=\beta_t(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)$
+    explanation: |
+      The $x_t$ coefficient is $\frac{\beta_t}{\sqrt{\alpha_t}(1-\bar\alpha_t)}+\frac{\sqrt{\alpha_t}(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}=\frac{\beta_t+\alpha_t(1-\bar\alpha_{t-1})}{\sqrt{\alpha_t}(1-\bar\alpha_t)}$, and the numerator equals $1-\bar\alpha_t$. The ratio $\sqrt{\bar\alpha_{t-1}}/\sqrt{\bar\alpha_t}=1/\sqrt{\alpha_t}$ is needed for the first term but does not by itself collapse the sum.
+  - id: q6
+    source: Ho et al. 2020 eq. (12); Kingma et al. 2021 §4
+    prompt: |
+      At $t=500$ of Ho's schedule, $\beta_{500}\approx0.0100$ and $\bar\alpha_{499}\approx0.079$. With $\sigma_t^2=\tilde\beta_t$, what is the ELBO weight $w_t=\beta_t/(2\alpha_t(1-\bar\alpha_{t-1}))$ on $\|\epsilon-\epsilon_\theta\|^2$?
+    correct: About 0.0055
+    wrong:
+      - About 0.0050
+      - About 0.0110
+      - About 0.064
+    explanation: |
+      $w_{500}=0.0100/(2\cdot0.990\cdot0.921)\approx0.0055$, equal to $\frac12(\mathrm{SNR}(499)/\mathrm{SNR}(500)-1)$. 0.0050 is just $\beta_t/2$; 0.0110 drops the $\frac12$; 0.064 uses $\bar\alpha_{t-1}$ in place of $1-\bar\alpha_{t-1}$.
+  - id: q7
+    source: Ho et al. 2020 §4.1–4.2, Table 2
+    prompt: |
+      Two identical $\epsilon$-prediction models are trained, one on the true variational bound (fixed $\Sigma$) and one on $L_{\text{simple}}$. What does Ho et al. report on CIFAR-10?
+    correct: The bound gives better bits/dim; L_simple gives far better FID
+    wrong:
+      - L_simple gives both better FID and better bits/dim
+      - The bound gives better FID; L_simple gives better bits/dim
+      - Results match, since both losses have the same minimiser
+    explanation: |
+      True bound: FID 13.51, NLL ≤ 3.70. $L_{\text{simple}}$: FID 3.17, NLL ≤ 3.75. Down-weighting small $t$ shifts effort from imperceptible detail (which dominates likelihood) to the noisier steps that shape samples. The per-$t$ minimiser is shared only for an infinitely flexible network; real networks trade capacity across $t$.
+  - id: q8
+    source: Ho et al. 2020 §3.4; Nichol & Dhariwal 2021 §3.1; Kingma & Gao 2023 §3
+    prompt: |
+      Which statement about $L_{\text{simple}}$ is **false**?
+    correct: It equals the negative ELBO up to an additive constant
+    wrong:
+      - Relative to the ELBO, it down-weights the loss at small t
+      - Any positive per-step weighting has the same per-step minimiser
+      - It does not depend on Σ_θ, so it cannot train a learned variance
+    explanation: |
+      $L_{\text{simple}}$ drops the step-dependent weights $w_t$, which vary by about 100× across $t$, so it differs from the bound by more than a constant. The per-step minimiser $\mathbb E[\epsilon|x_t]$ does not depend on the weight, and Nichol add $L_{\text{vlb}}$ precisely because $L_{\text{simple}}$ gives no signal to $\Sigma_\theta$.
+  - id: q9
+    source: Ho et al. 2020 §3.4; Luo 2022 eq. (110)
+    prompt: |
+      ![ELBO weight per step vs the flat L_simple weight](gen.ddpm-objective/elbo-vs-simple-weights)
+
+      Relative to the true ELBO (solid curve), by roughly what factor does $L_{\text{simple}}$ increase the emphasis on step $t=500$ compared with step $t=2$?
+    correct: About 100×
+    wrong:
+      - About 10×
+      - About 2×
+      - No change; both weight all steps equally
+    explanation: |
+      $L_{\text{simple}}$ multiplies step $t$'s KL by $1/w_t$. The ELBO weights are about 0.60 at $t=2$ and 0.0055 at $t=500$, a ratio of about 109, so relative to the bound $t=500$ gains about 100× emphasis over $t=2$. Only $L_{\text{simple}}$ is flat; the ELBO is not.
+  - id: q10
+    source: Nichol & Dhariwal 2021 §3.1, eq. (16)
+    prompt: |
+      Nichol & Dhariwal train with $L_{\text{hybrid}}=L_{\text{simple}}+0.001\,L_{\text{vlb}}$ and put a stop-gradient on $\mu_\theta$ inside $L_{\text{vlb}}$. Why the stop-gradient?
+    correct: So L_vlb trains only Σ_θ while L_simple drives μ_θ
+    wrong:
+      - Because L_vlb has no gradient with respect to μ_θ
+      - To make L_hybrid an exact evidence lower bound
+      - Because μ_θ is fixed to μ̃_t during training
+    explanation: |
+      $L_{\text{vlb}}$ does depend on $\mu_\theta$ (through the mean term of each KL), but its weighting would pull the mean toward the likelihood-oriented solution. The stop-gradient lets it guide only $\Sigma_\theta$, which $L_{\text{simple}}$ cannot train. With the 0.001 weight the sum is not an exact bound.
+  - id: q11
+    source: Nichol & Dhariwal 2021 §3.3, eq. (18), Fig. 2
+    prompt: |
+      Nichol & Dhariwal found the raw bound $L_{\text{vlb}}$ hard to optimise directly on ImageNet 64×64. What was the cause, and what fixed it?
+    correct: Terms vary hugely across t; importance-sample t
+    wrong:
+      - L_0 is not differentiable; replace it with an MSE
+      - L_T dominates the loss; drop the prior term
+      - The bound overfits; add dropout to the network
+    explanation: |
+      With uniform $t$, the gradient is dominated by the rare draws of the few large small-$t$ terms, so it is very noisy (they measured the gradient noise scale). Sampling $t$ with $p_t\propto\sqrt{\mathbb E[L_t^2]}$ and reweighting by $1/p_t$ keeps the estimate unbiased with less variance. $L_T$ is tiny and parameter-free.
+  - id: q12
+    source: Ho et al. 2020 §3.2; Luo 2022, "Three Equivalent Interpretations" (p.15)
+    prompt: |
+      A model parameterised by $\epsilon_\theta(x_t,t)$ implicitly predicts the clean image. Which estimate is it?
+    correct: $\hat x_0=(x_t-\sqrt{1-\bar\alpha_t}\,\epsilon_\theta)/\sqrt{\bar\alpha_t}$
+    wrong:
+      - $\hat x_0=\sqrt{\bar\alpha_t}\,(x_t-\sqrt{1-\bar\alpha_t}\,\epsilon_\theta)$
+      - $\hat x_0=x_t-\epsilon_\theta$
+      - $\hat x_0=(x_t-(1-\bar\alpha_t)\,\epsilon_\theta)/\bar\alpha_t$
+    explanation: |
+      Invert $x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon$ with $\epsilon$ replaced by its prediction. Multiplying by $\sqrt{\bar\alpha_t}$ instead of dividing shrinks the estimate; the last option uses variances where standard deviations belong.
+
+cards:
+  - id: f1
+    source: Ho et al. 2020 eq. (5)
+    front: Write the DDPM ELBO decomposition and name each term.
+    back: |
+      $$\begin{aligned} L &= L_T+\textstyle\sum_{t=2}^{T}L_{t-1}+L_0, \\ L_T &= \mathrm{KL}\big(q(x_T|x_0)\,\|\,p(x_T)\big), \\ L_{t-1} &= \mathbb E_{q(x_t|x_0)}\mathrm{KL}\big(q(x_{t-1}|x_t,x_0) \\ &\qquad\|\,p_\theta(x_{t-1}|x_t)\big), \\ L_0 &= -\mathbb E_{q(x_1|x_0)}\log p_\theta(x_0|x_1). \end{aligned}$$
+
+      $L_T$: prior matching. $L_{t-1}$: denoising matching. $L_0$: reconstruction.
+  - id: f2
+    source: Ho et al. 2020 App. A, eq. (20); Murphy PML2 eq. (25.13)
+    front: The identity that turns forward steps into posteriors in the DDPM ELBO derivation.
+    back: |
+      $$q(x_t|x_{t-1})=q(x_t|x_{t-1},x_0)=\frac{q(x_{t-1}|x_t,x_0)\,q(x_t|x_0)}{q(x_{t-1}|x_0)}$$
+
+      Markov property, then Bayes. The $q(\cdot|x_0)$ ratios then telescope.
+  - id: f3
+    source: "Luo 2022, \"Variational Diffusion Models\" eq. (86); Ho et al. 2020 eq. (8)"
+    front: KL between $N(\mu_1,s^2I)$ and $N(\mu_2,\sigma^2I)$ in $d$ dimensions, and what it gives for $L_{t-1}$.
+    back: |
+      $$\frac{\|\mu_1-\mu_2\|^2}{2\sigma^2}+\frac d2\Big(\frac{s^2}{\sigma^2}-1-\log\frac{s^2}{\sigma^2}\Big)$$
+
+      With fixed $\sigma_t^2$: $L_{t-1}=\mathbb E\|\tilde\mu_t-\mu_\theta\|^2/(2\sigma_t^2)+C$, and $C=0$ if $\sigma_t^2=\tilde\beta_t$.
+  - id: f4
+    source: Ho et al. 2020 eqs. (10)–(11)
+    front: The posterior mean $\tilde\mu_t$ written with $\epsilon$, and the matching parameterisation of $\mu_\theta$.
+    back: |
+      $$\tilde\mu_t=\frac{1}{\sqrt{\alpha_t}}\Big(x_t-\frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\,\epsilon\Big)$$
+
+      $\mu_\theta$: the same with $\epsilon\to\epsilon_\theta(x_t,t)$.
+  - id: f5
+    source: Ho et al. 2020 eq. (12); Luo 2022 eq. (110)
+    front: Ho's per-step weight on $\|\epsilon-\epsilon_\theta\|^2$, and its SNR form when $\sigma_t^2=\tilde\beta_t$.
+    back: |
+      $$\begin{aligned} w_t &= \frac{\beta_t^2}{2\sigma_t^2\alpha_t(1-\bar\alpha_t)} \\ &= \frac12\Big(\frac{\mathrm{SNR}(t-1)}{\mathrm{SNR}(t)}-1\Big) \end{aligned}$$
+
+      On the $x_0$-error: $\frac12(\mathrm{SNR}(t-1)-\mathrm{SNR}(t))$, the SNR lost across the step.
+  - id: f6
+    source: Ho et al. 2020 §3.4, eq. (14), Table 2
+    front: What is $L_{\text{simple}}$, and how does it relate to the ELBO?
+    back: |
+      $\mathbb E_{t\sim U\{1..T\},x_0,\epsilon}\|\epsilon-\epsilon_\theta(\sqrt{\bar\alpha_t}x_0+\sqrt{1-\bar\alpha_t}\epsilon,t)\|^2$.
+
+      A reweighted bound: multiplies step $t$ by $1/w_t$, down-weighting small $t$. CIFAR-10: FID 3.17 vs 13.51, NLL 3.75 vs 3.70 bits/dim.
+  - id: f7
+    source: Nichol & Dhariwal 2021 §3.1, §3.3
+    front: Nichol & Dhariwal's learned variance, hybrid loss and fix for the noisy bound.
+    back: |
+      $\Sigma_\theta=\exp(v\log\beta_t+(1-v)\log\tilde\beta_t)$; $L_{\text{hybrid}}=L_{\text{simple}}+0.001L_{\text{vlb}}$ with stop-gradient on $\mu_\theta$ in $L_{\text{vlb}}$.
+
+      To optimise $L_{\text{vlb}}$ alone: importance-sample $t$ with $p_t\propto\sqrt{\mathbb E[L_t^2]}$.
+  - id: f8
+    type: open
+    source: Ho et al. 2020 App. A; Luo 2022, "Variational Diffusion Models" (p.8–10); Murphy PML2 §25.2.3
+    front: Derive the DDPM variational bound in the form $L_T+\sum_t L_{t-1}+L_0$.
+    back: |
+      - Jensen with the fixed $q(x_{1:T}|x_0)$: $L=\mathbb E_q[-\log p(x_T)-\sum_{t\ge1}\log\frac{p_\theta(x_{t-1}|x_t)}{q(x_t|x_{t-1})}]$.
+      - Split off $t=1$. For $t\ge2$: $q(x_t|x_{t-1})=q(x_t|x_{t-1},x_0)=\frac{q(x_{t-1}|x_t,x_0)q(x_t|x_0)}{q(x_{t-1}|x_0)}$.
+      - The $\log\frac{q(x_{t-1}|x_0)}{q(x_t|x_0)}$ terms telescope to $\log\frac{q(x_1|x_0)}{q(x_T|x_0)}$; $q(x_1|x_0)$ cancels the $t=1$ denominator.
+      - Group: $-\log\frac{p(x_T)}{q(x_T|x_0)}\to L_T$; $-\log\frac{p_\theta(x_{t-1}|x_t)}{q(x_{t-1}|x_t,x_0)}\to L_{t-1}$ after the inner expectation; $-\log p_\theta(x_0|x_1)\to L_0$.
+      - Point out: exact rewrite; Gaussian KLs in closed form; only $x_t$ sampled (Rao–Blackwellized); $L_T$ parameter-free.
+  - id: f9
+    type: open
+    source: Ho et al. 2020 §3.2, eqs. (8)–(12)
+    front: Starting from one KL term $L_{t-1}$, derive the $\epsilon$-prediction loss and its weight.
+    back: |
+      - Fixed $\sigma_t^2$: Gaussian KL gives $L_{t-1}=\mathbb E\|\tilde\mu_t-\mu_\theta\|^2/(2\sigma_t^2)+C$.
+      - Substitute $x_0=(x_t-\sqrt{1-\bar\alpha_t}\epsilon)/\sqrt{\bar\alpha_t}$ into $\tilde\mu_t$; using $\beta_t+\alpha_t(1-\bar\alpha_{t-1})=1-\bar\alpha_t$, get $\tilde\mu_t=\frac1{\sqrt{\alpha_t}}(x_t-\frac{\beta_t}{\sqrt{1-\bar\alpha_t}}\epsilon)$.
+      - Parameterise $\mu_\theta$ identically with $\epsilon_\theta$; $x_t$ cancels in the difference.
+      - Result: $\frac{\beta_t^2}{2\sigma_t^2\alpha_t(1-\bar\alpha_t)}\|\epsilon-\epsilon_\theta\|^2$.
+      - With $\sigma_t^2=\tilde\beta_t$ this is $\frac12(\mathrm{SNR}(t-1)/\mathrm{SNR}(t)-1)$; dropping it and sampling $t$ uniformly gives $L_{\text{simple}}$.
+  - id: f10
+    type: open
+    source: Ho et al. 2020 §3.4, §4.2; Nichol & Dhariwal 2021 §3; Kingma & Gao 2023 §3
+    front: Explain to an interviewer why $L_{\text{simple}}$ gives better samples than the true bound, and what it gives up.
+    back: |
+      - The bound's weight $w_t$ is about 100× larger at small $t$ than mid-chain; $L_{\text{simple}}$ makes it flat, i.e. multiplies step $t$ by $1/w_t$.
+      - Small $t$ is near-clean denoising: imperceptible detail that dominates likelihood but barely affects samples. $L_{\text{simple}}$ spends capacity on noisier steps that decide global structure.
+      - For an infinitely flexible network the per-$t$ optimum $\mathbb E[\epsilon|x_t]$ is the same either way; the weighting matters because capacity and optimisation are finite.
+      - Cost: worse likelihood (3.75 vs 3.70 bits/dim on CIFAR-10) and no signal for a learned variance.
+      - Remedies: $L_{\text{hybrid}}$ with learned $\Sigma_\theta$, importance-sampled $L_{\text{vlb}}$ (Nichol); principled weightings in lesson III.
+  - id: f11
+    type: open
+    source: "Luo 2022, \"Learning Diffusion Noise Parameters\" (p.14); Kingma et al. 2021 §4"
+    front: Show that with $\sigma_t^2=\tilde\beta_t$ the ELBO term for step $t$ is $\frac12(\mathrm{SNR}(t-1)-\mathrm{SNR}(t))\|x_0-\hat x_0\|^2$, and interpret it.
+    back: |
+      - With an $x_0$-estimate in $\tilde\mu_t$: $\tilde\mu_t-\mu_\theta=\frac{\sqrt{\bar\alpha_{t-1}}\beta_t}{1-\bar\alpha_t}(x_0-\hat x_0)$.
+      - Weight $=$ coefficient$^2/(2\tilde\beta_t)=\frac{\bar\alpha_{t-1}\beta_t}{2(1-\bar\alpha_{t-1})(1-\bar\alpha_t)}$.
+      - $\mathrm{SNR}(t-1)-\mathrm{SNR}(t)=\frac{\bar\alpha_{t-1}-\bar\alpha_t}{(1-\bar\alpha_{t-1})(1-\bar\alpha_t)}$ and $\bar\alpha_{t-1}-\bar\alpha_t=\bar\alpha_{t-1}\beta_t$: equal up to the $\frac12$.
+      - Interpretation: each step is weighted by the SNR it destroys. In $\epsilon$-units divide by $\mathrm{SNR}(t)$.
+      - Continuous limit: $-\frac12\mathrm{SNR}'(t)\|x_0-\hat x_0\|^2dt$ (VDM), which leads to schedule invariance (lesson III).
+
+reading:
+  - title: "Ho, Jain & Abbeel (2020), Denoising Diffusion Probabilistic Models, §3 and App. A"
+    url: https://arxiv.org/abs/2006.11239
+    kind: paper
+    note: The bound (eq. 5) and its derivation, the ε-parameterisation (eqs. 8–12), L_simple (eq. 14) and the Table 2 ablation.
+  - title: "Luo (2022), Understanding Diffusion Models, \"Variational Diffusion Models\" and \"Learning Diffusion Noise Parameters\" (p.8–14)"
+    url: https://arxiv.org/abs/2208.11970
+    kind: paper
+    note: Shows the naive and the improved ELBO side by side, the Gaussian-KL step, and the SNR form of the weight line by line.
+  - title: "Nichol & Dhariwal (2021), Improved Denoising Diffusion Probabilistic Models, §3"
+    url: https://arxiv.org/abs/2102.09672
+    kind: paper
+    note: Learned variances, L_hybrid, importance-sampled L_vlb, and the per-step VLB plot.
+  - title: "Kingma, Salimans, Poole & Ho (2021), Variational Diffusion Models, §3–4"
+    url: https://arxiv.org/abs/2107.00630
+    kind: paper
+    note: The same discrete-time loss written as an SNR difference times an x-error (eq. 13), in α/σ notation.
+  - title: "CS229 Lecture Notes, ch. 14 (Diffusion models)"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: A course-notes derivation of training diffusion models by maximising the ELBO.

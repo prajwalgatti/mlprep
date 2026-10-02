@@ -1,0 +1,551 @@
+id: fund.svm-margin-dual
+area: fundamentals
+title: "SVMs I: Max Margin, Duality & Hinge Loss"
+summary: The maximum-margin classifier derived from scratch. The geometry of margins, the hard-margin QP, a Lagrangian-duality crash course, the dual derivation, support vectors via complementary slackness, a hand-solved example, the soft margin and its box constraint, hinge loss as regularized ERM, and how SVMs are solved (SMO, subgradient SGD).
+order: 270
+level: intermediate
+tags: [svm, convex-optimization, duality, hinge-loss, classical-ml]
+prereqs: [fund.loss-functions, fund.convexity]
+
+explainer:
+  - title: "The problem: which separating hyperplane?"
+    body: |
+      Binary data $(x_i, y_i)$ with $x_i \in \mathbb{R}^d$ and labels $y_i \in \{-1, +1\}$ (the $\pm1$ convention is essential here). A linear classifier predicts $\mathrm{sign}(f(x))$ with $f(x) = w^\top x + b$. Note that the intercept $b$ is kept separate from $w$, unlike in the regression lessons.
+
+      If the data are linearly separable, infinitely many hyperplanes classify the training set perfectly. The perceptron stops at whichever it hits first. **Which one should we prefer?** Intuitively, the one that stays as far as possible from every training point, so that small perturbations of the inputs don't flip any prediction.
+
+      **Distance to a hyperplane (derivation).** $w$ is normal to the hyperplane $\{x : w^\top x + b = 0\}$: for two points on it, $w^\top(x_1 - x_2) = 0$. Write any $x$ as its projection $x_\perp$ onto the hyperplane plus a step of signed length $r$ along the unit normal:
+
+      $$x = x_\perp + r\,\frac{w}{\|w\|}.$$
+
+      Apply $f$. Since $f(x_\perp) = 0$, $f(x) = r\,w^\top w/\|w\| = r\|w\|$, so
+
+      $$r = \frac{w^\top x + b}{\|w\|}.$$
+
+      **Two kinds of margin.**
+      - The **functional margin** $y_i(w^\top x_i + b)$ is positive iff point $i$ is correctly classified, but it scales with $(w, b)$.
+      - The **geometric margin** $\gamma_i = y_i(w^\top x_i + b)/\|w\|$ is the actual signed distance, and it is invariant to rescaling $(w, b) \to (cw, cb)$ for $c > 0$.
+
+      The margin of the classifier is $\gamma = \min_i \gamma_i$, the distance from the hyperplane to the closest training point.
+
+      **Fixing the scale.** Since rescaling $(w, b)$ doesn't change the hyperplane, choose the scale that makes the closest points have functional margin exactly 1:
+
+      $$\min_i y_i(w^\top x_i + b) = 1.$$
+
+      This is the **canonical** scaling. Then $\gamma = 1/\|w\|$, and the band between the hyperplanes $f = +1$ and $f = -1$ has width $2/\|w\|$. Example: $w = (3, 4)$ gives a band of width $2/5 = 0.4$.
+    source: "CS229 notes §6.1–6.4; Bishop PRML §7.1; ESL §4.5.2"
+
+  - title: "The hard-margin primal and why the margin matters"
+    body: |
+      Maximizing $\gamma = 1/\|w\|$ under the canonical constraint is the same as minimizing $\|w\|^2$ (squaring and the factor $\tfrac12$ just tidy the calculus):
+
+      $$\begin{aligned} \min_{w, b}\ & \tfrac12\|w\|^2 \\ \text{s.t. }\ & y_i(w^\top x_i + b) \ge 1,\ \ i = 1..N. \end{aligned}$$
+
+      Once some constraint is tight at the optimum, the minimum of $y_i f(x_i)$ is exactly 1, so the canonical scaling is enforced automatically.
+
+      **Why this is a nice problem.** The objective is a convex quadratic and the constraints are linear in $(w, b)$, so it is a **convex quadratic program (QP)**. A local optimum is global, and the objective is strictly convex in $w$, so the optimal $w$ is unique. Off-the-shelf QP solvers handle it. We take the dual route anyway, because it reveals the structure (support vectors, inner products) and leads to kernels.
+
+      ![Synthetic separable data. The max-margin line sits midway between the closest points of each class; only the circled support vectors touch the margin lines.](fund.svm-margin-dual/margin)
+
+      **Why maximize the margin?**
+      - **Robustness**: any perturbation of a training input smaller than $\gamma$ in norm can't flip its label.
+      - **Generalization without dimension**: for halfspaces with margin $\gamma$ on data of norm at most $\rho$, sample-complexity bounds scale with $(\rho/\gamma)^2$ rather than with the dimension $d$. The VC bound for halfspaces scales with $d$. UML's example is bag-of-words text, where $d > 10^5$ but $\rho^2 B^2$ (with $B = 1/\gamma$ the norm of a unit-margin $w$) can be under $10^4$.
+      - **The cost**: large margin is an inductive bias. When the true boundary isn't well separated, insisting on a large margin can increase approximation error.
+
+      If the data aren't separable, the constraints can't all hold and the hard-margin problem is **infeasible**. The soft margin (card 7) fixes this.
+    source: "CS229 notes §6.4; ESL §4.5.2; SSBD §15.1, §15.2.2"
+
+  - title: "Lagrangian duality, the crash course"
+    body: |
+      Take a general problem: minimize $f(w)$ subject to $g_i(w) \le 0$ for $i = 1..N$.
+
+      **Lagrangian.** Attach a multiplier $\alpha_i \ge 0$ to each constraint:
+
+      $$L(w, \alpha) = f(w) + \sum_i \alpha_i g_i(w).$$
+
+      **The primal as a min–max.** Fix $w$ and maximize over $\alpha \ge 0$. If some $g_i(w) > 0$, sending $\alpha_i \to \infty$ gives $+\infty$. If $w$ is feasible, the best is $\alpha_i g_i = 0$, which gives $f(w)$. So $\min_w \max_{\alpha \ge 0} L$ is exactly the constrained problem, with value $p^*$.
+
+      **The dual.** Swap the order. The **dual function** is $\theta(\alpha) = \min_w L(w, \alpha)$, and the **dual problem** is $d^* = \max_{\alpha \ge 0}\theta(\alpha)$.
+      - **$\theta$ is always concave**, even if the primal isn't convex: it is a pointwise minimum of functions that are affine in $\alpha$.
+      - **Weak duality, $d^* \le p^*$.** For any feasible $w$ and $\alpha \ge 0$:
+
+      $$\theta(\alpha) \le L(w, \alpha) = f(w) + \sum_i \alpha_i g_i(w) \le f(w),$$
+
+        since each $\alpha_i g_i(w) \le 0$. Every dual value lower-bounds every primal value.
+      - **Strong duality, $d^* = p^*$**, holds for convex problems under **Slater's condition** (a strictly feasible point exists). When the constraints are affine, as in the SVM, plain feasibility is enough.
+
+      **KKT conditions.** With strong duality and differentiable functions, $(w^*, \alpha^*)$ is optimal iff:
+      1. Stationarity: $\nabla_w L(w^*, \alpha^*) = 0$.
+      2. Primal feasibility: $g_i(w^*) \le 0$.
+      3. Dual feasibility: $\alpha_i^* \ge 0$.
+      4. **Complementary slackness**: $\alpha_i^* g_i(w^*) = 0$.
+
+      Condition 4 says that each constraint is either tight ($g_i = 0$) or has zero multiplier. A multiplier measures how much the optimal value would improve if that constraint were relaxed, so a slack constraint is worth nothing. This one condition produces the SVM's sparsity.
+    source: "CS229 notes §6.5; Boyd CVX §5.1, §5.2.2–5.2.3, §5.5.2–5.5.3; Bishop PRML App. E"
+
+  - title: "Deriving the SVM dual"
+    body: |
+      Write the hard-margin constraints as $g_i = 1 - y_i(w^\top x_i + b) \le 0$. The Lagrangian is
+
+      $$\begin{aligned} L(w, b, \alpha) &= \tfrac12\|w\|^2 \\ &\quad - \sum_i \alpha_i\big[y_i(w^\top x_i + b) - 1\big]. \end{aligned}$$
+
+      **Minimize over $w$ and $b$** (for fixed $\alpha \ge 0$). $L$ is a convex quadratic in $w$, so set the gradient to zero:
+
+      $$\nabla_w L = w - \sum_i \alpha_i y_i x_i = 0 \ \Rightarrow\ w = \sum_i \alpha_i y_i x_i.$$
+
+      $L$ is *linear* in $b$ with slope $-\sum_i \alpha_i y_i$. If that slope is nonzero, $\min_b L = -\infty$. So the dual function is finite only when
+
+      $$\sum_i \alpha_i y_i = 0.$$
+
+      **Substitute back.** With $w = \sum_j \alpha_j y_j x_j$, the term $\sum_i \alpha_i y_i w^\top x_i$ equals $w^\top w$, and the $b$ term vanishes:
+
+      $$\begin{aligned} \theta(\alpha) &= \tfrac12\|w\|^2 - \|w\|^2 + \sum_i \alpha_i \\ &= \sum_i \alpha_i - \tfrac12\sum_{i,j}\alpha_i\alpha_j y_i y_j\, x_i^\top x_j. \end{aligned}$$
+
+      **The dual problem.**
+
+      $$\begin{aligned} \max_\alpha\ & \sum_i \alpha_i - \tfrac12\sum_{i,j}\alpha_i\alpha_j y_i y_j\, x_i^\top x_j \\ \text{s.t. }\ & \alpha_i \ge 0, \ \ \sum_i \alpha_i y_i = 0. \end{aligned}$$
+
+      This is a concave QP in $N$ variables (instead of $d + 1$). The quadratic term is $-\tfrac12\|\sum_i \alpha_i y_i x_i\|^2 \le 0$.
+
+      **Predictions** also use only inner products:
+
+      $$f(x) = \sum_i \alpha_i y_i\, x_i^\top x + b.$$
+
+      **Why this matters.** The data enter *only* through inner products $x_i^\top x_j$. Replace them with a kernel $k(x_i, x_j) = \phi(x_i)^\top\phi(x_j)$ and you get a linear SVM in a feature space you never compute explicitly. That is the next lesson (`fund.svm-kernels`). The dual also has simpler constraints than the primal: one equality plus bounds.
+    source: "CS229 notes §6.6 (eqs. 6.9–6.12, 6.15); Bishop PRML §7.1 (eqs. 7.8–7.13)"
+
+  - title: "Complementary slackness and support vectors"
+    body: |
+      For the SVM, complementary slackness reads
+
+      $$\alpha_i\big[y_i f(x_i) - 1\big] = 0 \quad \text{for every } i.$$
+
+      So $\alpha_i > 0$ only for points with $y_i f(x_i) = 1$, the ones lying exactly on a margin hyperplane. These are the **support vectors**. Every point strictly outside the margin has $\alpha_i = 0$.
+
+      **Consequences.**
+      - **Sparsity.** $w = \sum_i \alpha_i y_i x_i$ involves only the support vectors, and so do predictions. After training you can discard the rest.
+      - **Non-support vectors don't matter.** Delete, or move without crossing the margin, a point with $\alpha_i = 0$, and the old solution still satisfies every KKT condition, so it is still optimal. Deleting a support vector can change the solution.
+      - **Recovering $b$.** For any support vector $s$, $y_s(w^\top x_s + b) = 1$. Multiply by $y_s$ (using $y_s^2 = 1$) to get $b = y_s - w^\top x_s$. In practice, average this over all support vectors for numerical stability.
+      - **The margin from the duals.** Sum complementary slackness over $i$: $\sum_i \alpha_i y_i f(x_i) = \sum_i \alpha_i$. The left side is $w^\top\sum_i\alpha_i y_i x_i + b\sum_i\alpha_i y_i = \|w\|^2$. So
+
+      $$\|w\|^2 = \sum_i \alpha_i, \qquad \gamma = \frac{1}{\sqrt{\sum_i \alpha_i}}.$$
+
+        This also shows the dual optimum equals the primal optimum: $\sum\alpha_i - \tfrac12\|w\|^2 = \tfrac12\|w\|^2$.
+      - **A leave-one-out bound.** Leaving out a non-support vector doesn't change the classifier, which still classifies it correctly. Only left-out support vectors can become errors. Hence (Vapnik)
+
+      $$\mathbb{E}[\text{test error}] \le \frac{\mathbb{E}[\#\text{SV}]}{N},$$
+
+        where the expected error is that of an SVM trained on $N - 1$ points. Few support vectors suggest good generalization.
+
+      **Caveat.** The converse of "$\alpha_i > 0$ ⇒ on the margin" fails. A point can lie exactly on the margin with $\alpha_i = 0$ (a degenerate case), so "support vector" is safest defined as $\alpha_i > 0$.
+    source: "CS229 notes §6.5–6.6 (eqs. 6.5, 6.13); Bishop PRML §7.1 (eqs. 7.14–7.18); Burges 1998 §7.4"
+
+  - title: "Worked example: solving an SVM by hand"
+    body: |
+      Five points in $\mathbb{R}^2$: positives $(2,0), (0,2), (3,3)$ and negatives $(0,0), (-1,0)$.
+
+      **Guess the support vectors from the geometry.** The closest opposite-class points are $(0,0)$ and the two positives $(2,0), (0,2)$. The boundary should be parallel to the line through $(2,0)$ and $(0,2)$, halfway to the origin. That suggests $f(x) = x_1 + x_2 - 1$, i.e. $w = (1, 1)$, $b = -1$.
+
+      **Check primal feasibility.** The margins $y_i f(x_i)$ are:
+      - $(2,0)$: $1$. $(0,2)$: $1$. $(0,0)$: $-1 \cdot (-1) = 1$. These three are on the margin.
+      - $(3,3)$: $5$. $(-1,0)$: $-1 \cdot (-2) = 2$. These two are outside it.
+
+      **Find $\alpha$ from stationarity.** Complementary slackness forces $\alpha = 0$ for $(3,3)$ and $(-1,0)$. Then
+
+      $$\begin{aligned} w &= \alpha_1 (2, 0) + \alpha_2 (0, 2) - \alpha_3 (0, 0) \\ &= (2\alpha_1, 2\alpha_2) = (1, 1), \end{aligned}$$
+
+      so $\alpha_1 = \alpha_2 = \tfrac12$. The point $(0,0)$ contributes nothing to $w$, but $\sum_i \alpha_i y_i = 0$ forces $\alpha_3 = \alpha_1 + \alpha_2 = 1$.
+
+      **Verify optimality.**
+      - All $\alpha \ge 0$, every constraint holds, complementary slackness holds, and stationarity holds. KKT is satisfied, so this is *the* optimum.
+      - $\|w\|^2 = 2 = \sum_i\alpha_i = \tfrac12 + \tfrac12 + 1$. ✓
+      - Dual value $\sum\alpha_i - \tfrac12\|w\|^2 = 2 - 1 = 1$ equals primal value $\tfrac12\|w\|^2 = 1$: strong duality.
+      - Margin $\gamma = 1/\sqrt2 \approx 0.71$, band width $\sqrt2$.
+
+      **Lessons.**
+      - The $\alpha$'s need not be equal: the single negative support vector balances both positives.
+      - Moving $(3,3)$ anywhere with $x_1 + x_2 > 2$, or deleting it, changes nothing.
+      - Signed distance of a new point $(2,2)$: $f/\|w\| = 3/\sqrt2 = 2.12$.
+
+      A scikit-learn `SVC(kernel="linear")` with a huge $C$ returns exactly $w = (1,1)$, $b = -1$ and these $\alpha$'s.
+    source: "CS229 notes §6.6; Bishop PRML §7.1"
+
+  - title: "Soft margin: slack variables and the box constraint"
+    body: |
+      Real data overlap, and even separable data can contain an outlier that forces a tiny margin. Let point $i$ violate the margin by a **slack** $\xi_i \ge 0$, and pay for it:
+
+      $$\begin{aligned} \min_{w, b, \xi}\ & \tfrac12\|w\|^2 + C\sum_i \xi_i \\ \text{s.t. }\ & y_i(w^\top x_i + b) \ge 1 - \xi_i, \ \ \xi_i \ge 0. \end{aligned}$$
+
+      - $\xi_i = 0$: on or outside the margin.
+      - $0 < \xi_i \le 1$: inside the margin but correctly classified.
+      - $\xi_i > 1$: misclassified.
+
+      So $\sum_i \xi_i$ upper-bounds the number of training errors. The problem is feasible for every $C$: take any $w$ and large enough slacks.
+
+      **The dual.** Add multipliers $\alpha_i \ge 0$ for the margin constraints and $\mu_i \ge 0$ for $\xi_i \ge 0$. The $w$ and $b$ conditions are unchanged. The new one is
+
+      $$\frac{\partial L}{\partial \xi_i} = C - \alpha_i - \mu_i = 0.$$
+
+      Substituting removes $\xi$ from $L$ entirely, so the dual objective is **identical** to the hard-margin one. Since $\mu_i = C - \alpha_i \ge 0$, the only change is a **box constraint**:
+
+      $$0 \le \alpha_i \le C, \qquad \sum_i \alpha_i y_i = 0.$$
+
+      **Three kinds of points** (from the two complementary-slackness conditions, $\alpha_i[y_if(x_i) - 1 + \xi_i] = 0$ and $\mu_i\xi_i = 0$):
+      - $\alpha_i = 0$: $y_i f(x_i) \ge 1$, outside the margin, ignored.
+      - $0 < \alpha_i < C$: then $\mu_i > 0$, so $\xi_i = 0$ and $y_i f(x_i) = 1$, exactly on the margin. Compute $b$ from these points.
+      - $\alpha_i = C$: $y_i f(x_i) \le 1$, inside the margin or misclassified ($\xi_i = 1 - y_i f(x_i)$).
+
+      ![Synthetic overlapping classes at C = 1. Every point inside the band or on the wrong side has α at the cap C; only points exactly on the dashed lines have 0 < α < C.](fund.svm-margin-dual/alpha-types)
+
+      **What $C$ trades off.** Large $C$ makes violations expensive: a narrow margin, few support vectors, and a boundary that bends toward outliers (low bias, high variance). As $C \to \infty$ on separable data the solution approaches the hard margin. Small $C$ gives a wide margin, many support vectors (each capped at $\alpha = C$) and a smoother, higher-bias boundary. $C$ is tuned by cross-validation, usually on a log grid.
+    source: "CS229 notes §6.7 (eqs. 6.16–6.18); Bishop PRML §7.1.1 (eqs. 7.21–7.37); ESL §12.2"
+
+  - title: "Hinge loss: the SVM as regularized ERM"
+    body: |
+      At the optimum each slack is as small as its constraints allow, because the objective increases in $\xi_i$. The constraints are $\xi_i \ge 0$ and $\xi_i \ge 1 - y_i f(x_i)$, so
+
+      $$\xi_i = \max\big(0,\ 1 - y_i f(x_i)\big) = [1 - y_i f(x_i)]_+.$$
+
+      Substitute, and divide the objective by $C$:
+
+      $$\min_{w, b}\ \sum_i [1 - y_i f(x_i)]_+ + \frac{\lambda}{2}\|w\|^2, \quad \lambda = \frac1C.$$
+
+      This is **hinge loss + L2 penalty**: the familiar loss-plus-regularizer form. Only $w$ is penalized, not $b$.
+
+      **Conventions differ.** UML writes $\lambda\|w\|^2 + \frac1N\sum\xi_i$, which corresponds to $\lambda = 1/(2NC)$. Scikit-learn's `C` multiplies the *sum* of hinge losses, so the best $C$ grows with $N$ at fixed per-example regularization.
+
+      **Hinge vs logistic.** Write the margin as $m = y f(x)$.
+      - Both are convex surrogates for the 0–1 loss $[m \le 0]$, and both grow linearly as $m \to -\infty$. Hinge equals $1 - m$ for $m \le 1$. Logistic $\log(1 + e^{-m})$ approaches $-m$.
+      - Hinge is **exactly zero for $m \ge 1$**. Confidently correct points contribute no gradient, which is the loss-function view of sparsity (only points with $m \le 1$ can have $\alpha > 0$). Logistic loss is positive everywhere, so every point influences the fit.
+      - **Probabilities.** The population minimizer of the hinge loss is $\mathrm{sign}(P(y{=}1 \mid x) - \tfrac12)$, while logistic loss recovers the log-odds. So an SVM's $f(x)$ is not a calibrated score (Platt scaling: next lesson).
+      - In practice, the two give similar linear boundaries.
+
+      ![The 0–1, hinge and logistic losses against the margin $m = y f(x)$, with logistic in bits so it passes through (0, 1). Hinge is exactly zero beyond m = 1; logistic only approaches zero.](fund.svm-margin-dual/hinge-vs-logistic)
+
+      **Hard margin as a limit.** The hard-margin SVM is the same template with a loss that is $0$ if $m \ge 1$ and $+\infty$ otherwise. The value of $\lambda$ then doesn't matter, as long as it is positive.
+    source: "ESL §12.3.2 (eq. 12.25, Fig. 12.4, Table 12.1); SSBD §15.2 (eq. 15.4); Bishop PRML §7.1.2 (eq. 7.19)"
+
+  - title: "Solving it: QP, SMO and subgradient SGD"
+    body: |
+      **Generic QP solvers** work on either form, but the dual has $N$ variables and a dense $N \times N$ matrix $Q_{ij} = y_iy_j x_i^\top x_j$. Memory and time grow at least quadratically in $N$. That's fine for thousands of points and painful for millions.
+
+      **SMO (sequential minimal optimization)** is coordinate ascent on the dual.
+      - **Why not one variable at a time?** The equality $\sum_i \alpha_i y_i = 0$ means that if all other $\alpha$'s are fixed, $\alpha_1 = -y_1\sum_{i \ne 1}\alpha_i y_i$ is determined: a single coordinate can't move.
+      - **So update a pair.** Fixing all but $\alpha_1, \alpha_2$, the constraint gives $\alpha_1 y_1 + \alpha_2 y_2 = \text{const}$, a line. The dual restricted to that line is a 1-D concave quadratic. Maximize it in closed form, then clip to the segment allowed by the box $[0, C]^2$.
+      - **Pair selection.** Heuristics pick pairs that violate the KKT conditions most, and the KKT conditions double as the stopping test.
+      - There's no matrix to store: kernel values are computed (and cached) on demand.
+
+      **Primal subgradient SGD** (UML §15.5; essentially the Pegasos algorithm). Minimize $\frac\lambda2\|w\|^2 + \frac1N\sum_i[1 - y_iw^\top x_i]_+$ (shown without $b$). The hinge isn't differentiable at $m = 1$, but it has a **subgradient**: $-y_ix_i$ if $y_iw^\top x_i < 1$, else $0$. A stochastic step on example $i$ is
+
+      $$w \leftarrow w - \eta_t\big(\lambda w - [y_i w^\top x_i < 1]\, y_i x_i\big).$$
+
+      Each step costs $O(d)$, independent of $N$, which makes this the method of choice for large *linear* SVMs. The step sizes decay ($\eta_t \propto 1/(\lambda t)$ in UML's analysis) because subgradients don't shrink near the optimum.
+
+      **Which to use?**
+      - Kernel SVMs, small to medium $N$: dual + SMO.
+      - Linear SVMs with large $N$ or sparse high-dimensional data: primal SGD or dual coordinate descent.
+      - Prediction cost: $O(\#\text{SV} \cdot d)$ in the dual form, $O(d)$ once $w$ is formed (linear case only).
+    source: "CS229 notes §6.8; SSBD §15.5; ESL §12.2.1"
+
+  - title: "Pitfalls and what interviewers probe"
+    body: |
+      **Pitfalls.**
+      - **Labels must be $\pm1$.** The constraint $y_i f(x_i) \ge 1$ and $\sum\alpha_iy_i = 0$ make no sense with $\{0, 1\}$ labels.
+      - **Feature scaling matters.** The margin is Euclidean, so a feature measured in large units dominates $\|w\|$ and the distances. Standardize first.
+      - **$C$ conventions.** Sum vs mean of slacks changes how $C$ should scale with $N$, and $\lambda = 1/C$ only in the sum form.
+      - **ESL's parameterization.** ESL fixes $\|\beta\| = 1$ and maximizes an explicit margin $M$, while CS229 and Bishop fix the functional margin to 1. Same solution, different-looking equations.
+      - **Reading $f(x)$ as a probability.** It isn't one; calibrate separately.
+      - **The penalty on $b$.** The standard SVM leaves $b$ unpenalized. Folding $b$ into $w$ via a constant feature silently penalizes it.
+
+      **What interviewers probe** (question → short answer).
+      - *Distance from $x$ to the hyperplane?* → $(w^\top x + b)/\|w\|$. With canonical scaling the margin is $1/\|w\|$.
+      - *Why minimize $\|w\|^2$?* → It maximizes the margin under $\min_i y_if(x_i) = 1$, and gives a convex QP.
+      - *Where does $\sum\alpha_iy_i = 0$ come from?* → Stationarity in $b$; otherwise $\min_b L = -\infty$.
+      - *What are support vectors, and why is the solution sparse?* → $\alpha_i > 0$ only on tight constraints, by complementary slackness.
+      - *Remove a non-support vector?* → Nothing changes. Remove a support vector? It may.
+      - *Why the dual?* → Inner products only (kernels), simpler constraints, sparsity, and SMO.
+      - *What does $C$ do as $C \to \infty$ and $C \to 0$?* → Separable data: tends to the hard margin. Non-separable: every finite $C$ still has a solution, but the boundary chases violators. $C \to 0$: wide margin, many support vectors.
+      - *SVM vs logistic regression?* → Hinge vs log loss, sparse vs dense dependence on the data, no probabilities vs probabilities, usually similar boundaries.
+      - *Why does SMO update two variables?* → The equality constraint pins a single one.
+    source: "CS229 notes ch.6; ESL §4.5.2, §12.2; Bishop PRML §7.1"
+
+  - title: "Key results"
+    body: |
+      - Signed distance $(w^\top x + b)/\|w\|$. Canonical scaling: margin $1/\|w\|$, band width $2/\|w\|$.
+      - Hard-margin primal: $\min\tfrac12\|w\|^2$ s.t. $y_i(w^\top x_i + b) \ge 1$, a convex QP.
+      - KKT: stationarity, primal and dual feasibility, complementary slackness $\alpha_ig_i = 0$. Weak duality $d^* \le p^*$ always; strong duality under Slater (affine constraints: feasibility).
+      - Stationarity: $w = \sum\alpha_iy_ix_i$ and $\sum\alpha_iy_i = 0$.
+      - Dual:
+
+      $$\max_{\alpha}\ \sum_i\alpha_i - \tfrac12\sum_{ij}\alpha_i\alpha_jy_iy_j x_i^\top x_j$$
+
+        with $0 \le \alpha_i \le C$ ($C = \infty$ for hard margin) and $\sum\alpha_iy_i = 0$.
+      - $f(x) = \sum_i\alpha_iy_ix_i^\top x + b$: only inner products, so kernels apply.
+      - $\alpha = 0$: outside the margin. $0 < \alpha < C$: on it. $\alpha = C$: inside or wrong side. Hard margin: $\|w\|^2 = \sum\alpha_i$.
+      - Soft margin ⇔ $\sum_i[1 - y_if(x_i)]_+ + \frac{\lambda}{2}\|w\|^2$ with $\lambda = 1/C$.
+      - SMO updates pairs (equality constraint). Pegasos-style SGD uses the hinge subgradient $-y_ix_i\,[y_if < 1]$.
+    source: "CS229 notes ch.6; Bishop PRML §7.1; ESL §12.3.2"
+
+quiz:
+  - id: q1
+    prompt: |
+      A hard-margin SVM in canonical form has $w = (3, 4)$. What is the width of the band between the hyperplanes $f = +1$ and $f = -1$?
+    correct: "0.4"
+    wrong:
+      - "0.2"
+      - "0.08"
+      - "2.5"
+    explanation: |
+      The band width is $2/\|w\| = 2/5 = 0.4$. The value 0.2 is $1/\|w\|$, the distance from the decision boundary to *one* margin line. The value 0.08 is $2/\|w\|^2$, which comes from forgetting the square root. The value 2.5 inverts the ratio.
+    source: "CS229 notes §6.4"
+
+  - id: q2
+    prompt: |
+      After training a hard-margin SVM, you delete one training point that has $\alpha_i = 0$ and retrain. What happens?
+    correct: "Nothing: the old $(w, b)$ still satisfies every KKT condition, so it stays optimal"
+    wrong:
+      - "The margin widens slightly, because one constraint was removed"
+      - "$w$ is unchanged but $b$ shifts, because $b$ averages over all points"
+      - "All the $\\alpha$'s change, because the dual has one fewer variable"
+    explanation: |
+      A point with $\alpha_i = 0$ appears in neither $w = \sum\alpha_jy_jx_j$ nor $\sum\alpha_jy_j = 0$, and its constraint was slack. Removing it leaves a solution that still satisfies stationarity, feasibility and complementary slackness, so by KKT it is still optimal. Removing a slack constraint can't change the optimum. $b$ is computed from support vectors only.
+    source: "CS229 notes §6.6; Bishop PRML §7.1"
+
+  - id: q3
+    prompt: |
+      In the SVM dual, where does the constraint $\sum_i \alpha_i y_i = 0$ come from?
+    correct: "Minimizing the Lagrangian over $b$: otherwise $L$ is linear in $b$ and unbounded below"
+    wrong:
+      - "Complementary slackness applied to the support vectors"
+      - "Requiring equal numbers of positive and negative support vectors"
+      - "Primal feasibility of the constraints $y_i(w^\\top x_i + b) \\ge 1$"
+    explanation: |
+      $L$ contains $-b\sum_i\alpha_iy_i$. If that coefficient isn't zero, $\min_b L = -\infty$, so the dual function is finite only when $\sum\alpha_iy_i = 0$. Equivalently, it is the stationarity condition $\partial L/\partial b = 0$. It balances the *total weight* of the two classes, not their counts: in the worked example one negative support vector with $\alpha = 1$ balances two positives with $\alpha = \tfrac12$.
+    source: "CS229 notes §6.6 (eq. 6.11)"
+
+  - id: q4
+    prompt: |
+      Which statement about the hard-margin SVM is **false**?
+    correct: "Its solution depends on the positions of all training points"
+    wrong:
+      - "The training data enter the dual only through inner products $x_i^\\top x_j$"
+      - "The dual objective is concave in $\\alpha$"
+      - "At the optimum, $\\|w\\|^2 = \\sum_i \\alpha_i$"
+    explanation: |
+      Only support vectors ($\alpha_i > 0$) determine $w$ and $b$. Other points can move freely outside the margin without changing anything. The other statements are true. The dual's quadratic term is $-\tfrac12\|\sum\alpha_iy_ix_i\|^2$, which is concave. Summing complementary slackness gives $\sum\alpha_i = \sum\alpha_iy_if(x_i) = \|w\|^2$.
+    source: "CS229 notes §6.6; Bishop PRML §7.1"
+
+  - id: q5
+    prompt: |
+      Hard-margin SVM on two points: $x_1 = (1, 1)$ with $y_1 = +1$ and $x_2 = (-1, -1)$ with $y_2 = -1$. The solution is $w = (\tfrac12, \tfrac12)$, $b = 0$. What are the dual variables?
+    correct: "$\\alpha_1 = \\alpha_2 = \\tfrac14$"
+    wrong:
+      - "$\\alpha_1 = \\alpha_2 = \\tfrac12$"
+      - "$\\alpha_1 = \\alpha_2 = 1$"
+      - "$\\alpha_1 = \\tfrac12,\\ \\alpha_2 = 0$"
+    explanation: |
+      $\sum\alpha_iy_i = 0$ forces $\alpha_1 = \alpha_2 = \alpha$. Then $w = \alpha x_1 - \alpha x_2 = 2\alpha(1, 1) = (\tfrac12, \tfrac12)$, so $\alpha = \tfrac14$. Check: $\|w\|^2 = \tfrac12 = \alpha_1 + \alpha_2$. The value $\tfrac12$ would give $w = (1, 1)$. Setting $\alpha_2 = 0$ violates $\sum\alpha_iy_i = 0$. The margin is $1/\|w\| = \sqrt2$, half the distance between the points.
+    source: "CS229 notes §6.6; Bishop PRML §7.1"
+
+  - id: q6
+    prompt: |
+      The same synthetic data, including one outlier (the outlined dot near the squares), fitted by a linear soft-margin SVM at three values of $C$: 0.01, 1 and 100. Which panel used $C = 100$?
+
+      ![Soft-margin SVMs at three values of C; solid line = boundary, dashed = margin.](fund.svm-margin-dual/soft-margin-c)
+    correct: "B"
+    wrong:
+      - "A"
+      - "C"
+      - "It can't be read off without the dual variables"
+    explanation: |
+      Large $C$ makes slack expensive, so the boundary tilts until even the outlier is on the right side with a margin. B is the narrowest band (width 0.60), with no violations and only 2 support vectors. A ($C = 1$) has width 1.49 and accepts the outlier as an error. C ($C = 0.01$) has a very wide band (4.48) with 32 support vectors, almost every point inside it.
+    source: "CS229 notes §6.7; ESL §12.2"
+
+  - id: q7
+    prompt: |
+      In a soft-margin SVM with $C = 1$, a training point ends up with $y_i f(x_i) = 0.4$. What is its dual variable?
+    correct: "$\\alpha_i = C = 1$"
+    wrong:
+      - "$\\alpha_i = 0$"
+      - "$\\alpha_i = 0.6$, equal to its slack"
+      - "Some value strictly between 0 and $C$"
+    explanation: |
+      $y_if = 0.4 < 1$ means a positive slack $\xi_i = 0.6$. Complementary slackness on $\xi_i \ge 0$ gives $\mu_i\xi_i = 0$, so $\mu_i = 0$, and $C - \alpha_i - \mu_i = 0$ then gives $\alpha_i = C$. $0 < \alpha_i < C$ happens only for points exactly on the margin. $\alpha_i = 0$ requires $y_if \ge 1$. The slack's value doesn't set $\alpha$.
+    source: "CS229 notes §6.7 (eqs. 6.16–6.18); Bishop PRML §7.1.1"
+
+  - id: q8
+    prompt: |
+      At the optimum of a soft-margin SVM, $\sum_i \xi_i = 7.3$. What does this tell you about the number of misclassified training points?
+    correct: "There are at most 7"
+    wrong:
+      - "There are exactly 7"
+      - "There are at least 7"
+      - "Nothing, since $\\xi_i$ measures only margin violations"
+    explanation: |
+      A misclassified point has $y_if < 0$, so $\xi_i = 1 - y_if > 1$. With $k$ misclassified points, $\sum\xi_i > k$, so $k \le 7$. There could be fewer: points inside the margin but correctly classified also contribute slack between 0 and 1.
+    source: "Bishop PRML §7.1.1; CS229 notes §6.7"
+
+  - id: q9
+    prompt: |
+      A soft-margin SVM minimizes $\tfrac12\|w\|^2 + C\sum_i\xi_i$ with $C = 10$. It is equivalent to minimizing $\sum_i[1 - y_if(x_i)]_+ + \tfrac\lambda2\|w\|^2$ for which $\lambda$?
+    correct: "$\\lambda = 0.1$"
+    wrong:
+      - "$\\lambda = 10$"
+      - "$\\lambda = 0.05$"
+      - "$\\lambda = 20$"
+    explanation: |
+      At the optimum $\xi_i = [1 - y_if(x_i)]_+$. Dividing the objective by $C$ leaves the minimizer unchanged and gives hinge sum $+ \frac{1}{2C}\|w\|^2$, i.e. $\lambda = 1/C = 0.1$. Large $C$ means weak regularization. The value 0.05 puts an extra factor of 2 on the penalty.
+    source: "ESL §12.3.2 (eq. 12.25)"
+
+  - id: q10
+    prompt: |
+      Linear SVM vs L2-regularized logistic regression on the same data. Which statement is true?
+    correct: "Points with margin $y f(x) > 1$ have no effect on the SVM, but still affect logistic regression"
+    wrong:
+      - "Passing the SVM score through $\\sigma(f(x))$ gives calibrated probabilities"
+      - "The hinge loss is differentiable everywhere, like the logistic loss"
+      - "Logistic loss is exactly zero for points beyond the margin, like hinge"
+    explanation: |
+      Hinge loss is flat at zero for $m > 1$, so those points get no gradient and have $\alpha = 0$. Logistic loss is strictly positive and has nonzero gradient everywhere, so every point contributes. The hinge minimizer estimates only $\mathrm{sign}(P - \tfrac12)$, so a plain sigmoid of $f$ isn't calibrated (Platt scaling fits a sigmoid's slope and offset on held-out data). Hinge has a kink at $m = 1$.
+    source: "ESL §12.3.2 (Table 12.1); Bishop PRML §7.1.2"
+
+  - id: q11
+    prompt: |
+      Why does SMO optimize two dual variables at a time rather than one?
+    correct: "With the others fixed, $\\sum_i\\alpha_iy_i = 0$ pins any single $\\alpha$, so it can't move"
+    wrong:
+      - "The one-variable subproblem is non-convex, but the two-variable one is convex"
+      - "The box constraints $0 \\le \\alpha_i \\le C$ couple each $\\alpha$ to its neighbour"
+      - "Two at a time halves the memory needed for the kernel matrix"
+    explanation: |
+      Fixing $\alpha_2, \dots, \alpha_N$ gives $\alpha_1 = -y_1\sum_{i \ne 1}\alpha_iy_i$, so no single-coordinate step is feasible. With two free variables, $\alpha_1y_1 + \alpha_2y_2 = \text{const}$ leaves a line segment (clipped by the box), and the concave dual restricted to that segment is maximized in closed form. The dual is concave in any number of coordinates, and the box constraints are separate for each variable.
+    source: "CS229 notes §6.8.2"
+
+  - id: q12
+    prompt: |
+      Your data are **not** linearly separable, and you train soft-margin SVMs with $C$ increasing toward $\infty$. Which statement is correct?
+    correct: "Every finite $C$ has a solution, but the boundary increasingly chases individual violators"
+    wrong:
+      - "Beyond some finite $C$ the soft-margin QP becomes infeasible"
+      - "The solution converges to the hard-margin SVM solution"
+      - "$w$ shrinks toward 0, so the margin becomes infinitely wide"
+    explanation: |
+      The soft-margin problem is feasible for any $C$ (choose large slacks), so a solution always exists. As $C$ grows the objective is dominated by $\sum\xi_i$, so the fit focuses on reducing violations at the expense of margin. There is no hard-margin solution to converge to here, because the hard-margin problem is infeasible. The margin goes the *other* way: it narrows as $C$ grows.
+    source: "CS229 notes §6.7; Bishop PRML §7.1.1"
+
+  - id: q13
+    prompt: |
+      For a hard-margin SVM with optimal primal value $p^* = \tfrac12\|w^*\|^2$, take any $\alpha \ge 0$ with $\sum_i\alpha_iy_i = 0$ (not necessarily optimal). The dual objective $\theta(\alpha)$ is:
+    correct: "A lower bound on $p^*$"
+    wrong:
+      - "An upper bound on $p^*$"
+      - "Equal to $p^*$, by strong duality"
+      - "Unrelated to $p^*$ unless $\\alpha$ satisfies KKT"
+    explanation: |
+      Weak duality: for any feasible $w$, $\theta(\alpha) = \min_{w'}L(w', \alpha) \le L(w, \alpha) = f(w) + \sum\alpha_ig_i(w) \le f(w)$, because each $\alpha_ig_i \le 0$. This holds for every dual-feasible $\alpha$, optimal or not. Strong duality only says the *maximum* over $\alpha$ reaches $p^*$. That is why the duality gap is a valid stopping certificate for solvers.
+    source: "Boyd CVX §5.2.2; CS229 notes §6.5"
+
+cards:
+  - id: f1
+    front: Give the distance from $x$ to the hyperplane $w^\top x + b = 0$, and the margin under canonical scaling.
+    back: |
+      Signed distance $(w^\top x + b)/\|w\|$. With $\min_iy_i(w^\top x_i + b) = 1$, the margin is $1/\|w\|$ and the band between $f = \pm1$ has width $2/\|w\|$.
+    source: "CS229 notes §6.3–6.4"
+  - id: f2
+    front: Write the hard-margin SVM primal.
+    back: |
+      $\min_{w,b}\tfrac12\|w\|^2$ s.t. $y_i(w^\top x_i + b) \ge 1$ for all $i$. A convex QP with a unique $w$. It is infeasible if the data aren't separable.
+    source: "CS229 notes §6.4"
+  - id: f3
+    front: Write the soft-margin SVM dual and the formula for predictions.
+    back: |
+      $\max_\alpha\sum_i\alpha_i - \tfrac12\sum_{ij}\alpha_i\alpha_jy_iy_jx_i^\top x_j$ s.t. $0 \le \alpha_i \le C$, $\sum_i\alpha_iy_i = 0$. Predict with $f(x) = \sum_i\alpha_iy_ix_i^\top x + b$. Hard margin: $C = \infty$.
+    source: "CS229 notes §6.6–6.7"
+  - id: f4
+    front: List the KKT conditions and state complementary slackness for the hard-margin SVM.
+    back: |
+      Stationarity ($w = \sum\alpha_iy_ix_i$, $\sum\alpha_iy_i = 0$), primal feasibility ($y_if(x_i) \ge 1$), dual feasibility ($\alpha_i \ge 0$), complementary slackness $\alpha_i[y_if(x_i) - 1] = 0$. So $\alpha_i > 0$ ⇒ the point lies on the margin.
+    source: "CS229 notes §6.5 (eqs. 6.3–6.7); Boyd CVX §5.5.3"
+  - id: f5
+    front: In a soft-margin SVM, what do $\alpha_i = 0$, $0 < \alpha_i < C$ and $\alpha_i = C$ mean geometrically?
+    back: |
+      $\alpha_i = 0$: $y_if \ge 1$, outside the margin. $0 < \alpha_i < C$: $y_if = 1$, exactly on the margin (use these points for $b$). $\alpha_i = C$: $y_if \le 1$, inside the margin or misclassified.
+    source: "CS229 notes §6.7 (eqs. 6.16–6.18)"
+  - id: f6
+    front: Write the soft-margin SVM as regularized ERM.
+    back: |
+      $\min_{w,b}\sum_i[1 - y_i(w^\top x_i + b)]_+ + \tfrac\lambda2\|w\|^2$ with $\lambda = 1/C$ (when $C$ multiplies the *sum* of slacks). Hinge loss + L2, with $b$ unpenalized.
+    source: "ESL §12.3.2 (eq. 12.25)"
+  - id: f7
+    front: How is $b$ computed after solving the SVM dual?
+    back: |
+      From any support vector $s$ with $0 < \alpha_s < C$ (on the margin): $b = y_s - w^\top x_s = y_s - \sum_i\alpha_iy_ix_i^\top x_s$. Average over all such $s$ for numerical stability.
+    source: "Bishop PRML §7.1 (eqs. 7.18, 7.37)"
+  - id: f8
+    front: How are the margin and the dual variables related in a hard-margin SVM?
+    back: |
+      $\|w\|^2 = \sum_i\alpha_i$ (sum complementary slackness: $\sum\alpha_iy_if(x_i) = \sum\alpha_i$, and the left side equals $w^\top w$ using $\sum\alpha_iy_i = 0$). So the margin is $\gamma = 1/\sqrt{\sum_i\alpha_i}$.
+    source: "CS229 notes §6.6; Bishop PRML §7.1"
+  - id: f9
+    type: open
+    front: Derive the dual of the hard-margin SVM.
+    back: |
+      1. Primal: $\min\tfrac12\|w\|^2$ s.t. $1 - y_i(w^\top x_i + b) \le 0$.
+      2. Lagrangian: $L = \tfrac12\|w\|^2 - \sum_i\alpha_i[y_i(w^\top x_i + b) - 1]$, $\alpha \ge 0$.
+      3. Dual function $\theta(\alpha) = \min_{w,b}L$. $\nabla_w = 0 \Rightarrow w = \sum\alpha_iy_ix_i$. $L$ is linear in $b$, so it is finite only if $\sum\alpha_iy_i = 0$.
+      4. Substitute: $\sum_i\alpha_iy_iw^\top x_i = \|w\|^2$ and the $b$ term vanishes, giving $\theta = \sum\alpha_i - \tfrac12\sum_{ij}\alpha_i\alpha_jy_iy_jx_i^\top x_j$.
+      5. Dual: maximize $\theta$ s.t. $\alpha \ge 0$, $\sum\alpha_iy_i = 0$. A concave QP in $N$ variables.
+      6. Strong duality holds (convex, affine constraints, feasible), so KKT applies. Complementary slackness gives sparsity, $b$ comes from a support vector, and only inner products appear, which enables kernels.
+    source: "CS229 notes §6.5–6.6; Bishop PRML §7.1"
+  - id: f10
+    type: open
+    front: Derive the soft-margin box constraint $0 \le \alpha_i \le C$ and classify points by $\alpha_i$.
+    back: |
+      - Primal: $\min\tfrac12\|w\|^2 + C\sum\xi_i$ s.t. $y_if(x_i) \ge 1 - \xi_i$, $\xi_i \ge 0$.
+      - Lagrangian with $\alpha_i \ge 0$ (margin) and $\mu_i \ge 0$ (slack): $L = \tfrac12\|w\|^2 + C\sum\xi_i - \sum\alpha_i[y_if(x_i) - 1 + \xi_i] - \sum\mu_i\xi_i$.
+      - $\partial L/\partial\xi_i = C - \alpha_i - \mu_i = 0$. The $\xi$ terms cancel from $L$, so the dual objective is the same as for the hard margin. $\mu_i \ge 0$ gives $\alpha_i \le C$.
+      - Complementary slackness: $\alpha_i[y_if - 1 + \xi_i] = 0$ and $\mu_i\xi_i = 0$.
+      - $\alpha_i = 0$ ⇒ $\mu_i = C$ ⇒ $\xi_i = 0$, $y_if \ge 1$. $0 < \alpha_i < C$ ⇒ $\mu_i > 0$ ⇒ $\xi_i = 0$ and $y_if = 1$. $\alpha_i = C$ ⇒ $\xi_i = 1 - y_if \ge 0$: inside the margin, or misclassified if $\xi_i > 1$.
+      - Interpretation: $C$ caps any single point's influence on $w$, which gives robustness to outliers.
+    source: "CS229 notes §6.7; Bishop PRML §7.1.1"
+  - id: f11
+    type: open
+    front: Compare a linear SVM with logistic regression as an interviewer would want.
+    back: |
+      - **Same template**: convex surrogate loss on the margin $m = yf(x)$ plus an L2 penalty. Hinge $[1 - m]_+$ vs logistic $\log(1 + e^{-m})$. Both have linear tails for $m \to -\infty$.
+      - **Sparsity**: hinge is zero for $m \ge 1$, so the solution depends only on support vectors. Logistic loss gives every point a nonzero weight $\sigma(-m)$.
+      - **Probabilities**: logistic regression estimates log-odds (proper, calibratable). The hinge minimizer is $\mathrm{sign}(P - \tfrac12)$, so SVMs need Platt scaling.
+      - **Separable data**: unregularized logistic regression diverges, and its GD direction tends to the hard-margin SVM direction. The SVM is well posed by construction.
+      - **Optimization**: logistic is smooth (GD, Newton/IRLS). Hinge is non-smooth (dual QP/SMO, subgradient SGD). The dual gives kernels naturally (kernel logistic regression exists but isn't sparse).
+      - **In practice**: similar linear boundaries. Choose logistic regression when you need probabilities, the SVM for sparse kernel models or a max-margin bias.
+    source: "ESL §12.3.2; Bishop PRML §7.1.2; Murphy PML1 §10.2"
+  - id: f12
+    type: open
+    front: Explain how SMO and primal SGD solve an SVM, and when you'd use each.
+    back: |
+      - **SMO**: coordinate ascent on the dual. A single $\alpha_i$ can't move because $\sum\alpha_iy_i = 0$ pins it, so pick a KKT-violating pair. On the line $\alpha_1y_1 + \alpha_2y_2 = \text{const}$, the dual is a 1-D concave quadratic. Take the closed-form maximizer, clip it to the box $[0, C]$, and update $b$. Repeat until the KKT conditions hold within tolerance. It needs no QP solver or stored $N\times N$ matrix, so it suits kernel SVMs.
+      - **Primal subgradient SGD** (UML §15.5 / Pegasos): minimize $\frac\lambda2\|w\|^2 + \frac1N\sum[1 - y_iw^\top x_i]_+$. Subgradient on example $i$: $\lambda w - y_ix_i[y_iw^\top x_i < 1]$, with decaying steps ($\propto 1/(\lambda t)$). Each step costs $O(d)$, independent of $N$, so it suits large linear SVMs.
+      - **Costs**: the dual scales at least quadratically in $N$. Linear models train in the primal at $O(Nd)$ per epoch. Prediction: $O(\#\text{SV}\cdot d)$ for kernel models.
+    source: "CS229 notes §6.8; SSBD §15.5"
+
+reading:
+  - title: "CS229 Lecture Notes, ch. 6 (Support vector machines)"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: "The standard derivation: functional vs geometric margins, Lagrange duality and KKT, the dual, the soft margin and SMO."
+  - title: "Burges (1998), A Tutorial on Support Vector Machines for Pattern Recognition"
+    url: https://www.microsoft.com/en-us/research/publication/a-tutorial-on-support-vector-machines-for-pattern-recognition/
+    kind: paper
+    note: A thorough classic, with the geometry of the separable and non-separable cases, the KKT conditions, the leave-one-out bound (§7.4) and worked solutions.
+  - title: "Bishop, Pattern Recognition and Machine Learning, §7.1 (Maximum Margin Classifiers)"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: A compact derivation of the dual and box constraints, how to compute b, the ν-SVM, and the comparison with logistic regression (§7.1.2). Appendix E covers Lagrange multipliers.
+  - title: "Shalev-Shwartz & Ben-David, Understanding Machine Learning, ch. 15"
+    url: https://www.cs.huji.ac.il/~shais/UnderstandingMachineLearning/
+    kind: book
+    note: The learning-theory view, with margin-based bounds that don't depend on dimension (§15.2.2), the soft SVM as regularized loss minimization, and SGD for the soft SVM (§15.5).
+  - title: "Boyd & Vandenberghe, Convex Optimization, ch. 5 (Duality)"
+    url: https://web.stanford.edu/~boyd/cvxbook/
+    kind: book
+    note: The background for the crash-course card, covering the dual function, weak and strong duality, Slater's condition, complementary slackness and KKT.

@@ -1,0 +1,448 @@
+id: sys.collectives
+area: applied
+title: Communication Primitives and the Ring All-Reduce
+summary: What broadcast, reduce, all-reduce, all-gather, reduce-scatter and all-to-all do to the data, the minimum bytes each must move, how the ring all-reduce reaches that minimum, and which bandwidth to use inside and across nodes.
+order: 160
+level: core
+tags: [distributed-training, collectives, nccl, all-reduce, communication]
+prereqs: []
+
+explainer:
+  - title: "The problem: many GPUs, one computation"
+    body: |
+      Every way of training on many GPUs (data, tensor, pipeline or expert parallelism, ZeRO/FSDP) is local compute plus a handful of **communication steps**. Whether a run scales is usually decided by those steps. To reason about them we need to know four things: what each step does to the data, the fewest bytes it can possibly move, the algorithm that achieves that, and which link bandwidth limits it.
+
+      **Setting.** There are $P$ processes, called **ranks** $0,\dots,P-1$, usually one per GPU. Each holds a buffer of $S$ bytes.
+      - *Point-to-point* communication is one rank sending to one other rank (`send`/`recv`).
+      - A **collective** is an operation that every rank in a group calls together. The library decides who sends what to whom. On GPUs this library is NCCL; Gloo and MPI are the CPU-side equivalents.
+      - A **process group** (or communicator) is the set of ranks taking part, e.g. the 8 GPUs of one node, or all GPUs holding the same shard.
+
+      **Cost model.** Sending $n$ bytes over one link takes
+
+      $$T = \alpha + \frac{n}{W}$$
+
+      Here $\alpha$ is the fixed **latency** per message (start-up, synchronisation, hops) and $W$ is the link **bandwidth** in bytes/s in one direction. Some texts write $\beta = 1/W$. For the large buffers of training (gradients, weights) the $n/W$ term dominates. This lesson is about that bandwidth term; the latency term gets its own lesson (`sys.collective-algorithms`).
+
+      **Units.** 1 GB $=10^9$ bytes here. Vendor numbers need converting:
+      - H100 NVLink is sold as "900 GB/s", which counts both directions. Per direction it is **450 GB/s per GPU**.
+      - An InfiniBand NIC sold as "400G" carries 400 *gigabits*/s, i.e. **50 GB/s**.
+    source: 'Ultra-Scale Playbook App. A0 "Parallel Programming Crash Course"; nccl-tests PERFORMANCE.md "Time"; Scaling Book Part 12 "At the node level"'
+
+  - title: "The primitives, defined by what goes in and comes out"
+    body: |
+      ![Six collectives on 4 ranks (rows) with 4 chunks each (columns). Colour shows where data came from; striped cells hold a sum over all ranks. Note that only broadcast, all-reduce and all-gather leave every rank with the same buffer. The digits in the all-gather and all-to-all panels show that their outputs differ: every rank gets chunks 0–3 from an all-gather, but rank j gets four copies of chunk index j from an all-to-all.](sys.collectives/collectives-grid)
+
+      In each definition, "sum" can be any elementwise associative operation (max, min…). It means sum unless stated, and an average is a sum divided by $P$.
+      - **Broadcast**: the root's $S$-byte buffer is copied to every rank.
+      - **Reduce**: the elementwise sum of all ranks' buffers lands on the root only.
+      - **All-reduce**: the elementwise sum lands on *every* rank.
+      - **Gather**: the root receives every rank's buffer, concatenated in rank order ($PS$ bytes). **All-gather**: every rank receives that concatenation.
+      - **Scatter**: the root cuts its buffer into $P$ chunks and sends chunk $i$ to rank $i$. **Reduce-scatter**: sum all buffers, then rank $i$ keeps only chunk $i$ of the sum.
+      - **All-to-all**: each rank cuts its buffer into $P$ chunks and sends chunk $j$ to rank $j$. If row $r$ of a matrix is rank $r$'s buffer, all-to-all transposes the matrix.
+      - **Barrier**: no data; no rank continues until all have arrived.
+
+      **Worked example.** Four ranks hold $[1,2,3,4]$, $[5,6,7,8]$, $[9,10,11,12]$ and $[13,14,15,16]$.
+      - All-reduce: every rank ends with $[28,32,36,40]$.
+      - Reduce-scatter: rank 0 gets $[28]$, rank 1 $[32]$, rank 2 $[36]$, rank 3 $[40]$.
+      - All-gather of those four one-element shards: every rank gets $[28,32,36,40]$, the all-reduce result again.
+
+      **Size conventions differ.** NCCL's all-gather and reduce-scatter take a *per-rank* count, so all-gather's output is $P$ times its input. nccl-tests, and this lesson, write $S$ for the *full* array.
+    source: 'NCCL User Guide "Collective Operations"; nccl-tests PERFORMANCE.md "ReduceScatter", "AllGather"; Ultra-Scale Playbook App. A0'
+
+  - title: "Identities: decompositions and backward passes"
+    body: |
+      ![All-reduce as two halves. After reduce-scatter each rank owns one fully summed chunk; all-gather then copies the owned chunks everywhere.](sys.collectives/allreduce-decomposition)
+
+      **All-reduce = reduce-scatter + all-gather.** Reduce-scatter leaves rank $i$ with chunk $i$ of the sum; all-gathering those chunks gives everyone the whole sum. (All-reduce also equals reduce followed by broadcast.)
+
+      **The backward of all-gather is reduce-scatter.** In FSDP, rank $r$ holds a shard $x_r$ and all-gathers it, so every rank $q$ gets $y^{(q)}=[x_0;\dots;x_{P-1}]$. Each rank then computes its own loss $L_q$ on its own data, and the training loss is $L=\sum_q L_q$. Write $g^{(q)}=\partial L_q/\partial y^{(q)}$ and split it into blocks $g^{(q)}_0,\dots,g^{(q)}_{P-1}$. Shard $x_r$ is block $r$ of *every* $y^{(q)}$, so by the chain rule
+
+      $$\frac{\partial L}{\partial x_r}=\sum_{q=0}^{P-1} g^{(q)}_r$$
+
+      That means summing over ranks and keeping block $r$ on rank $r$, which is exactly a reduce-scatter. In linear-algebra terms, all-gather is a linear map $A$, backprop multiplies by $A^\top$, and $A^\top$ is reduce-scatter.
+
+      **The converse holds too.** If the forward is a reduce-scatter, $y_r=\sum_q x^{(q)}_r$ on rank $r$, then $\partial L/\partial x^{(q)}_r=\partial L/\partial y_r$ for every $q$. Rank $q$ needs every block, which is an all-gather.
+
+      **Other pairs.**
+      - Broadcast's backward is a reduce: the gradients of the copies add up at the source. Reduce's backward is a broadcast.
+      - All-reduce's backward is an all-reduce *if* each rank's downstream gradient is different. If instead every rank holds an identical copy of one gradient (a replicated computation whose loss counts once), the backward is the identity. Megatron's tensor parallelism uses this pair: $g$ = all-reduce forward, identity backward; $f$ = identity forward, all-reduce backward (`sys.tensor-parallel`).
+    source: 'Scaling Book Part 3 "More about the ReduceScatter"; NCCL User Guide "Reduce", "AllGather" notes; ZeRO §7.1'
+
+  - title: "How many bytes must move? Lower bounds"
+    body: |
+      Before looking for algorithms, count what *must* cross each rank's link. Assume the data can't be compressed and the elements are independent. Each rank has one link of bandwidth $W$ in each direction.
+
+      **All-gather.** Rank $r$ starts with its $S/P$-byte shard and must end with all $S$ bytes. The missing $(P-1)S/P$ bytes can only come in through its link:
+
+      $$T_{AG}\ \ge\ \frac{P-1}{P}\cdot\frac{S}{W}$$
+
+      **Reduce-scatter.** Rank $r$ holds its contributions to the $P-1$ chunks owned by other ranks, $(P-1)S/P$ bytes. Each must affect another rank's result. Partial sums can only merge contributions to the *same* chunk, so these bytes, or sums containing them, must leave $r$. The bound is the same: $(P-1)S/P$ out of each rank.
+
+      **All-reduce.** Patarasuk & Yuan count messages per element. Folding $P$ inputs into one sum takes $P-1$ merges, and the result must then reach the other ranks. They prove by induction on $P$ that any algorithm needs at least $2(P-1)$ element transfers in total. Spread over $P$ ranks, some rank must send at least
+
+      $$2\,\frac{P-1}{P}\,S \ \text{bytes}$$
+
+      This is the reduce-scatter bound plus the all-gather bound, which fits the decomposition on the previous card.
+
+      **All-to-all.** Each rank sends $P-1$ distinct chunks of $S/P$ bytes, one to each other rank: $(P-1)S/P$. Nothing can be combined on the way.
+
+      **Broadcast and reduce.** All $S$ bytes must leave (or enter) the root: $T\ge S/W$ whatever $P$ is.
+
+      These are exactly the "bus bandwidth" correction factors nccl-tests uses: $2(P-1)/P$ for all-reduce, $(P-1)/P$ for all-gather, reduce-scatter and all-to-all, and 1 for broadcast and reduce. **Key fact:** as $P$ grows, per-rank all-reduce traffic tends to $2S$, not $PS$.
+    source: 'Patarasuk & Yuan 2009 §3 (Lemmas 1–5); nccl-tests PERFORMANCE.md "Summary"'
+
+  - title: "The ring all-reduce, derived"
+    body: |
+      **Naive version.** Everyone sends its buffer to a root, the root sums, then sends the result back. The root receives $(P-1)S$ bytes and sends $(P-1)S$ while every other link idles. For $P=8$ and $S=14$ GB at 450 GB/s, that is 98 GB each way through one GPU: about 218 ms.
+
+      **Ring.** Order the ranks in a ring, $r\to r+1 \bmod P$, and split every buffer into $P$ chunks of $S/P$ bytes.
+
+      ![Simulated 4-rank ring all-reduce. Each chunk gains one contribution per hop, and after 3 reduce-scatter steps rank $i$ owns the complete chunk $i$. Three all-gather steps then pass the finished chunks around.](sys.collectives/ring-allreduce)
+
+      1. **Reduce-scatter phase, $P-1$ steps.** In step $j$, rank $i$ sends chunk $(i-j) \bmod P$ to rank $i+1$, which adds it into its own copy of that chunk. Each chunk travels around the ring, picking up one rank's contribution per hop. After $P-1$ hops it is complete, and the complete chunk $i$ sits on rank $i$. Every link carries $S/P$ bytes in every step, so no link idles.
+      2. **All-gather phase, $P-1$ steps.** Each rank sends its finished chunk to the right, then forwards whatever it just received. After $P-1$ steps everyone has all $P$ finished chunks.
+
+      **Cost.** Each rank sends $2(P-1)$ messages of $S/P$ bytes:
+
+      $$\begin{aligned}T_{\text{ring}} &= 2(P-1)\Big(\alpha+\frac{S}{PW}\Big)\\ &= 2(P-1)\alpha + 2\frac{P-1}{P}\frac{S}{W}\end{aligned}$$
+
+      The bytes per rank, $2(P-1)S/P$, equal the lower bound, so the ring is **bandwidth-optimal**. Patarasuk & Yuan prove this holds on any topology where a contention-free logical ring can be embedded, such as a tree of switches.
+
+      **What the formula says.**
+      - The bandwidth term is about $2S/W$, *nearly independent of $P$*: more ranks means smaller chunks but more steps, and the two cancel.
+      - The latency term $2(P-1)\alpha$ grows linearly with $P$. At thousands of GPUs or with small buffers it dominates, which is why trees and hierarchical rings exist (`sys.collective-algorithms`).
+    source: 'Patarasuk & Yuan 2009 §4.1, Theorem 1; Ultra-Scale Playbook App. A0 "A quick focus on Ring AllReduce"'
+
+  - title: "Which bandwidth to plug in: inside vs across nodes"
+    body: |
+      **Inside an H100 node.** Eight GPUs are joined through NVSwitch, and each GPU can send 450 GB/s. The Scaling Book measures about 370 GB/s in practice, and only for very large messages. Example: a 7B model with bf16 gradients (14 GB; this assumes bf16 parameters or a bf16 communication hook):
+
+      $$2\cdot\tfrac{7}{8}\cdot\frac{14\times10^9}{450\times10^9}\approx 54\ \text{ms}$$
+
+      That becomes about 66 ms at 370 GB/s.
+
+      **Across nodes.** Each node has 8 NICs of 50 GB/s, so 400 GB/s leaves the node in total. Take the same 14 GB over 64 GPUs (8 nodes).
+      - *Naive flat ring:* one ring through all 64 GPUs, running at its slowest hop, one NIC's 50 GB/s: $\approx0.55$ s. It uses only **one of the 8 NICs** per node.
+      - *Multi-ring:* 8 flat rings at once, each carrying $1/8$ of the buffer and leaving each node through a different NIC, so all 8 NICs work:
+
+      $$2\cdot\tfrac{63}{64}\cdot\frac{14\times10^9}{400\times10^9}\approx 69\ \text{ms}$$
+
+      - *Hierarchical:* reduce-scatter over NVLink inside the node, so each GPU owns $1/8$. Then each GPU all-reduces its $1/8$ with its counterparts on the other $X=8$ nodes through its own NIC. Then all-gather inside the node. Its cross-node phase costs $2\frac{X-1}{X}\cdot S/400\text{e}9\approx61$ ms (the Scaling Book's form, and the lower bound when each node is one rank with 400 GB/s egress), plus partly overlapped NVLink phases.
+
+      **Conventions.** 69 ms ($\frac{P-1}{P}$, $P$ = GPUs) and 61 ms ($\frac{X-1}{X}$, $X$ = nodes) are different algorithms; the large-$P$ limit drops the factor (70 ms). Budget about $2S/400$ GB/s. The flat-ring estimate is about **8× too pessimistic**.
+
+      **The rule.** Across nodes, all-gather and reduce-scatter take about $\text{bytes}/400\,\text{GB/s}$, and all-reduce about twice that.
+
+      **The exception: all-to-all.** Every GPU's chunks are distinct and bound for different GPUs, so nothing can be combined inside the node. Each GPU's buffer leaves through its own NIC, at about **50 GB/s per GPU**. The same applies to a tensor-parallel group placed one GPU per node. This is why expert and tensor parallelism are kept inside a node.
+
+    source: 'Scaling Book Part 12 "Intra-node collectives", "Cross-node collectives"; NVIDIA 2019 NCCL 2.4 blog (hierarchical 2D rings)'
+
+  - title: "Where collectives appear, and why they hang"
+    body: |
+      **The map** (each is developed in its own lesson):
+      - **DDP:** all-reduce of gradients during the backward pass.
+      - **ZeRO / FSDP:** all-gather of parameters (forward and backward) and reduce-scatter of gradients.
+      - **Tensor parallelism:** all-reduce of activations, or all-gather plus reduce-scatter when sequence parallelism is used.
+      - **Pipeline parallelism:** point-to-point send/recv of activations between stages.
+      - **MoE expert parallelism:** all-to-all to dispatch tokens to experts and to bring them back.
+      - **Elsewhere:** broadcast of initial weights from rank 0, reduce or all-reduce of metrics for logging, all-reduce of BatchNorm statistics in synchronised BatchNorm.
+
+      **Synchronous semantics.** Every rank in the group must call the *same* collectives in the *same order*, with the same element count and dtype. NCCL warns that anything else is undefined behaviour: hangs, crashes or silently corrupted data. The classic bug is rank-dependent control flow. Say rank 0 runs an evaluation that contains an all-reduce: rank 0 waits in that all-reduce while the others wait in the next training all-reduce, and the job hangs until the NCCL timeout fires.
+
+      **One slow rank stalls everyone.** A collective can't complete until the last rank arrives. In the Playbook's barrier demo, ranks that sleep 0, 1 and 2 s all leave the barrier at 2 s. A *straggler* (a slower GPU, a longer sequence, a noisy host) therefore sets the step time for the whole job.
+
+      **Asynchrony.** NCCL collectives run as kernels on a CUDA stream. In PyTorch, `async_op=True` returns a work handle that you `wait()` on later. The NCCL process group uses dedicated communication streams, so communication can overlap with compute on the default stream. DDP's overlap is built on exactly this.
+    source: 'NCCL User Guide "Collective Operations" (intro); Li et al. 2020 §3.3; Ultra-Scale Playbook App. A0 "Barrier"; NVIDIA 2019 NCCL 2.4 blog "NCCL operations behave as CUDA kernels"'
+
+  - title: "What interviewers probe"
+    body: |
+      - **"Derive the cost of a ring all-reduce."** Split into $P$ chunks. Run $P-1$ reduce-scatter steps, then $P-1$ all-gather steps, each sending $S/P$. That gives $T=2(P-1)\alpha+2\frac{P-1}{P}\frac{S}{W}$, which matches the lower bound.
+      - **"Why doesn't the time grow with $P$?"** The bandwidth term tends to $2S/W$, because all $P$ links work in parallel on shrinking chunks. The latency term does grow linearly with $P$.
+      - **"All-reduce or reduce-scatter?"** Use reduce-scatter whenever each rank needs only its slice of the sum (ZeRO-2/3, sequence parallelism). It moves half the bytes.
+      - **"Write all-reduce in terms of other collectives."** Reduce-scatter + all-gather, or reduce + broadcast.
+      - **"What is the backward of an all-gather?"** A reduce-scatter. Each shard appears in every rank's copy, so its gradient is the sum over ranks of the matching block.
+      - **"Which collectives does FSDP use?"** All-gather in the forward. All-gather plus reduce-scatter in the backward.
+      - **"Which bandwidth do you use across nodes?"** For all-reduce, all-gather and reduce-scatter, the node egress (400 GB/s on H100), because all 8 NICs carry traffic. Use 50 GB/s per GPU only for all-to-all or a group with one GPU per node.
+      - **"The job hangs at step 1."** Look for collectives that don't match across ranks: rank-dependent branches, different numbers of batches per rank, or different tensor sizes.
+      - **"Is a broadcast cheaper than an all-gather of the same total size?"** No; they cost about the same. Broadcast is bounded by the root sending all $S$ bytes ($S/W$, which a pipelined ring broadcast reaches). All-gather is bounded by each rank receiving $\frac{P-1}{P}S$.
+    source: 'Patarasuk & Yuan 2009 §3–4; Scaling Book Part 3 "More about the ReduceScatter"; Scaling Book Part 12 "Cross-node collectives"'
+
+  - title: "Key results"
+    body: |
+      - **Minimum bytes per rank** ($S$ = full array): all-reduce $2\frac{P-1}{P}S$; all-gather, reduce-scatter and all-to-all $\frac{P-1}{P}S$; broadcast and reduce $S$ (through the root).
+      - **Ring all-reduce:**
+
+      $$T=2(P-1)\alpha+2\frac{P-1}{P}\frac{S}{W}$$
+
+        It is bandwidth-optimal, and its bandwidth term is nearly independent of $P$.
+      - All-reduce = reduce-scatter + all-gather.
+      - Backward of all-gather = reduce-scatter (and vice versa). Backward of broadcast = reduce.
+      - **H100 bandwidths:** 450 GB/s per GPU per direction inside a node (≈370 GB/s achieved). Across nodes, 400 GB/s per node for all-reduce, all-gather and reduce-scatter, and ≈50 GB/s per GPU for all-to-all.
+      - **14 GB of bf16 gradients:** ≈54 ms inside one node; ≈69 ms across 8 nodes. The naive flat-ring estimate of 0.55 s is wrong.
+      - **Collectives synchronise.** Mismatched calls hang, and the slowest rank sets the pace.
+      - **Scope of the bandwidth numbers:** large messages, a full-bisection fat-tree fabric (e.g. a DGX H100 SuperPod), and no in-network reduction. Switch-side reduction (SHARP) could in theory halve an all-reduce; the Scaling Book measured about 30% within a node.
+    source: 'nccl-tests PERFORMANCE.md "Summary"; Patarasuk & Yuan 2009 Theorem 1; Scaling Book Part 12 "How Do Collectives Work on GPUs?"'
+
+quiz:
+  - id: q1
+    prompt: |
+      Four ranks hold the buffers on the left. After one collective they hold the buffers on the right. Which collective was it?
+
+      ![Before and after an unnamed collective on 4 ranks.](sys.collectives/mystery)
+    correct: "All-to-all: rank j receives chunk j of every rank's buffer"
+    wrong:
+      - "All-gather: each rank collects one element from every rank"
+      - "Reduce-scatter: each rank keeps one slice of the summed buffer"
+      - "Scatter from rank 0, followed by a broadcast of each slice"
+    explanation: |
+      Row $j$ on the right is column $j$ on the left: rank $j$ received chunk $j$ from every rank. That is a transpose, which is what all-to-all does. All-gather is the tempting answer because each output row has one element from every rank. But after an all-gather every rank holds the *same* buffer, and here the rows differ. No sums appear, so it isn't a reduce-scatter.
+    source: 'NCCL User Guide "AlltoAll"; Scaling Book Part 3 "Our final communication primitive: the AllToAll"'
+
+  - id: q2
+    prompt: |
+      Ranks 0–3 hold $[1,2,3,4]$, $[5,6,7,8]$, $[9,10,11,12]$ and $[13,14,15,16]$. After a sum **reduce-scatter**, what does rank 2 hold?
+    correct: "$[36]$"
+    wrong:
+      - "$[28,32,36,40]$"
+      - "$[3,7,11,15]$"
+      - "$[9,10,11,12]$"
+    explanation: |
+      Reduce-scatter sums the four buffers elementwise to $[28,32,36,40]$, then gives rank $i$ chunk $i$, so rank 2 gets $36$. $[28,32,36,40]$ is the all-reduce result (reduce-scatter followed by all-gather). $[3,7,11,15]$ is what rank 2 would get from an all-to-all: no sums, just element 2 of each rank.
+    source: 'NCCL User Guide "ReduceScatter"; Ultra-Scale Playbook App. A0 "Scatter & ReduceScatter"'
+
+  - id: q3
+    prompt: |
+      You all-reduce 14 GB of bf16 gradients across 64 H100s (8 nodes, each with 8 × 400 Gb/s InfiniBand NICs). Using NCCL-style multi-ring or hierarchical all-reduce and ignoring latency, which estimate is closest?
+    correct: "About 69 ms, using 400 GB/s of egress per node"
+    wrong:
+      - "About 0.55 s, using 50 GB/s per GPU in one ring"
+      - "About 34 ms, using 400 GB/s for $S/W$ alone"
+      - "About 8.6 ms, pooling all 64 NICs into 3.2 TB/s"
+    explanation: |
+      Multi-ring or hierarchical all-reduce keeps all 8 NICs of every node busy. With 8 flat rings, $T\approx2\cdot\frac{63}{64}\cdot14\text{e}9/400\text{e}9\approx69$ ms; the hierarchical cross-node phase is about 61 ms. Both round to about $2S/400$ GB/s. The 0.55 s figure models a single flat ring whose node-crossing hops use one 50 GB/s NIC; that is about 8× too pessimistic. 34 ms forgets the factor 2 for all-reduce (reduce-scatter + all-gather). Pooling all 64 NICs double-counts, because each byte leaving a node still has to pass through that node's 400 GB/s.
+    source: 'Scaling Book Part 12 "Cross-node collectives"; NVIDIA 2019 NCCL 2.4 blog'
+
+  - id: q4
+    prompt: |
+      In an FSDP forward pass, rank $r$ all-gathers weight shards $W_0,\dots,W_{P-1}$ into the full $W$. In the backward pass each rank $q$ has its own gradient $\partial L_q/\partial W$, computed on its own data. Which collective delivers to rank $r$ exactly the gradient for its shard $W_r$ under $L=\sum_q L_q$?
+    correct: "Reduce-scatter: rank r receives the sum over q of block r"
+    wrong:
+      - "None: block r of rank r's own gradient is already enough"
+      - "Gather: rank r receives block r from every rank, unsummed"
+      - "All-gather: rank r receives every rank's full gradient"
+    explanation: |
+      $W_r$ appears as block $r$ of every rank's copy of $W$, so by the chain rule $\partial L/\partial W_r=\sum_q(\partial L_q/\partial W)_r$. Summing over ranks and keeping block $r$ on rank $r$ is a reduce-scatter, the transpose of the forward all-gather. Using only the local block drops the other ranks' data, so the update would differ from rank to rank. A gather collects the blocks without summing them and funnels everything to one root.
+    source: 'Scaling Book Part 3 "More about the ReduceScatter"; Scaling Book Part 5 "Fully-Sharded Data Parallelism (FSDP)"'
+
+  - id: q5
+    prompt: |
+      Which statement about the ring all-reduce on $P$ ranks with link bandwidth $W$ is **false**?
+    correct: "Going from 8 to 16 ranks about halves the bandwidth term"
+    wrong:
+      - "Each rank sends $2(P-1)$ messages, each holding $S/P$ bytes of the buffer"
+      - "The latency term $2(P-1)\\alpha$ grows linearly with the number of ranks"
+      - "Its bytes per rank match the lower bound, so no algorithm sends fewer"
+    explanation: |
+      Chunks do halve, but the number of steps roughly doubles, so the bandwidth term $2\frac{P-1}{P}\frac{S}{W}$ barely changes (from $1.75\,S/W$ to $1.875\,S/W$). The other three statements are true. Each of the $2(P-1)$ steps sends one $S/P$ chunk, which adds up to $2(P-1)S/P$ bytes, exactly Patarasuk & Yuan's lower bound. The cost is the latency term, which grows with $P$.
+    source: 'Patarasuk & Yuan 2009 §4.1, Theorem 1; Ultra-Scale Playbook App. A0 "A quick focus on Ring AllReduce"'
+
+  - id: q6
+    prompt: |
+      A 1 GB all-reduce on a 4-rank ring with 100 GB/s links takes 15 ms (bandwidth term only). You grow the ring to 32 ranks with the same links. About how long does the bandwidth term take now?
+    correct: "About 19 ms"
+    wrong:
+      - "About 120 ms"
+      - "About 1.9 ms"
+      - "About 30 ms"
+    explanation: |
+      $T=2\frac{P-1}{P}\frac{S}{W}$: for $P=4$ that is $1.5\cdot10$ ms $=15$ ms, and for $P=32$ it is $1.9375\cdot10$ ms $\approx19$ ms. Only the factor $(P-1)/P$ changes. Scaling by 8 (120 ms) wrongly assumes every rank sends $P\times$ more data. Scaling by $1/8$ (1.9 ms) counts the smaller chunks but forgets the extra steps. 30 ms assumes the time doubles with more ranks, which no term in the formula does. Latency, which this question ignores, would grow linearly.
+    source: 'nccl-tests PERFORMANCE.md "AllReduce"; Patarasuk & Yuan 2009 Theorem 1'
+
+  - id: q7
+    prompt: |
+      A naive all-reduce sends every buffer to a root, sums there, and sends the result back. Compared with one rank of a ring all-reduce on the same $P=8$ ranks, how many times more bytes pass through the root's link (in each direction)?
+    correct: "4 times as many"
+    wrong:
+      - "2 times as many"
+      - "7 times as many"
+      - "8 times as many"
+    explanation: |
+      The root receives $(P-1)S$ and sends $(P-1)S$. A ring rank sends $2(P-1)S/P$ and receives the same amount. Per direction the ratio is $(P-1)S\big/\big(2(P-1)S/P\big)=P/2=4$. "7×" compares $(P-1)S$ with a single $S$ and ignores how the ring splits data into chunks. In both schemes the root bottleneck also leaves the other links idle.
+    source: 'Patarasuk & Yuan 2009 §4; Li et al. 2020 §2.3'
+
+  - id: q8
+    prompt: |
+      Across H100 nodes, which collective really sees only about **50 GB/s per GPU**, and why?
+    correct: "All-to-all: chunks are distinct, so each GPU's data exits via its own NIC"
+    wrong:
+      - "All-reduce: the ring must cross each node boundary through a single shared NIC"
+      - "All-gather: its output is P times larger, so it saturates one NIC at a time"
+      - "Reduce-scatter: the summing serialises traffic onto the node's first NIC"
+    explanation: |
+      All-reduce, all-gather and reduce-scatter can be organised hierarchically, or as several rings, so all 8 NICs carry traffic and the node sees 400 GB/s. In an all-to-all every GPU sends different data to different remote GPUs, so nothing can be combined inside the node first, and each GPU is limited by its own 50 GB/s NIC. The all-reduce distractor describes the naive flat ring, which real implementations avoid.
+    source: 'Scaling Book Part 12 "Cross-node collectives"'
+
+  - id: q9
+    prompt: |
+      An 8-GPU job hangs at the first logging step. The code runs `if rank == 0: print(global_mean(loss))`, and `global_mean` calls `dist.all_reduce`. What is going on?
+    correct: "Rank 0 waits in an all-reduce the other seven ranks never call"
+    wrong:
+      - "The other ranks deadlock because print() holds the GIL across processes"
+      - "All-reduce needs a power-of-two group, so rank 0 alone cannot finish"
+      - "NCCL forbids collectives inside print(), so it blocks until timeout"
+    explanation: |
+      Every rank must call the same collectives in the same order. Here only rank 0 enters the all-reduce, so it waits for partners that never arrive. Meanwhile the other ranks move on and block in the next training collective, which rank 0 never reaches. Fix it by calling the all-reduce on every rank and printing only on rank 0. Separate processes don't share a GIL, so that distractor can't be the cause.
+    source: 'NCCL User Guide "Collective Operations" (intro); Li et al. 2020 §3.2.3'
+
+  - id: q10
+    prompt: |
+      Why can no all-gather algorithm, however clever, beat $T=\frac{P-1}{P}\frac{S}{W}$ (one link of bandwidth $W$ per rank, no compression)?
+    correct: "Each rank must receive the $(P-1)S/P$ bytes it lacks over its link"
+    wrong:
+      - "One root must send the whole $S$ bytes to the others through one link"
+      - "Each shard must be sent directly to each of the other $P-1$ ranks"
+      - "The ring needs $P-1$ steps, each costing at least the latency $\\alpha$"
+    explanation: |
+      The bound counts what must *arrive*. Each rank ends with $S$ bytes but starts with $S/P$, so $(P-1)S/P$ must come in through a link of bandwidth $W$. The root argument is broadcast's bound ($S/W$), not all-gather's. Sending each shard directly to each rank isn't required, since rings forward data hop by hop. The latency argument bounds the $\alpha$ term, not the bandwidth term.
+    source: 'nccl-tests PERFORMANCE.md "AllGather"; Scaling Book Part 12 "Intra-node collectives"'
+
+  - id: q11
+    prompt: |
+      An H100 spec sheet lists NVLink at "900 GB/s", and the node's NICs are "400G" InfiniBand. Which per-direction byte rates go into $T=\text{bytes}/W$ for one GPU's NVLink and one NIC?
+    correct: "450 GB/s and 50 GB/s"
+    wrong:
+      - "900 GB/s and 400 GB/s"
+      - "450 GB/s and 400 GB/s"
+      - "900 GB/s and 50 GB/s"
+    explanation: |
+      The 900 GB/s NVLink figure counts both directions (18 links × 25 GB/s each way is 450 GB/s per direction). "400G" means 400 gigabits/s, and dividing by 8 bits per byte gives 50 GB/s. The 400 GB/s you use for cross-node collectives is all 8 NICs of a node together, not one NIC.
+    source: 'Scaling Book Part 12 "At the node level", "Networking"'
+
+  - id: q12
+    prompt: |
+      In ZeRO-2 each rank needs only the summed gradient for the $1/P$ of the parameters it owns. Replacing the gradient all-reduce with a reduce-scatter changes the per-rank gradient traffic how?
+    correct: "From $2\\frac{P-1}{P}S$ to $\\frac{P-1}{P}S$, i.e. halved"
+    wrong:
+      - "From $2\\frac{P-1}{P}S$ to $\\frac{2}{P}S$, i.e. cut by about $P$"
+      - "Unchanged, since a reduce-scatter is an all-reduce plus slicing"
+      - "From $(P-1)S$ to $S$, i.e. cut by about $P$"
+    explanation: |
+      All-reduce is reduce-scatter followed by all-gather. Stopping after the reduce-scatter skips the all-gather and saves half the bytes: $\frac{P-1}{P}S$ per rank. Traffic doesn't fall by a factor of $P$, because every rank still has to send its contributions to everyone else's chunks. Implementing reduce-scatter as "all-reduce, then slice" would be correct but would waste the saving.
+    source: 'ZeRO §7.2.1; nccl-tests PERFORMANCE.md "ReduceScatter"'
+
+cards:
+  - id: f1
+    front: Minimum bytes each rank must send or receive, for each collective ($S$ = full array, $P$ ranks)?
+    back: |
+      - All-reduce: $2\frac{P-1}{P}S$
+      - All-gather, reduce-scatter, all-to-all: $\frac{P-1}{P}S$
+      - Broadcast, reduce: $S$ through the root
+    source: 'nccl-tests PERFORMANCE.md "Summary"; Patarasuk & Yuan 2009 Lemma 4'
+
+  - id: f2
+    front: Time of a ring all-reduce in the α–β model, and its behaviour as $P$ grows?
+    back: |
+      $$T=2(P-1)\alpha+2\frac{P-1}{P}\frac{S}{W}$$
+
+      The bandwidth term tends to $2S/W$, nearly independent of $P$, and matches the lower bound. The latency term grows linearly in $P$.
+    source: 'Patarasuk & Yuan 2009 Theorem 1'
+
+  - id: f3
+    front: Which bandwidth goes into collective estimates on H100 clusters, inside a node and across nodes?
+    back: |
+      - Inside a node: 450 GB/s per GPU per direction (≈370 GB/s achieved).
+      - Across nodes, for all-reduce, all-gather and reduce-scatter: about 400 GB/s per node (8 NICs × 50 GB/s). All-gather or reduce-scatter takes ≈ bytes/400e9; all-reduce takes twice that.
+      - Across nodes, for all-to-all (or one GPU per node): ≈50 GB/s per GPU.
+    source: 'Scaling Book Part 12 "Cross-node collectives"'
+
+  - id: f4
+    front: Name the transpose (backward) of all-gather, reduce-scatter, broadcast and reduce.
+    back: |
+      - All-gather ↔ reduce-scatter
+      - Broadcast ↔ reduce
+
+      Each pair is a linear map and its transpose, and backprop multiplies by the transpose. All-reduce maps to all-reduce when ranks' downstream gradients differ, and to the identity when they are replicated.
+    source: 'Scaling Book Part 3 "More about the ReduceScatter"'
+
+  - id: f5
+    front: Define all-to-all precisely.
+    back: |
+      Each of $P$ ranks splits its buffer into $P$ chunks and sends chunk $j$ to rank $j$. Rank $j$'s output is chunk $j$ from every rank, in rank order. Viewing the buffers as rows of a $P\times P$ block matrix, it is a transpose. Each rank sends $\frac{P-1}{P}S$ bytes.
+    source: 'NCCL User Guide "AlltoAll"'
+
+  - id: f6
+    front: What does NCCL require of every rank calling a collective, and what happens otherwise?
+    back: |
+      Same collectives, in the same order, with the same count and datatype. Otherwise behaviour is undefined: hangs (until the timeout), crashes, or corrupted data.
+    source: 'NCCL User Guide "Collective Operations" (intro)'
+
+  - id: f7
+    type: open
+    front: Derive the ring all-reduce and show it is bandwidth-optimal.
+    back: |
+      1. **Lower bound.** Each element needs at least $2(P-1)$ transfers (fold $P$ values into one, then distribute; Patarasuk & Yuan). Spread over $P$ ranks, some rank sends at least $2\frac{P-1}{P}S$.
+      2. **Algorithm.** Form a ring and split the buffer into $P$ chunks.
+         - Reduce-scatter: in step $j$, rank $i$ sends chunk $(i-j)\bmod P$ to $i+1$, which adds it in. After $P-1$ steps rank $i$ owns the complete chunk $i$.
+         - All-gather: circulate the complete chunks for $P-1$ more steps.
+      3. **Cost.** $2(P-1)$ steps of $S/P$: $T=2(P-1)\alpha+2\frac{P-1}{P}\frac{S}{W}$. The bytes per rank equal the bound, and every link is busy in every step.
+      4. **Contrast.** A naive root-based version pushes $(P-1)S$ through one link.
+      5. **Caveats.** Latency grows with $P$, which favours trees or hierarchy at scale. The result assumes a contention-free ring embedding.
+    source: 'Patarasuk & Yuan 2009 §3–4; Ultra-Scale Playbook App. A0'
+
+  - id: f8
+    type: open
+    front: Explain to an interviewer why the backward of an all-gather is a reduce-scatter.
+    back: |
+      - **Setup.** Rank $r$ holds $x_r$. The all-gather gives every rank $q$ the vector $y^{(q)}=[x_0;\dots;x_{P-1}]$. Rank $q$ computes $L_q$ on its own data, and $L=\sum_qL_q$.
+      - **Chain rule.** $x_r$ is block $r$ of every $y^{(q)}$, so $\partial L/\partial x_r=\sum_q(\partial L_q/\partial y^{(q)})_r$.
+      - **Read it off.** That is a sum over ranks with block $r$ delivered to rank $r$: a reduce-scatter.
+      - **Linear-algebra view.** All-gather is the linear map $A=\mathbf 1_P\otimes I$, which stacks $P$ copies of the concatenated shards. Backprop applies $A^\top$, which sums the copies and hands block $r$ to rank $r$: a reduce-scatter. By the same argument the backward of reduce-scatter is an all-gather.
+      - **Use.** This is why FSDP's backward has a reduce-scatter of gradients.
+    source: 'Scaling Book Part 3 "More about the ReduceScatter"'
+
+  - id: f9
+    type: open
+    front: "Estimate: all-reducing 14 GB of bf16 gradients over 8 H100 nodes (64 GPUs). Someone says 0.55 s. Respond."
+    back: |
+      - **Formula.** Ring-type all-reduce costs $2\frac{P-1}{P}S/W$, so everything hinges on $W$.
+      - **Where 0.55 s comes from.** A single flat ring, limited at node boundaries by one 50 GB/s NIC: $2\cdot\frac{63}{64}\cdot14\text{e}9/50\text{e}9\approx0.55$ s. That ring uses only 1 of each node's 8 NICs.
+      - **What real implementations do.** Reduce-scatter over NVLink inside the node, then 8 parallel cross-node all-reduces (one per NIC, each on $1/8$ of the data), then all-gather inside the node. Equivalently, run 8 rings at once. All NICs carry traffic, so $W\approx400$ GB/s per node.
+      - **Answer.** $2\cdot\frac{63}{64}\cdot14\text{e}9/400\text{e}9\approx69$ ms, about 8× faster.
+      - **Caveats.** Large messages and a full-bisection fabric are assumed; achieved bandwidth is lower than peak, and SHARP can help. The 50 GB/s per-GPU figure is right for all-to-all.
+    source: 'Scaling Book Part 12 "Cross-node collectives"; NVIDIA 2019 NCCL 2.4 blog'
+
+  - id: f10
+    type: open
+    front: A multi-GPU job hangs on step 1, or after some steps. How do you reason about it?
+    back: |
+      - **Model.** Collectives must match across ranks: the same ops, order, sizes and dtypes. A hang means some rank is waiting in a collective the others never reach.
+      - **Common causes:**
+        - rank-dependent branches that contain collectives (evaluation or logging on rank 0);
+        - ranks running different numbers of batches (uneven data shards at the end of an epoch);
+        - shape mismatches (a different sequence length per rank in an op that needs equal sizes);
+        - in DDP, parameters that get no gradient, so a bucket never fills (`sys.ddp`).
+      - **Diagnose.** Dump each rank's stack and the collective it is in; turn on NCCL or torch.distributed debug logging; check that every rank executes the same code path.
+      - **Not a hang but related.** A straggler makes every step slow, because each collective waits for the slowest rank.
+    source: 'NCCL User Guide "Collective Operations"; Li et al. 2020 §3.2.3; Ultra-Scale Playbook App. A0 "Barrier"'
+
+reading:
+  - title: "NCCL User Guide: Collective Operations"
+    url: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/collectives.html
+    kind: docs
+    note: Precise input/output definitions of every collective, with diagrams, and the rule that all ranks must call them identically.
+  - title: "nccl-tests PERFORMANCE.md (algorithm vs bus bandwidth)"
+    url: https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md
+    kind: docs
+    note: Short derivation of the 2(n−1)/n and (n−1)/n traffic factors, and how to read benchmark numbers against hardware peaks.
+  - title: "Patarasuk & Yuan 2009, Bandwidth optimal all-reduce algorithms, §3–4"
+    url: https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf
+    kind: paper
+    note: The proof of the 2(N−1)/N lower bound and of the ring algorithm's optimality on tree topologies.
+  - title: "Ultra-Scale Playbook, Appendix A0: Parallel Programming Crash Course"
+    url: https://huggingface.co/spaces/nanotron/ultrascale-playbook
+    kind: book
+    note: Runnable torch.distributed examples for every primitive, and an animated ring all-reduce.
+  - title: "How To Scale Your Model, Part 12: How Do Collectives Work on GPUs?"
+    url: https://jax-ml.github.io/scaling-book/gpus/
+    kind: book
+    note: Intra- vs cross-node cost models (450 vs 400 GB/s), the all-to-all exception, SHARP, and measured NVLink bandwidth.

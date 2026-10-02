@@ -1,0 +1,460 @@
+id: gen.ddpm-forward-reverse
+area: genmodels
+title: "Diffusion I: Forward Noising & the Reverse Posterior"
+summary: Builds a diffusion model from the problem up. Defines the variance-preserving forward noising chain, derives its closed-form marginal by induction and the tractable reverse posterior q(x_{t−1}|x_t, x_0) by completing the square, and explains ancestral sampling and the two natural reverse variances.
+order: 100
+level: core
+tags: [diffusion, ddpm, generative-models, gaussian]
+prereqs: [gen.latent-variables-elbo, fund.gaussian]
+
+explainer:
+  - title: The problem, and the plan
+    source: "Ho et al. 2020 §1–2; Murphy PML2 §25.1–25.2; Luo 2022, \"Variational Diffusion Models\" (p.6–7)"
+    body: |
+      We want to sample new images from an unknown data distribution $q(x_0)$, given only examples of it. Mapping noise to data in one shot is hard: a GAN learns such a map adversarially, which is unstable, and a VAE's one-step decoder tends to blur.
+
+      Diffusion models split the job. **Turning data into noise is easy:** keep adding a little Gaussian noise, and after enough steps the image is indistinguishable from $N(0,I)$. If we can learn to undo **one small step** of noising, we can start from pure noise and undo the steps one at a time. Each reverse step is a small denoising problem, and a single network, told which step it is at, handles all of them.
+
+      ![The forward chain q adds noise with no parameters; the learned chain p_θ removes it one step at a time. The dashed arc is the closed-form jump derived below](gen.ddpm-forward-reverse/markov-chain)
+
+      In latent-variable language (the ELBO lesson), $x_1,\dots,x_T$ are latents with the same shape as $x_0$. Two things differ from a VAE: the "encoder" $q$ is **fixed**, not learned, and there are $T$ latent layers that share one decoder network.
+
+      **Notation for all three diffusion lessons** (Ho et al. 2020):
+
+      - $t=0$ is data and $t=T$ is (almost) pure noise; $T=1000$.
+      - $\beta_t\in(0,1)$ is the variance of the noise added at step $t$.
+      - $\alpha_t := 1-\beta_t$ and $\bar\alpha_t := \prod_{s=1}^{t}\alpha_s$, with $\bar\alpha_0:=1$.
+
+      Papers clash here. DDIM writes $\alpha_t$ for our $\bar\alpha_t$. VDM and Salimans & Ho write $\alpha_t$ for our $\sqrt{\bar\alpha_t}$ and $\sigma_t$ for $\sqrt{1-\bar\alpha_t}$, whereas Ho uses $\sigma_t^2$ for the reverse-step variance. Flow-matching papers put data at $t=1$. Convert before comparing formulas. From lesson III on we switch to the VDM-style $\alpha_t:=\sqrt{\bar\alpha_t}$, $\sigma_t:=\sqrt{1-\bar\alpha_t}$, and say so there.
+  - title: "Refresher: three Gaussian facts"
+    source: Bishop PRML §2.3.1, §2.3.3; Luo 2022, "Variational Diffusion Models" (p.10–11)
+    body: |
+      Every derivation in this lesson uses only these.
+
+      **1. Reparameterization.** If $\epsilon\sim N(0,I)$, then $\mu+s\,\epsilon\sim N(\mu,s^2I)$. "Sample from $N(\mu,s^2I)$" and "compute $\mu+s\epsilon$" are the same thing.
+
+      **2. Independent Gaussians add, and so do their variances.** If $a\sim N(0,s_1^2I)$ and $b\sim N(0,s_2^2I)$ are independent, then
+
+      $$a+b\sim N\big(0,\,(s_1^2+s_2^2)\,I\big).$$
+
+      A sum of independent Gaussians is Gaussian, and its variance is the sum because the cross-covariance is zero.
+
+      **3. Completing the square.** A density in $x$ whose log is quadratic,
+
+      $$\log f(x) = -\tfrac12\big(Ax^2-2Bx\big)+\text{const},$$
+
+      is Gaussian with variance $1/A$ and mean $B/A$, because $-\frac12(Ax^2-2Bx)=-\frac A2(x-B/A)^2+\text{const}$. So read off the coefficient of $x^2$ (the **precision** $A$) and the coefficient of $x$.
+
+      A corollary: multiplying two Gaussian densities in the same variable, $N(x;m_1,v_1)\,N(x;m_2,v_2)$, adds their quadratics. So **precisions add**, $A=1/v_1+1/v_2$, and the mean is the precision-weighted average $(m_1/v_1+m_2/v_2)/A$.
+
+      All covariances in these lessons are isotropic ($s\,I$), so each coordinate behaves independently and we can do the algebra with scalars.
+  - title: The forward process and its closed form
+    source: "Ho et al. 2020 §2, eqs. (2), (4); Luo 2022, \"Variational Diffusion Models\" (p.7, p.10–11); Murphy PML2 §25.2.1"
+    body: |
+      One forward step shrinks the current image slightly and adds noise:
+
+      $$q(x_t|x_{t-1}) = N\big(\sqrt{\alpha_t}\,x_{t-1},\ \beta_tI\big).$$
+
+      By fact 1, $x_t=\sqrt{\alpha_t}\,x_{t-1}+\sqrt{\beta_t}\,\epsilon_t$ with fresh noise $\epsilon_t\sim N(0,I)$. Ho uses a linear schedule from $\beta_1=10^{-4}$ to $\beta_T=0.02$.
+
+      **Why shrink by $\sqrt{\alpha_t}$?** If $\mathrm{Var}(x_{t-1})=1$ per coordinate, then $\mathrm{Var}(x_t)=\alpha_t\cdot1+\beta_t=1$. The scale never drifts ("variance preserving"). Adding noise without shrinking makes the variance grow step after step; that is the "variance exploding" family, which has its own conventions.
+
+      **Closed form.** Claim: $x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$ for some $\epsilon\sim N(0,I)$. At $t=1$ this is the definition, since $\bar\alpha_1=\alpha_1$. Assume it at $t-1$ (with noise $\epsilon'$) and substitute into one step:
+
+      $$\begin{aligned} x_t &= \sqrt{\alpha_t}\sqrt{\bar\alpha_{t-1}}\;x_0 \\ &\quad+\sqrt{\alpha_t(1-\bar\alpha_{t-1})}\;\epsilon' \\ &\quad+\sqrt{1-\alpha_t}\;\epsilon_t. \end{aligned}$$
+
+      The first coefficient is $\sqrt{\bar\alpha_t}$. The two noise terms are independent zero-mean Gaussians, so by fact 2 they merge into one, with variance
+
+      $$\alpha_t-\bar\alpha_t+1-\alpha_t=1-\bar\alpha_t.$$
+
+      That completes the induction:
+
+      $$q(x_t|x_0)=N\big(\sqrt{\bar\alpha_t}\,x_0,\ (1-\bar\alpha_t)\,I\big).$$
+
+      **Why this matters.** Training needs $x_t$ at random steps $t$, and now we can jump there in one shot instead of simulating $t$ steps. And because $\bar\alpha_T\approx4\times10^{-5}$ for Ho's schedule, $q(x_T|x_0)\approx N(0,I)$ whatever $x_0$ was, so $N(0,I)$ is the right place to start sampling.
+  - title: How fast is the signal destroyed?
+    source: "Ho et al. 2020 §4; Kingma et al. 2021 §3.1; Nichol & Dhariwal 2021 §3.2; Murphy PML2 §25.2.1"
+    body: |
+      $x_t$ is a scaled copy of $x_0$ plus noise. Measure how much signal is left with the **signal-to-noise ratio**
+
+      $$\mathrm{SNR}(t)=\frac{\bar\alpha_t}{1-\bar\alpha_t},$$
+
+      the ratio of signal variance to noise variance for unit-variance data. Each $\alpha_s<1$, so $\bar\alpha_t$ falls and SNR decreases monotonically in $t$. Ho's linear schedule, computed:
+
+      - $t=1$: $\bar\alpha_t=0.9999$, SNR ≈ $10^4$
+      - $t=100$: $\bar\alpha_t=0.897$, SNR ≈ 8.7
+      - $t=250$: $\bar\alpha_t=0.524$, SNR ≈ 1.10
+      - $t=500$: $\bar\alpha_t=0.079$, SNR ≈ 0.085
+      - $t=1000$: $\bar\alpha_t\approx4.0\times10^{-5}$
+
+      ![Signal and noise coefficients of q(x_t|x_0) under Ho's linear schedule. They cross (SNR = 1) near t ≈ 259, so most of the chain works on mostly-noise inputs](gen.ddpm-forward-reverse/schedule-curves)
+
+      SNR passes 1 near $t\approx259$, so about three quarters of the steps see inputs that are more noise than signal. Nichol & Dhariwal found the end of this schedule contributes little at 32×32 and 64×64 resolution, which motivates the cosine schedule (lesson III).
+
+      Here is the process on a toy 2-D dataset, simulated with the closed form. The fine structure goes first (by $t=50$ the arms have thickened), then the global shape; by $t=250$ the cloud looks like $N(0,I)$. On images the analogue is texture first, then shapes (Murphy §25.2.1).
+
+      ![Forward diffusion of a synthetic 2-D Swiss roll (standardised to unit variance), linear schedule. Faint circles mark radius 1 and 2 of N(0, I): the cloud converges to them](gen.ddpm-forward-reverse/forward-2d)
+  - title: The reverse process we want
+    source: "Ho et al. 2020 §2, eq. (1); Sohl-Dickstein et al. 2015 §2.2; Murphy PML2 §25.2.2"
+    body: |
+      To generate, run the chain backwards: sample $x_T\sim N(0,I)$, then $x_{T-1}\sim q(x_{T-1}|x_T)$, and so on. By Bayes,
+
+      $$q(x_{t-1}|x_t)=\frac{q(x_t|x_{t-1})\,q(x_{t-1})}{q(x_t)}.$$
+
+      The marginal $q(x_{t-1})=\int q(x_{t-1}|x_0)\,q(x_0)\,dx_0$ is the data distribution blurred by noise. It needs the unknown $q(x_0)$, so the true reverse step is **intractable**.
+
+      **But it is close to Gaussian when $\beta_t$ is small.** A heuristic: as a function of $x_{t-1}$, the factor $q(x_t|x_{t-1})$ is a narrow Gaussian of width about $\sqrt{\beta_t}$. Over such a narrow window $\log q(x_{t-1})$ is roughly linear, and a Gaussian times $e^{\text{linear}}$ is again a Gaussian, with a shifted mean. Sohl-Dickstein et al. cite Feller (1949) for the rigorous version: for small steps, the reverse of a Gaussian diffusion has the same functional form. This is why $T$ is large and each $\beta_t$ small.
+
+      So we model each reverse step as a Gaussian, with $p(x_T)=N(0,I)$ and
+
+      $$p_\theta(x_{t-1}|x_t)=N\big(\mu_\theta(x_t,t),\ \sigma_t^2I\big).$$
+
+      $\mu_\theta$ is a neural network that takes the noisy image and the step $t$ and returns a tensor of the same shape (a U-Net with a time embedding in Ho et al.; backbones are in gen.diffusion-transformers). Ho fixes $\sigma_t^2$ instead of learning it; the sampling card says which values make sense.
+
+      What should $\mu_\theta$ aim for? We cannot compute $q(x_{t-1}|x_t)$. But if we also condition on the clean image $x_0$, the reverse step becomes a closed-form Gaussian. That posterior is the most common diffusion whiteboard question, so the next two cards derive it line by line.
+  - title: "Deriving q(x_{t−1}|x_t, x_0): the precision"
+    source: "Ho et al. 2020 eqs. (6)–(7); Luo 2022, \"Variational Diffusion Models\" (p.11–13); Bishop PRML §2.3.3"
+    body: |
+      **(a) Bayes, then Markov.**
+
+      $$q(x_{t-1}|x_t,x_0)=\frac{q(x_t|x_{t-1},x_0)\,q(x_{t-1}|x_0)}{q(x_t|x_0)}.$$
+
+      The forward chain is Markov: given $x_{t-1}$, the next state ignores $x_0$, so $q(x_t|x_{t-1},x_0)=q(x_t|x_{t-1})$. The denominator has no $x_{t-1}$ in it, so
+
+      $$q(x_{t-1}|x_t,x_0)\propto q(x_t|x_{t-1})\,q(x_{t-1}|x_0).$$
+
+      **(b) Both factors are Gaussian in $x_{t-1}$.** Work per coordinate and write $y=x_{t-1}$. The step density and the closed-form marginal give
+
+      $$\begin{aligned} \log q(x_t|y) &= -\frac{(x_t-\sqrt{\alpha_t}\,y)^2}{2\beta_t}+c_1, \\ \log q(y|x_0) &= -\frac{(y-\sqrt{\bar\alpha_{t-1}}\,x_0)^2}{2(1-\bar\alpha_{t-1})}+c_2. \end{aligned}$$
+
+      Expand the squares and keep only the terms containing $y$. The sum has fact 3's form $-\frac12(Ay^2-2By)$ with
+
+      $$\begin{aligned} A &= \frac{\alpha_t}{\beta_t}+\frac{1}{1-\bar\alpha_{t-1}}, \\ B &= \frac{\sqrt{\alpha_t}}{\beta_t}\,x_t+\frac{\sqrt{\bar\alpha_{t-1}}}{1-\bar\alpha_{t-1}}\,x_0. \end{aligned}$$
+
+      So the posterior is Gaussian with variance $1/A$ and mean $B/A$. Note the $\alpha_t$ in $A$: it comes from $(\sqrt{\alpha_t}\,y)^2$.
+
+      **(c) The precision.** Over a common denominator, using $\alpha_t(1-\bar\alpha_{t-1})+\beta_t=\alpha_t-\bar\alpha_t+1-\alpha_t=1-\bar\alpha_t$:
+
+      $$\begin{aligned} A &= \frac{\alpha_t(1-\bar\alpha_{t-1})+\beta_t}{\beta_t(1-\bar\alpha_{t-1})} \\ &= \frac{1-\bar\alpha_t}{\beta_t(1-\bar\alpha_{t-1})}. \end{aligned}$$
+
+      Hence the posterior variance is
+
+      $$\tilde\beta_t:=\frac1A=\frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\,\beta_t.$$
+
+      $A$ is a sum of two precisions: $\alpha_t/\beta_t$ from the noisy step we observed, and $1/(1-\bar\alpha_{t-1})$ from what $x_0$ says about $x_{t-1}$. Two sources of information make the posterior tighter than either alone.
+  - title: "Deriving q(x_{t−1}|x_t, x_0): the mean"
+    source: "Ho et al. 2020 eqs. (6)–(7); Luo 2022, \"Variational Diffusion Models\" (p.12–13); Murphy PML2 §25.2.2"
+    body: |
+      **(d) The mean** is $B/A=\tilde\beta_t B$. Multiply each term of $B$ by $\tilde\beta_t=\frac{(1-\bar\alpha_{t-1})\beta_t}{1-\bar\alpha_t}$: in the first term $\beta_t$ cancels, in the second $1-\bar\alpha_{t-1}$ cancels.
+
+      $$\begin{aligned} \tilde\mu_t &= \frac{\sqrt{\alpha_t}(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}\,x_t \\ &\quad+\frac{\sqrt{\bar\alpha_{t-1}}\,\beta_t}{1-\bar\alpha_t}\,x_0, \end{aligned}$$
+
+      and $q(x_{t-1}|x_t,x_0)=N(\tilde\mu_t,\ \tilde\beta_tI)$.
+
+      **Worked example** (one coordinate): $\beta_t=0.1$ so $\alpha_t=0.9$; $\bar\alpha_{t-1}=0.5$, hence $\bar\alpha_t=0.45$; observed $x_t=0.8$ and $x_0=1$.
+
+      - Precision $A=0.9/0.1+1/0.5=11$, so $\tilde\beta_t=1/11\approx0.091$, below $\beta_t=0.1$.
+      - Coefficient on $x_t$: $\sqrt{0.9}\cdot0.5/0.55\approx0.862$. On $x_0$: $\sqrt{0.5}\cdot0.1/0.55\approx0.129$.
+      - Mean $\approx0.862\cdot0.8+0.129\cdot1\approx0.819$.
+
+      Simulating the two forward steps and keeping samples with $x_t\approx0.8$ gives mean 0.82 and variance 0.091, as derived.
+
+      **Interpretation.** $\tilde\mu_t$ blends the current noisy image with the clean one, and the blend depends on $t$:
+
+      ![Coefficients of x_t and x_0 in the posterior mean, linear schedule. The clean image has real weight only in the last few reverse steps; elsewhere the mean is almost a rescaled x_t](gen.ddpm-forward-reverse/posterior-blend)
+
+      Each reverse step moves only slightly toward $x_0$, which is what makes it learnable. Since $(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)<1$, $\tilde\beta_t<\beta_t$: knowing $x_0$ always reduces uncertainty. The ratio is 0.45 at $t=2$ and above 0.98 for $t\ge100$.
+
+      This Gaussian is the **target** that $p_\theta(x_{t-1}|x_t)$ is trained to match in the next lesson, with the unknown $x_0$ replaced by the network's estimate.
+  - title: Ancestral sampling and the choice of σ_t²
+    source: "Ho et al. 2020 §3.2, Alg. 2; Nichol & Dhariwal 2021 §3.1; Bishop PRML §2.3.1"
+    body: |
+      **Sampling** (Ho's Algorithm 2, in words). Draw $x_T\sim N(0,I)$. For $t=T,\dots,1$, compute $\mu_\theta(x_t,t)$ and set
+
+      $$x_{t-1}=\mu_\theta(x_t,t)+\sigma_t\,z,\qquad z\sim N(0,I),$$
+
+      with $z=0$ at the last step, so the output is the final mean. That is $T$ network evaluations, 1000 in Ho et al., so sampling is slow; DDIM (gen.ddim) cuts this.
+
+      **Which $\sigma_t^2$?** Ho tried two values and found similar sample quality. Each is exactly right for one extreme kind of data:
+
+      - **$\sigma_t^2=\tilde\beta_t$ is exact if the data is a single point.** Then $x_0$ is known, so $q(x_{t-1}|x_t)=q(x_{t-1}|x_t,x_0)$, whose variance is $\tilde\beta_t$.
+      - **$\sigma_t^2=\beta_t$ is exact if $x_0\sim N(0,I)$.** Then every marginal is $N(0,I)$ by variance preservation, and $(x_{t-1},x_t)$ is jointly Gaussian with unit variances and covariance $\mathrm{Cov}(x_{t-1},\sqrt{\alpha_t}x_{t-1}+\sqrt{\beta_t}\epsilon)=\sqrt{\alpha_t}$. Gaussian conditioning gives
+
+      $$\mathrm{Var}(x_{t-1}|x_t)=1-\frac{(\sqrt{\alpha_t})^2}{1}=\beta_t.$$
+
+      For data with unit variance per coordinate, Ho notes these are the two extremes (lower and upper bounds on the reverse-step entropy). They differ only at small $t$ (ratio 0.45 at $t=2$, above 0.98 from $t=100$ on), which is why the choice barely changes samples when $T=1000$. Nichol & Dhariwal instead learn an interpolation between the two, which improves likelihood and tolerates fewer sampling steps (next lesson).
+  - title: What interviewers probe
+    source: Ho et al. 2020 §2–3.2; Luo 2022, "Variational Diffusion Models" (p.6–13)
+    body: |
+      - *Why the factor $\sqrt{1-\beta_t}$?* Keeps unit variance: $\alpha_t\cdot1+\beta_t=1$. Without it the variance grows by $\sum\beta_t$.
+      - *Derive $q(x_t|x_0)$.* Induction; merge two independent Gaussians with variances $\alpha_t(1-\bar\alpha_{t-1})$ and $1-\alpha_t$ into one with $1-\bar\alpha_t$.
+      - *Why not use $q(x_{t-1}|x_t)$ directly?* It needs the noised data marginal $q(x_{t-1})$, hence the unknown $q(x_0)$.
+      - *Why condition on $x_0$?* Bayes plus the Markov property turn it into a product of two Gaussians in $x_{t-1}$: closed form.
+      - *Posterior precision?* $\alpha_t/\beta_t+1/(1-\bar\alpha_{t-1})=1/\tilde\beta_t$, two precisions adding.
+      - *Is $\tilde\beta_t$ larger or smaller than $\beta_t$?* Smaller, by the factor $(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)$.
+      - *Why must the steps be small?* So that the true reverse step is close to Gaussian, which a Gaussian $p_\theta$ can match. Note that $q(x_t|x_0)$ and $q(x_{t-1}|x_t,x_0)$ are Gaussian for any step size.
+      - *DDPM vs VAE?* Fixed, parameter-free encoder; latents the size of the data; one network shared by $T$ layers.
+      - *What if $\bar\alpha_T$ is not near 0?* Training never sees inputs like the $N(0,I)$ that sampling starts from (the terminal-SNR problem, lesson III).
+  - title: Key results
+    source: Ho et al. 2020 eqs. (2), (4), (6)–(7), §3.2
+    body: |
+      $$q(x_t|x_{t-1})=N\big(\sqrt{\alpha_t}\,x_{t-1},\,\beta_tI\big)$$
+
+      $$q(x_t|x_0)=N\big(\sqrt{\bar\alpha_t}\,x_0,\,(1-\bar\alpha_t)I\big)$$
+
+      $$x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$$
+
+      $$q(x_{t-1}|x_t,x_0)=N(\tilde\mu_t,\,\tilde\beta_tI)$$
+
+      $$\begin{aligned} \tilde\mu_t &= \frac{\sqrt{\alpha_t}(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}\,x_t+\frac{\sqrt{\bar\alpha_{t-1}}\,\beta_t}{1-\bar\alpha_t}\,x_0 \\ \tilde\beta_t &= \frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\,\beta_t \end{aligned}$$
+
+      - $\alpha_t=1-\beta_t$, $\bar\alpha_t=\prod_{s\le t}\alpha_s$; $\mathrm{SNR}(t)=\bar\alpha_t/(1-\bar\alpha_t)$.
+      - Ho: $T=1000$, $\beta_t$ linear from $10^{-4}$ to $0.02$; SNR = 1 near $t\approx259$; $\bar\alpha_T\approx4\times10^{-5}$.
+      - Posterior precision $=\alpha_t/\beta_t+1/(1-\bar\alpha_{t-1})$.
+      - Reverse variance: $\sigma_t^2=\tilde\beta_t$ (exact for a point mass) or $\beta_t$ (exact for $N(0,I)$ data).
+
+quiz:
+  - id: q1
+    source: Ho et al. 2020 eq. (4)
+    prompt: |
+      With $\bar\alpha_t=0.25$, a clean value $x_0=2$ and noise draw $\epsilon=1$, what is $x_t$ under $q(x_t|x_0)$?
+    correct: About 1.87
+    wrong:
+      - About 1.75
+      - About 1.37
+      - Exactly 1.25
+    explanation: |
+      $x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon=0.5\cdot2+\sqrt{0.75}\approx1.866$. The value 1.25 uses $\bar\alpha_t$ and $1-\bar\alpha_t$ without square roots (variances in place of standard deviations); 1.75 drops only the noise square root; 1.37 drops only the signal one.
+  - id: q2
+    source: Ho et al. 2020 eq. (4); Kingma et al. 2021 §3.1
+    prompt: |
+      A forward process uses a constant $\beta_t=0.02$. What is $\mathrm{SNR}(t)=\bar\alpha_t/(1-\bar\alpha_t)$ after 100 steps?
+    correct: About 0.15
+    wrong:
+      - About 0.13
+      - About 0.36
+      - About 6.5
+    explanation: |
+      $\bar\alpha_{100}=0.98^{100}\approx0.133$, so SNR $=0.133/0.867\approx0.153$. 0.13 is $\bar\alpha_{100}$ itself; 0.36 is the signal coefficient $\sqrt{\bar\alpha_{100}}$; 6.5 is the inverse ratio, noise over signal.
+  - id: q3
+    source: Ho et al. 2020 §2, §4; Luo 2022, "Variational Diffusion Models" (p.7)
+    prompt: |
+      Someone drops the shrink factor and uses $x_t=x_{t-1}+\sqrt{\beta_t}\,\epsilon_t$ with Ho's linear schedule ($T=1000$, $\beta_t$ from $10^{-4}$ to $0.02$) on unit-variance data. What happens at $t=T$?
+    correct: The variance grows to about 11, so x_T no longer matches N(0, I)
+    wrong:
+      - Nothing changes, because the closed form still ends at N(0, I)
+      - The signal is destroyed sooner, so x_T is even closer to N(0, I)
+      - The variance shrinks toward zero and x_T collapses to a point
+    explanation: |
+      Without shrinking, variances simply add: $1+\sum_t\beta_t=1+1000\cdot\frac{10^{-4}+0.02}{2}\approx11$. The signal coefficient stays 1, so the SNR at $T$ is about 0.1, far from the near-zero SNR that makes $N(0,I)$ a good starting point. The $\sqrt{1-\beta_t}$ factor is exactly what keeps the variance at 1 and drives the signal to 0.
+  - id: q4
+    source: "Ho et al. 2020 eqs. (6)–(7); Luo 2022, \"Variational Diffusion Models\" (p.12)"
+    prompt: |
+      Completing the square for $q(x_{t-1}|x_t,x_0)\propto q(x_t|x_{t-1})\,q(x_{t-1}|x_0)$, what is the coefficient $A$ of $-\frac12x_{t-1}^2$, i.e. the posterior precision?
+    correct: $\alpha_t/\beta_t+1/(1-\bar\alpha_{t-1})$
+    wrong:
+      - $1/\beta_t+1/(1-\bar\alpha_{t-1})$
+      - $\alpha_t/\beta_t+1/(1-\bar\alpha_t)$
+      - $\beta_t/\alpha_t+(1-\bar\alpha_{t-1})$
+    explanation: |
+      $q(x_t|x_{t-1})$ contributes $(x_t-\sqrt{\alpha_t}x_{t-1})^2/\beta_t$, whose $x_{t-1}^2$ coefficient is $\alpha_t/\beta_t$, not $1/\beta_t$. $q(x_{t-1}|x_0)$ has variance $1-\bar\alpha_{t-1}$ (the marginal at step $t-1$, not $t$). Precisions add; adding variances, as in the last option, is the classic slip.
+  - id: q5
+    source: Ho et al. 2020 App. A; Murphy PML2 §25.2.3
+    prompt: |
+      In deriving $q(x_{t-1}|x_t,x_0)$, why may we replace $q(x_t|x_{t-1},x_0)$ by $q(x_t|x_{t-1})$?
+    correct: Given x_{t−1}, the Markov forward chain makes x_t independent of x_0
+    wrong:
+      - For one training example x_0 is a constant, so it can be dropped
+      - Because β_t is small, the dependence on x_0 is negligible
+      - Because q(x_t|x_0) is Gaussian, conditioning on x_0 changes nothing
+    explanation: |
+      $q(x_t|x_{t-1})$ is defined to depend only on $x_{t-1}$; this conditional independence is exact, not an approximation. "$x_0$ is a constant" is tempting but wrong: $q(x_{t-1}|x_t,x_0)$ certainly depends on $x_0$. It is specifically the next step, given $x_{t-1}$, that does not.
+  - id: q6
+    source: Ho et al. 2020 §2; Sohl-Dickstein et al. 2015 §2.2
+    prompt: |
+      Which statement about the distributions in a DDPM is **false**?
+    correct: q(x_{t−1}|x_t) is a closed-form Gaussian for any data distribution
+    wrong:
+      - q(x_{t−1}|x_t, x_0) is Gaussian with variance β̃_t below β_t
+      - q(x_t|x_0) can be sampled in one step without simulating the chain
+      - With small β_t, a Gaussian can approximate the true reverse step well
+    explanation: |
+      $q(x_{t-1}|x_t)$ needs the noised marginal $q(x_{t-1})=\int q(x_{t-1}|x_0)q(x_0)dx_0$, which depends on the unknown data distribution; it is only approximately Gaussian, and only for small steps. Conditioning on $x_0$ is what makes the posterior closed-form.
+  - id: q7
+    source: Ho et al. 2020 eq. (7)
+    prompt: |
+      One coordinate, with $\beta_t=0.2$ and $\bar\alpha_{t-1}=0.5$. What is the posterior variance $\tilde\beta_t$ of $q(x_{t-1}|x_t,x_0)$?
+    correct: 1/6 ≈ 0.167
+    wrong:
+      - 0.20, the forward-step variance
+      - 0.25, from the observed step alone
+      - 0.10, the product of the two variances
+    explanation: |
+      Precisions add: $\alpha_t/\beta_t+1/(1-\bar\alpha_{t-1})=0.8/0.2+2=6$, so $\tilde\beta_t=1/6$. Equivalently $\frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\beta_t=\frac{0.5}{0.6}\cdot0.2$ with $\bar\alpha_t=0.4$. 0.25 keeps only the precision $\alpha_t/\beta_t=4$ and ignores what $x_0$ says about $x_{t-1}$.
+  - id: q8
+    source: Ho et al. 2020 eq. (7)
+    prompt: |
+      Same setting ($\beta_t=0.2$, $\bar\alpha_{t-1}=0.5$). If $x_t=1$ and $x_0=0$, what is the posterior mean $\tilde\mu_t$?
+    correct: About 0.745
+    wrong:
+      - About 1.118
+      - About 0.894
+      - About 0.500
+    explanation: |
+      With $x_0=0$ only the $x_t$ term survives: $\frac{\sqrt{\alpha_t}(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}=\frac{\sqrt{0.8}\cdot0.5}{0.6}\approx0.745$. 1.118 is $x_t/\sqrt{\alpha_t}$, which inverts the forward scaling but ignores the information in $x_0$ (here that the clean value is 0); 0.894 is $\sqrt{\alpha_t}\,x_t$, the forward mean applied in the wrong direction.
+  - id: q9
+    source: Ho et al. 2020 eq. (7); Luo 2022, "Variational Diffusion Models" (p.13)
+    prompt: |
+      At $t=500$ of Ho's linear schedule, $x_t$ is mostly noise (SNR ≈ 0.085). What does the posterior mean $\tilde\mu_t(x_t,x_0)$ look like there?
+    correct: Almost a rescaled x_t; the x_0 coefficient is about 0.003
+    wrong:
+      - Mostly x_0, because x_t carries so little signal at this step
+      - An even mix of x_t and x_0, since the SNR is close to 1
+      - Exactly x_0 scaled by the signal coefficient √ᾱ_{t−1}
+    explanation: |
+      One reverse step removes only one $\beta_t$-sized slice of noise, so $x_{t-1}$ stays close to $x_t$: the $x_t$ coefficient is about 0.994 and the $x_0$ coefficient $\sqrt{\bar\alpha_{t-1}}\beta_t/(1-\bar\alpha_t)\approx0.003$. A low SNR tells us how far $x_t$ is from $x_0$, not how far $x_{t-1}$ is from $x_t$. The $x_0$ term matters only in the last few steps.
+  - id: q10
+    source: Ho et al. 2020 §3.2; Nichol & Dhariwal 2021 §3.1
+    prompt: |
+      For which data distribution is $\sigma_t^2=\beta_t$ the exact variance of the true reverse step $q(x_{t-1}|x_t)$?
+    correct: Standard Gaussian data, x_0 ~ N(0, I)
+    wrong:
+      - A single fixed data point x_0
+      - Any data distribution supported in [−1, 1]
+      - Any data whose coordinates are independent
+    explanation: |
+      For $x_0\sim N(0,I)$ every marginal is $N(0,I)$, and conditioning the jointly Gaussian pair with covariance $\sqrt{\alpha_t}$ gives variance $1-\alpha_t=\beta_t$. For a single point, $x_0$ is known and the reverse variance is $\tilde\beta_t$. Independence of coordinates is not enough: for non-Gaussian data the reverse step is not even exactly Gaussian.
+  - id: q11
+    source: Sohl-Dickstein et al. 2015 §2.2; Ho et al. 2020 §2
+    prompt: |
+      Why do DDPMs use many small noise steps ($T=1000$, $\beta_t\le0.02$) rather than a few large ones?
+    correct: So the true reverse step q(x_{t−1}|x_t) is close to Gaussian
+    wrong:
+      - So the forward marginal q(x_t|x_0) remains a Gaussian
+      - So that ᾱ_T becomes exactly zero at the final step
+      - So the posterior q(x_{t−1}|x_t, x_0) stays tractable
+    explanation: |
+      $q(x_t|x_0)$ and $q(x_{t-1}|x_t,x_0)$ are Gaussian for any step sizes, and the linear schedule never makes $\bar\alpha_T$ exactly 0 ($\approx4\times10^{-5}$). The step size matters for the *true* reverse step $q(x_{t-1}|x_t)$, which is near-Gaussian only when each step adds little noise.
+  - id: q12
+    source: Ho et al. 2020 §2; Murphy PML2 §25.2; Luo 2022, "Variational Diffusion Models" (p.6)
+    prompt: |
+      Comparing a DDPM with a VAE, which statement is **false**?
+    correct: Its encoder q(x_t|x_{t−1}) is learned jointly with the decoder
+    wrong:
+      - Its latents x_1, …, x_T have the same dimension as the data
+      - One network is shared across all T reverse steps
+      - It is trained on a variational bound on the log-likelihood
+    explanation: |
+      In a DDPM the forward "encoder" is a fixed Gaussian noising chain with no parameters (Ho fixes the $\beta_t$; VDM-style models learn only the noise schedule). The other three are the defining features: same-size latents, a shared time-conditioned network, and an ELBO-based objective (next lesson).
+
+cards:
+  - id: f1
+    source: Ho et al. 2020 eq. (2)
+    front: Write the DDPM forward step and say why it scales $x_{t-1}$ by $\sqrt{1-\beta_t}$.
+    back: |
+      $$q(x_t|x_{t-1})=N\big(\sqrt{1-\beta_t}\,x_{t-1},\,\beta_tI\big)$$
+
+      If $\mathrm{Var}(x_{t-1})=1$ then $\mathrm{Var}(x_t)=(1-\beta_t)+\beta_t=1$: variance preserving.
+  - id: f2
+    source: Ho et al. 2020 eq. (4)
+    front: Closed-form forward marginal $q(x_t|x_0)$, and how to sample it in one shot.
+    back: |
+      $$q(x_t|x_0)=N\big(\sqrt{\bar\alpha_t}\,x_0,\,(1-\bar\alpha_t)I\big)$$
+
+      $x_t=\sqrt{\bar\alpha_t}\,x_0+\sqrt{1-\bar\alpha_t}\,\epsilon$, $\epsilon\sim N(0,I)$, with $\alpha_t=1-\beta_t$, $\bar\alpha_t=\prod_{s\le t}\alpha_s$.
+  - id: f3
+    source: Ho et al. 2020 eqs. (6)–(7)
+    front: Mean and variance of the DDPM posterior $q(x_{t-1}|x_t,x_0)$.
+    back: |
+      $$\begin{aligned} \tilde\mu_t &= \frac{\sqrt{\alpha_t}(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}\,x_t \\ &\quad+\frac{\sqrt{\bar\alpha_{t-1}}\,\beta_t}{1-\bar\alpha_t}\,x_0 \end{aligned}$$
+
+      $$\tilde\beta_t=\frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\,\beta_t$$
+  - id: f4
+    source: Luo 2022, "Variational Diffusion Models" (p.12)
+    front: The DDPM posterior precision as a sum of two precisions. What does each term represent?
+    back: |
+      $$\frac{1}{\tilde\beta_t}=\frac{\alpha_t}{\beta_t}+\frac{1}{1-\bar\alpha_{t-1}}$$
+
+      $\alpha_t/\beta_t$: information from the observed noisy step $x_t$. $1/(1-\bar\alpha_{t-1})$: information from $x_0$ about $x_{t-1}$.
+  - id: f5
+    source: Ho et al. 2020 §4; Kingma et al. 2021 §3.1
+    front: Define SNR(t) for a DDPM, and give the key numbers for Ho's linear schedule.
+    back: |
+      $\mathrm{SNR}(t)=\bar\alpha_t/(1-\bar\alpha_t)$, monotonically decreasing.
+
+      Ho: $T=1000$, $\beta_t$ linear $10^{-4}\to0.02$. SNR ≈ 1.1 at $t=250$, crosses 1 near $t\approx259$; $\bar\alpha_{500}\approx0.079$; $\bar\alpha_T\approx4\times10^{-5}$.
+  - id: f6
+    source: Ho et al. 2020 §3.2
+    front: The two fixed reverse variances in DDPM, and the data for which each is exact.
+    back: |
+      $\sigma_t^2=\tilde\beta_t$: exact when the data is a single point (then $q(x_{t-1}|x_t)=q(x_{t-1}|x_t,x_0)$).
+
+      $\sigma_t^2=\beta_t$: exact when $x_0\sim N(0,I)$. They bracket the sensible range for unit-variance data and differ only at small $t$.
+  - id: f7
+    source: Ho et al. 2020 §2, Alg. 2
+    front: DDPM ancestral sampling, in two lines.
+    back: |
+      $x_T\sim N(0,I)$; for $t=T,\dots,1$: $x_{t-1}=\mu_\theta(x_t,t)+\sigma_tz$, $z\sim N(0,I)$ ($z=0$ at the last step). $T$ network calls.
+  - id: f8
+    type: open
+    source: "Ho et al. 2020 eq. (4); Luo 2022, \"Variational Diffusion Models\" (p.10–11)"
+    front: Derive the closed-form marginal $q(x_t|x_0)$ of the DDPM forward process.
+    back: |
+      - Step: $x_t=\sqrt{\alpha_t}x_{t-1}+\sqrt{1-\alpha_t}\,\epsilon_t$.
+      - Induction hypothesis: $x_{t-1}=\sqrt{\bar\alpha_{t-1}}x_0+\sqrt{1-\bar\alpha_{t-1}}\,\epsilon'$.
+      - Substitute: $x_t=\sqrt{\bar\alpha_t}x_0+\sqrt{\alpha_t(1-\bar\alpha_{t-1})}\,\epsilon'+\sqrt{1-\alpha_t}\,\epsilon_t$.
+      - The two noise terms are independent zero-mean Gaussians, so they merge: variance $\alpha_t-\bar\alpha_t+1-\alpha_t=1-\bar\alpha_t$.
+      - Result: $q(x_t|x_0)=N(\sqrt{\bar\alpha_t}x_0,(1-\bar\alpha_t)I)$; base case $t=1$ is the definition.
+      - Consequences: one-shot sampling of any $x_t$ for training; $\bar\alpha_T\approx0$ makes $x_T\approx N(0,I)$.
+  - id: f9
+    type: open
+    source: "Ho et al. 2020 eqs. (6)–(7); Luo 2022, \"Variational Diffusion Models\" (p.11–13)"
+    front: Derive $q(x_{t-1}|x_t,x_0)$ at a whiteboard.
+    back: |
+      - Bayes: $q(x_{t-1}|x_t,x_0)\propto q(x_t|x_{t-1},x_0)\,q(x_{t-1}|x_0)$; Markov makes the first factor $q(x_t|x_{t-1})$.
+      - Logs, in $y=x_{t-1}$: $-\frac{(x_t-\sqrt{\alpha_t}y)^2}{2\beta_t}-\frac{(y-\sqrt{\bar\alpha_{t-1}}x_0)^2}{2(1-\bar\alpha_{t-1})}$.
+      - Collect $-\frac12(Ay^2-2By)$: $A=\frac{\alpha_t}{\beta_t}+\frac1{1-\bar\alpha_{t-1}}$, $B=\frac{\sqrt{\alpha_t}}{\beta_t}x_t+\frac{\sqrt{\bar\alpha_{t-1}}}{1-\bar\alpha_{t-1}}x_0$.
+      - Simplify with $\alpha_t(1-\bar\alpha_{t-1})+\beta_t=1-\bar\alpha_t$: $\tilde\beta_t=1/A=\frac{1-\bar\alpha_{t-1}}{1-\bar\alpha_t}\beta_t$.
+      - Mean $\tilde\beta_tB=\frac{\sqrt{\alpha_t}(1-\bar\alpha_{t-1})}{1-\bar\alpha_t}x_t+\frac{\sqrt{\bar\alpha_{t-1}}\beta_t}{1-\bar\alpha_t}x_0$.
+      - Interpret: precision-weighted blend of $x_t$ and $x_0$; $\tilde\beta_t<\beta_t$; this is the target for $p_\theta$.
+  - id: f10
+    type: open
+    source: Ho et al. 2020 §2–3.2; Sohl-Dickstein et al. 2015 §2.2
+    front: Explain why the true reverse step $q(x_{t-1}|x_t)$ is intractable, why a Gaussian model of it is still reasonable, and what the model is trained against.
+    back: |
+      - $q(x_{t-1}|x_t)\propto q(x_t|x_{t-1})\,q(x_{t-1})$ and $q(x_{t-1})$ is the data distribution blurred by noise, which needs the unknown $q(x_0)$.
+      - For small $\beta_t$, $q(x_t|x_{t-1})$ is narrow in $x_{t-1}$; $\log q(x_{t-1})$ is nearly linear over that window, so the product is nearly Gaussian (Feller; Sohl-Dickstein §2.2). Hence many small steps.
+      - Model $p_\theta(x_{t-1}|x_t)=N(\mu_\theta(x_t,t),\sigma_t^2I)$, one time-conditioned network for all $t$.
+      - Train it against the tractable posterior $q(x_{t-1}|x_t,x_0)=N(\tilde\mu_t,\tilde\beta_tI)$: the ELBO's per-step KL terms compare exactly these (next lesson).
+  - id: f11
+    type: open
+    source: Ho et al. 2020 §3.2; Bishop PRML §2.3.1
+    front: Show that $\sigma_t^2=\beta_t$ is the exact reverse variance for $N(0,I)$ data and $\tilde\beta_t$ for a single data point. Why does the choice matter little in practice?
+    back: |
+      - Point mass: $x_0$ is known, so $q(x_{t-1}|x_t)=q(x_{t-1}|x_t,x_0)$, variance $\tilde\beta_t$.
+      - $N(0,I)$ data: all marginals are $N(0,I)$; $\mathrm{Cov}(x_{t-1},x_t)=\sqrt{\alpha_t}$; conditional variance $1-\alpha_t=\beta_t$.
+      - Real data sits between: Ho calls them the two extremes for unit-variance data.
+      - $\tilde\beta_t/\beta_t=(1-\bar\alpha_{t-1})/(1-\bar\alpha_t)$ is 0.45 at $t=2$ but above 0.98 for $t\ge100$ (linear schedule), so with $T=1000$ samples barely change.
+      - It matters for likelihood (small $t$ dominates the bound), which is why Nichol & Dhariwal learn an interpolation.
+
+reading:
+  - title: "Ho, Jain & Abbeel (2020), Denoising Diffusion Probabilistic Models, §2–3.2"
+    url: https://arxiv.org/abs/2006.11239
+    kind: paper
+    note: The forward process, eq. (4), the posterior eqs. (6)–(7), the two reverse variances and Algorithm 2, in two dense pages.
+  - title: "Luo (2022), Understanding Diffusion Models: A Unified Perspective, \"Variational Diffusion Models\" (p.6–14)"
+    url: https://arxiv.org/abs/2208.11970
+    kind: paper
+    note: Every step of the closed-form marginal and the posterior derivation written out, in notation matching Ho's.
+  - title: "Murphy, Probabilistic Machine Learning: Advanced Topics, §25.2.1–25.2.2"
+    url: https://probml.github.io/pml-book/book2.html
+    kind: book
+    note: A compact textbook treatment of the encoder and decoder, with the hierarchical-VAE framing.
+  - title: "Sohl-Dickstein et al. (2015), Deep Unsupervised Learning using Nonequilibrium Thermodynamics, §2"
+    url: https://arxiv.org/abs/1503.03585
+    kind: paper
+    note: The original diffusion model; §2.2 gives the small-step argument for a Gaussian reverse process.
+  - title: "Weng (2021), What are Diffusion Models?"
+    url: https://lilianweng.github.io/posts/2021-07-11-diffusion-models/
+    kind: blog
+    note: A readable walk through the same derivations, useful as a second pass.

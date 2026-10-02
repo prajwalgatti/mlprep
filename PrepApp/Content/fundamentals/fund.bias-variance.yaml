@@ -1,0 +1,472 @@
+id: fund.bias-variance
+area: fundamentals
+title: Bias–Variance Decomposition & Overfitting
+summary: Treat the trained model as a random variable, derive the noise + bias² + variance split, work it out for kNN and least squares, and see where it stops being additive (0–1 loss) or U-shaped (deep nets).
+order: 130
+level: core
+tags: [generalization, theory, overfitting, model-selection]
+prereqs: [fund.estimation, fund.learning-setups]
+
+explainer:
+  - title: "The problem: the fitted model is random"
+    body: |
+      We fit a model on a finite training set and care about its error on *new* inputs. Training error can't tell us that, because the same data chose the parameters. To reason about test error we need a model of where the training set came from.
+
+      **Setup.** Inputs and labels follow
+
+      $$y=f(x)+\varepsilon,\quad \mathbb{E}[\varepsilon]=0,\quad \mathrm{Var}(\varepsilon)=\sigma^2,$$
+
+      where $f(x)=\mathbb{E}[y\mid x]$ is the true regression function and the noise $\varepsilon$ is independent of everything else. A training set $D$ is $N$ i.i.d. pairs. A learning algorithm maps $D$ to a fitted function $\hat f_D$.
+
+      **The key move.** $D$ is random, so $\hat f_D(x)$ at a *fixed* input $x$ is a random variable. Draw a different training set and you get a different fit:
+
+      ![Synthetic: 20 training sets of 20 noisy points from a sine, fit by polynomials. Degree 1: fits agree but sit far from the truth. Degree 15: right on average, but scattered.](fund.bias-variance/fits-grid)
+
+      The picture shows two different ways to be wrong. The degree-1 fits agree with each other but are **systematically** off. The degree-15 fits are centred on the truth but **scatter** from sample to sample.
+
+      **What we measure.** At a fixed $x$, take a fresh test label $y=f(x)+\varepsilon$ (new noise, independent of $D$) and define the expected prediction error
+
+      $$\mathrm{Err}(x)=\mathbb{E}_{D,\varepsilon}\big[(y-\hat f_D(x))^2\big].$$
+
+      The expectation runs over training sets *and* test noise; $x$ is held fixed. Averaging over $x\sim p(x)$ comes at the end.
+
+      One more definition: the **average model** $\bar f(x)=\mathbb{E}_D[\hat f_D(x)]$, the orange curve in the figure.
+    source: ESL §7.3; Bishop PRML §3.2; CS229 notes §8.1
+
+  - title: Deriving the decomposition
+    body: |
+      **Refresher.** For a random variable $Z$ and a constant $c$, $\mathbb{E}[(Z-c)^2]=\mathrm{Var}(Z)+(\mathbb{E}Z-c)^2$. Add and subtract $\mathbb{E}Z$; the cross term is $2(\mathbb{E}Z-c)\,\mathbb{E}[Z-\mathbb{E}Z]=0$. The derivation below applies this idea twice.
+
+      **Step 1: split off the noise.** Write $y-\hat f_D=(f-\hat f_D)+\varepsilon$ (all at the same $x$) and expand:
+
+      $$\begin{aligned}(y-\hat f_D)^2&=(f-\hat f_D)^2+\varepsilon^2\\&\quad+2\varepsilon\,(f-\hat f_D).\end{aligned}$$
+
+      Take expectations. $\mathbb{E}[\varepsilon^2]=\sigma^2$. The cross term vanishes because the *test* noise $\varepsilon$ is independent of $D$, and $\hat f_D$ depends only on $D$, so $\mathbb{E}[\varepsilon(f-\hat f_D)]=\mathbb{E}[\varepsilon]\,\mathbb{E}[f-\hat f_D]=0$.
+
+      **Step 2: split the estimation error.** Add and subtract $\bar f$:
+
+      $$f-\hat f_D=(f-\bar f)+(\bar f-\hat f_D).$$
+
+      Squaring gives a cross term $2(f-\bar f)\,\mathbb{E}_D[\bar f-\hat f_D]$. Here $f-\bar f$ is a constant (nothing random at fixed $x$), and $\mathbb{E}_D[\hat f_D]=\bar f$ by definition, so it is zero too.
+
+      **Result.**
+
+      $$\begin{aligned}\mathrm{Err}(x)&=\underbrace{\sigma^2}_{\text{noise}}+\underbrace{\big(f(x)-\bar f(x)\big)^2}_{\text{bias}^2}\\&\quad+\underbrace{\mathbb{E}_D\big[(\hat f_D(x)-\bar f(x))^2\big]}_{\text{variance}}.\end{aligned}$$
+
+      The two cross terms vanish for **different reasons**: the first by independence of test noise from the training set, the second by the definition of the mean. Interviewers like to ask which is which.
+
+      Averaging over $x\sim p(x)$ gives expected test MSE = $\sigma^2$ + integrated bias² + integrated variance. The identity is exact for squared loss and makes no assumption about the model.
+    source: ESL §7.3 (eq. 7.9); Bishop PRML §3.2 (eqs. 3.37–3.44); CS229 notes §8.1.1
+
+  - title: What each term means
+    body: |
+      - **Noise $\sigma^2$**: the spread of $y$ around $f(x)$. No predictor can remove it, because $f(x)=\mathbb{E}[y\mid x]$ already minimises expected squared error. So $\sigma^2$ is the Bayes risk for squared loss.
+      - **Bias²**: how far the *average* fit is from the truth. It comes from the model's assumptions, or from deliberately shrinking the fit.
+      - **Variance**: how much the fit moves when the training sample changes. It measures sensitivity to the particular $D$.
+
+      **Two kinds of bias (ESL).** For a linear model family, let $\beta_*$ be the best linear approximation to $f$ in the population, $\beta_*=\arg\min_\beta\mathbb{E}_X(f(X)-X^\top\beta)^2$. Then the average squared bias splits into
+      - **model bias**, $f(x_0)-x_0^\top\beta_*$: the gap between the truth and the best member of the class. Only a richer class (interactions, transformed features) reduces it.
+      - **estimation bias**, $x_0^\top\beta_*-\mathbb{E}\,x_0^\top\hat\beta$: zero for least squares, positive for ridge. Ridge accepts it in exchange for lower variance, and that pays off when the variance drop exceeds the squared-bias rise.
+
+      **Two decompositions with similar names.** Goodfellow DL §5.4 decomposes the MSE of a *parameter estimator*, $\mathbb{E}[(\hat\theta-\theta)^2]=\mathrm{Bias}(\hat\theta)^2+\mathrm{Var}(\hat\theta)$. There is no noise term, because the target $\theta$ is a fixed number. The prediction-error version above adds $\sigma^2$ because the test label itself is noisy.
+
+      **A practical caveat (Bishop).** The terms are averages over many training sets, and we only ever have one. The decomposition is a tool for reasoning and for simulation studies. In practice you estimate test error directly (held-out data, cross-validation) and use the decomposition to interpret what you see.
+    source: ESL §7.3 (eqs. 7.13–7.14, Fig. 7.2); Goodfellow DL §5.4.4; Bishop PRML §3.2
+
+  - title: "Worked example 1: kNN regression"
+    body: |
+      ESL's simplifying assumption: the training inputs $x_1,\dots,x_N$ are **fixed**, and only the labels are random. Then $D$ varies only through the noise.
+
+      kNN predicts the average label of the $k$ training inputs nearest to $x_0$, written $x_{(1)},\dots,x_{(k)}$:
+
+      $$\hat f_k(x_0)=\frac1k\sum_{l=1}^k y_{(l)}.$$
+
+      **Mean.** Each $y_{(l)}=f(x_{(l)})+\varepsilon_{(l)}$ has mean $f(x_{(l)})$, so $\bar f(x_0)=\frac1k\sum_l f(x_{(l)})$.
+
+      **Variance.** It is the mean of $k$ independent noises, each with variance $\sigma^2$, so the variance is $\sigma^2/k$.
+
+      Plugging both into the decomposition:
+
+      $$\begin{aligned}\mathrm{Err}(x_0)&=\sigma^2+\frac{\sigma^2}{k}\\&\quad+\Big[f(x_0)-\frac1k\sum_{l=1}^k f(x_{(l)})\Big]^2.\end{aligned}$$
+
+      **Numbers.** Take $\sigma^2=1$ and $f(x_0)=1$.
+      - $k=1$, and the nearest input has $f=1.0$: bias² $=0$, variance $=1$, so $\mathrm{Err}=2.0$.
+      - $k=4$, and the neighbours have $f=1.2, 0.8, 1.4, 1.0$: the mean is $1.1$, bias² $=0.01$, variance $=0.25$, so $\mathrm{Err}=1.26$.
+
+      Averaging four labels cut the variance by 4 at the price of a little bias. As $k$ keeps growing, the neighbours get farther from $x_0$ and the bias takes over. Small $k$ means a flexible model, so $k$ acts as an *inverse* complexity knob.
+
+      ![Exact decomposition, not a simulation: kNN on 50 equally spaced inputs from a sine, σ² = 0.09. Variance σ²/k falls fast; bias² grows once neighbourhoods get wide.](fund.bias-variance/knn-tradeoff)
+
+      A subtlety: at fixed $k$, more training data makes the neighbours closer, so the **bias falls with $N$** too. For nonparametric methods, "more data only fixes variance" is false.
+    source: ESL §7.3 (eq. 7.10)
+
+  - title: "Worked example 2: least squares and the p/N law"
+    body: |
+      **Variance at one point.** Least squares with $p$ features on a fixed design matrix $X\in\mathbb{R}^{N\times p}$ predicts
+
+      $$\hat f(x_0)=x_0^\top(X^\top X)^{-1}X^\top y=h(x_0)^\top y,$$
+
+      with weights $h(x_0)=X(X^\top X)^{-1}x_0\in\mathbb{R}^N$. The prediction is *linear in $y$*, and $\mathrm{Cov}(y)=\sigma^2I$, so
+
+      $$\mathrm{Var}\,\hat f(x_0)=\sigma^2\|h(x_0)\|^2.$$
+
+      **Averaging over the training inputs.** $h(x_i)$ is the $i$-th row of the hat matrix $\mathbf{H}=X(X^\top X)^{-1}X^\top$, which is symmetric and idempotent ($\mathbf{H}^2=\mathbf{H}$). So
+
+      $$\begin{aligned}\sum_{i=1}^N\|h(x_i)\|^2&=\mathrm{tr}(\mathbf{H}\mathbf{H}^\top)=\mathrm{tr}(\mathbf{H})\\&=\mathrm{tr}\big((X^\top X)^{-1}X^\top X\big)=p,\end{aligned}$$
+
+      using the cyclic property of the trace. Dividing by $N$:
+
+      $$\frac1N\sum_{i=1}^N\mathrm{Var}\,\hat f(x_i)=\frac{p}{N}\,\sigma^2.$$
+
+      Each feature adds $\sigma^2/N$ of variance, even a useless one, and doubling the data halves the term. With $p=10$, $N=100$ and $\sigma^2=1$, the variance term averages $0.1$. The bias here is pure model bias, which only better features reduce.
+
+      **Ridge** has the same form with $h(x_0)=X(X^\top X+\lambda I)^{-1}x_0$. Its weights are smaller, so variance falls, and it adds estimation bias.
+
+      **Bishop's experiment** makes this visible. He draws 100 training sets of 25 points from a sine and fits 24 Gaussian basis functions with a ridge penalty, sweeping $\ln\lambda$. Large $\lambda$ gives fits that agree with one another but are too flat (high bias). Small $\lambda$ gives wiggly fits that disagree (high variance). The minimum of bias² + variance falls near $\ln\lambda\approx-0.31$, close to where test error is lowest.
+
+      ![Schematic, not data: as capacity grows (degree up, or λ down), bias² falls and variance rises; test error is their sum plus the noise floor.](fund.bias-variance/u-curve)
+    source: ESL §7.3 (eqs. 7.11–7.12); Bishop PRML §3.2 (Figs. 3.5–3.6)
+
+  - title: Overfitting, underfitting and learning curves
+    body: |
+      **Definitions (Goodfellow).** A model *underfits* when it can't get the training error low. It *overfits* when the gap between training and test error is too large. **Capacity** is the range of functions a model can fit. You control it through the hypothesis space (degree, width), through regularization, and through how long you train. Under squared loss, underfitting is bias-dominated error and overfitting is variance-dominated error.
+
+      **Learning curves** plot train and validation error against training-set size $N$:
+      - **Variance-dominated**: training error is low and validation error much higher. The gap closes slowly as $N$ grows, so more data keeps helping.
+      - **Bias-dominated**: both curves meet quickly at a plateau well above the noise floor. More data barely moves them.
+
+      **What each remedy targets:**
+      - Lower variance: more data, augmentation, a stronger penalty, early stopping, dropout, a smaller model, ensembling. Most of these add some bias.
+      - Lower bias: more capacity, better features, a weaker penalty, training longer.
+
+      **Training curves against steps.** The Tuning Playbook calls it **problematic overfitting** when validation error starts *rising* during training. If the best trial for some setting shows it, add or retune regularization before comparing settings. There is a trap here. Anything that hampers optimisation acts as a regularizer, even if unintended. A too-small learning rate can win a "pick the best trial" comparison simply because it stops the model fitting noise. So best-trial selection can favour hobbled optimizer settings.
+    source: Goodfellow DL §5.2, §5.4.4; ESL §7.2; Tuning Playbook §"Examining the training curves"
+
+  - title: "0–1 loss: bias and variance stop adding up"
+    body: |
+      **Setup.** Labels are $Y\in\{0,1\}$ with $f(x_0)=P(Y{=}1\mid x_0)$. The classifier thresholds an estimate, $\hat G=\mathbb{1}[\hat f(x_0)>\tfrac12]$, and the Bayes classifier is $G=\mathbb{1}[f(x_0)>\tfrac12]$. Its error $\mathrm{Err}_B=\min(f,1-f)$ is the best achievable at $x_0$.
+
+      **The exact identity (ESL Ex. 7.2).** If $\hat G=G$, we err with probability $\min(f,1-f)$. If $\hat G\neq G$, we err with probability $\max(f,1-f)$. Averaging over training sets and using $\max-\min=|2f-1|$:
+
+      $$\begin{aligned}\mathrm{Err}(x_0)&=\mathrm{Err}_B(x_0)\\&\quad+|2f(x_0)-1|\;P(\hat G\neq G).\end{aligned}$$
+
+      **Bringing in bias and variance.** Approximate $\hat f(x_0)\sim\mathcal N(\bar f,v)$ across training sets. The label is wrong when $\hat f$ lands on the wrong side of ½:
+
+      $$P(\hat G\neq G)\approx\Phi\!\left(\frac{\mathrm{sign}(\tfrac12-f)\,(\bar f-\tfrac12)}{\sqrt v}\right).$$
+
+      **Two consequences**, with $f=0.9$ (so $\mathrm{Err}_B=0.1$):
+      - $\bar f=0.6$, $\sqrt v=0.1$: the squared bias is $(0.3)^2=0.09$, yet $P(\hat G\neq G)=\Phi(-1)=0.16$ and $\mathrm{Err}=0.1+0.8\times0.16=0.23$. Estimation error that leaves you on the right side of ½ costs nothing.
+      - $\bar f=0.4$, now on the wrong side: with $\sqrt v=0.1$, $\Phi(1)=0.84$ and $\mathrm{Err}=0.77$. Raising $\sqrt v$ to $0.3$ gives $\Phi(0.33)=0.63$ and $\mathrm{Err}=0.60$. **More variance lowers the error**, because more fits land on the correct side.
+
+      So bias and variance **interact**: the bias sets the sign, the variance sets how often the sign flips. In ESL's simulation, kNN classification error stays flat or falls as $k$ grows to 20 even though squared bias rises. Tuning parameters that are best for squared loss can be poor for 0–1 loss, so tune on an estimate of the loss you care about. Several additive 0–1 "decompositions" have been proposed (e.g. Kohavi–Wolpert, Domingos), and none is standard.
+    source: ESL §7.3.1; ESL Ex. 7.2 (eqs. 7.62–7.63)
+
+  - title: Averaging, and where the U-curve breaks
+    body: |
+      **Averaging attacks variance.** Average $B$ predictors that each have variance $v$ and pairwise correlation $\rho$ (derived in fund.variance-covariance):
+
+      $$\mathrm{Var}\Big(\frac1B\sum_b\hat f_b\Big)=\rho v+\frac{1-\rho}{B}v.$$
+
+      Expectation is linear, so the average of identically distributed fits has the **same bias** as one of them. Bagging can therefore only help through variance, and correlation $\rho$ caps what it can gain. Boosting is different: it fits learners sequentially to what earlier ones got wrong, so the members are not identically distributed, and it mainly removes bias.
+
+      **Where the classic picture fails.** The U-curve assumes variance rises with parameter count. Neal et al. (2018) measured both terms for single-hidden-layer networks on MNIST, CIFAR-10 and SVHN as width grows. They found **bias and variance can both fall** with width. They split the variance into a sampling part (which training set) and an optimisation part (which initialisation), and the optimisation part shrinks with width once the network is over-parameterized. Relatedly, test error against model size can peak near the *interpolation threshold* (where the model can first fit the training set exactly) and fall again beyond it. That is **double descent** (Belkin et al. 2019), the next lesson.
+
+      Neither finding breaks the decomposition, which is an identity. What breaks is the heuristic that more parameters always mean more variance.
+    source: ESL §15.2 (eq. 15.1); Neal et al. 2018 §1, §3.3, §4; Belkin et al. 2019 §1
+
+  - title: What interviewers probe
+    body: |
+      - *Derive it.* Write $y=f+\varepsilon$, then add and subtract $\bar f$. One cross term dies because test noise is independent of $D$ and has mean zero. The other dies because $\mathbb{E}_D\hat f_D=\bar f$.
+      - *What is the expectation over?* Training sets and test noise, at a fixed $x$. Then average over $x$.
+      - *Does more data reduce bias?* It depends on the method. For least squares on fixed features, model bias doesn't change. kNN at fixed $k$ gets closer neighbours, so bias falls. Ridge at a fixed sum-of-squares $\lambda$ has its estimation bias swamped as $N$ grows.
+      - *Does more data reduce variance?* Usually. For least squares, the in-sample variance term is $p\sigma^2/N$.
+      - *Low training error, high validation error. What next?* That is variance. Check for leakage or a split mismatch first. Then regularize, augment, add data, shrink the model or ensemble.
+      - *Why regularize if it adds bias?* Because it can remove more variance than it adds bias² (ESL's "shrunken fit").
+      - *What is irreducible error?* $\sigma^2=\mathbb{E}[\mathrm{Var}(y\mid x)]$, the Bayes risk under squared loss.
+      - *Classification?* There is no additive split. Use $\mathrm{Err}_B+|2f-1|P(\hat G\neq G)$; variance can even help when the mean estimate is on the wrong side of ½.
+      - *Can you measure bias and variance on a real problem?* Not from one fit. Simulate many training sets, or approximate them with bootstrap resamples and look at the spread of predictions.
+      - *Is the trade-off dead in deep learning?* The identity holds. The U-shape in parameter count often doesn't.
+    source: ESL §7.3, §7.3.1; Bishop PRML §3.2; Neal et al. 2018 §1
+
+  - title: Key results
+    body: |
+      $$\begin{aligned}\mathrm{Err}(x)&=\sigma^2+\big(f(x)-\bar f(x)\big)^2\\&\quad+\mathrm{Var}_D\,\hat f_D(x)\end{aligned}$$
+
+      - $\bar f(x)=\mathbb{E}_D\hat f_D(x)$. The expectation is over $D$ and test noise at fixed $x$.
+      - kNN (fixed design): variance $=\sigma^2/k$; bias² $=[f(x_0)-\frac1k\sum_l f(x_{(l)})]^2$.
+      - Least squares: $\mathrm{Var}\,\hat f(x_0)=\sigma^2\|h(x_0)\|^2$, which averages to $p\sigma^2/N$ over the training inputs.
+      - Bias = model bias + estimation bias. Ridge adds estimation bias to cut variance.
+      - 0–1 loss: $\mathrm{Err}=\mathrm{Err}_B+|2f-1|\,P(\hat G\neq G)$, which is not additive.
+      - An average of $B$ correlated predictors has variance $\rho v+\frac{1-\rho}{B}v$ and unchanged bias.
+      - Problematic overfitting means validation error *rising* during training.
+    source: ESL §7.3, §7.3.1, §15.2; Bishop PRML §3.2
+
+quiz:
+  - id: q3
+    prompt: |
+      In kNN regression on a fixed training set, increasing $k$ from 1 toward $N$ generally:
+    correct: Increases bias and decreases variance
+    wrong:
+      - Decreases bias and increases variance
+      - Decreases both bias and variance
+      - Leaves bias unchanged and decreases variance
+    explanation: |
+      The variance term is $\sigma^2/k$, so it falls. The prediction averages labels from ever-farther neighbours, so $\frac1k\sum f(x_{(l)})$ drifts from $f(x_0)$ and the bias grows. At $k=N$ every prediction is the global mean. The "bias unchanged" option holds only if $f$ is constant around $x_0$.
+    source: ESL §7.3 (eq. 7.10)
+
+  - id: q4
+    prompt: |
+      At a point $x$ the true function is $f(x)=2$ and the noise variance is $\sigma^2=0.5$. Over training sets, the model predicts 2, 3 or 4 with equal probability. Expected squared test error at $x$?
+    correct: '$13/6 \approx 2.17$'
+    wrong:
+      - '$5/3 \approx 1.67$'
+      - '$3/2 = 1.5$'
+      - '$7/6 \approx 1.17$'
+    explanation: |
+      The mean prediction is 3, so bias² $=(3-2)^2=1$. Variance is $(1+0+1)/3=2/3$. Total $=1+2/3+1/2=13/6$. Each wrong option leaves out one of the three terms: $5/3$ drops the noise, $3/2$ drops the variance, $7/6$ drops the bias.
+    source: ESL §7.3 (eq. 7.9)
+
+  - id: q7
+    prompt: |
+      Training and validation errors are both high and nearly equal, and adding more data barely changes them. Which action is most likely to help?
+    correct: Increase model capacity or improve the features
+    wrong:
+      - Collect even more data from the same distribution
+      - Increase the L2 penalty
+      - Bag several copies of the same model
+    explanation: |
+      A small train–validation gap with both errors high is the bias-dominated signature. More data, a stronger penalty and bagging all target variance. A stronger penalty would push bias up further, and bagging leaves the bias of the base learner unchanged.
+    source: Goodfellow DL §5.2; ESL §15.2
+
+  - id: q9
+    prompt: |
+      Train and validation MSE against training-set size for two models on the same task. The dashed line is the noise level $\sigma^2$.
+
+      ![Synthetic learning curves for two models, A and B.](fund.bias-variance/learning-curves)
+
+      Which reading is right?
+    correct: A is variance-dominated, and more data keeps helping it
+    wrong:
+      - B is variance-dominated, and more data keeps helping it
+      - A is bias-dominated, and it needs a more flexible model
+      - Both are bias-dominated, and only better features will help
+    explanation: |
+      A has low training error, a large gap that closes as $N$ grows, and validation error falling toward $\sigma^2$: classic high variance. B's curves meet quickly at a plateau far above $\sigma^2$, so more data won't help. B needs capacity (here B is a straight line fit to a sine; A is a degree-12 polynomial).
+    source: Goodfellow DL §5.2; ESL §7.2
+
+  - id: q10
+    prompt: |
+      Fixed-design kNN regression with $\sigma^2=1$ and $k=4$. At $x_0$, $f(x_0)=2$, and the four nearest training inputs have $f$ values 2.2, 1.8, 2.4 and 2.0. What is the expected squared error at $x_0$?
+    correct: '1.26'
+    wrong:
+      - '0.26'
+      - '1.01'
+      - '2.01'
+    explanation: |
+      The mean of the neighbours' $f$ is 2.1, so bias² $=0.01$. The variance is $\sigma^2/k=0.25$. Adding the noise gives $1+0.01+0.25=1.26$. 0.26 forgets the noise, 1.01 forgets the variance, and 2.01 uses $\sigma^2$ instead of $\sigma^2/k$ for the variance.
+    source: ESL §7.3 (eq. 7.10)
+
+  - id: q11
+    prompt: |
+      In the derivation, expanding $(y-\hat f_D(x))^2$ with $y=f(x)+\varepsilon$ produces the cross term $2\,\mathbb{E}[\varepsilon\,(f(x)-\hat f_D(x))]$. Why is it zero?
+    correct: The test noise is independent of $D$ and has mean zero
+    wrong:
+      - $\hat f_D(x)$ is an unbiased estimate of $f(x)$
+      - $\mathbb{E}_D[\hat f_D(x)]=\bar f(x)$ holds by definition
+      - The training and test noise have equal variance
+    explanation: |
+      $\hat f_D$ depends only on the training data, and the test noise is drawn independently with mean zero, so the expectation factorises to $\mathbb{E}[\varepsilon]\cdot\mathbb{E}[f-\hat f_D]=0$. The definition of $\bar f$ kills the *other* cross term, the one between bias and variance. Unbiasedness isn't needed: the identity holds for biased estimators too.
+    source: ESL §7.3; Bishop PRML §3.2 (eq. 3.39)
+
+  - id: q12
+    prompt: |
+      Least squares with $p=20$ features, $N=200$ training points and noise variance $\sigma^2=4$. Averaged over the training inputs, what is the variance term? What happens if you add 20 more features that are pure noise?
+    correct: 0.4, rising to 0.8
+    wrong:
+      - 0.1, rising to 0.2
+      - 0.4, staying at 0.4
+      - 0.4, falling to 0.2
+    explanation: |
+      The average variance is $p\sigma^2/N=20\times4/200=0.4$, and with $p=40$ it is 0.8. It depends only on the number of fitted parameters, not on whether they're useful: $\mathrm{tr}(\mathbf{H})=p$ either way. 0.1 forgets the factor $\sigma^2$.
+    source: ESL §7.3 (eq. 7.12)
+
+  - id: q13
+    prompt: |
+      Binary classification at $x_0$ with $P(Y{=}1\mid x_0)=0.9$. Across training sets, the estimate $\hat f(x_0)$ is roughly Gaussian with mean 0.4, on the wrong side of ½. What does increasing its variance do to the expected 0–1 error at $x_0$?
+    correct: Lowers it, since more fits land on the right side of ½
+    wrong:
+      - Raises it, since variance always adds to expected error
+      - Leaves it unchanged, since only the mean sets the label
+      - Raises it, since the squared bias grows with the variance
+    explanation: |
+      The error is $\mathrm{Err}_B+|2f-1|\,P(\hat G\neq G)$ with $P(\hat G\neq G)\approx\Phi\big((0.4-0.5)\cdot(-1)/\sqrt v\big)=\Phi(0.1/\sqrt v)$, which falls toward ½ as $v$ grows. For example, $\sqrt v$ going from 0.1 to 0.3 takes the error from 0.77 to 0.60. "Variance always adds" is true only for squared loss.
+    source: ESL Ex. 7.2 (eqs. 7.62–7.63); ESL §7.3.1
+
+  - id: q14
+    prompt: |
+      Which statement is **false**?
+    correct: For 0–1 loss, expected error equals Bayes error plus bias² plus variance
+    wrong:
+      - For squared loss, no predictor's expected error at $x$ falls below $\sigma^2$
+      - Bagging leaves the bias of the bootstrap base learner unchanged
+      - With fixed features, more data leaves least squares' model bias unchanged
+    explanation: |
+      Under 0–1 loss there is no additive decomposition. Bias and variance interact through which side of ½ the estimate falls on. The other three are true: $\sigma^2$ is the Bayes risk for squared loss; an average of identically distributed fits has the same expectation as one fit; and model bias is defined against the population-best linear fit, which doesn't depend on $N$.
+    source: ESL §7.3, §7.3.1, §15.2
+
+  - id: q15
+    prompt: |
+      For each model size you keep the best of several learning rates by final validation error. The largest model's winner uses a suspiciously small learning rate, and its other trials show validation error rising late in training. What is the most likely story?
+    correct: The small LR is acting as an accidental regularizer
+    wrong:
+      - Rising validation error means the LR was too high
+      - The model underfits, so it needs a smaller LR to fit
+      - Rising validation error means the val set leaks
+    explanation: |
+      Validation error rising during training is problematic overfitting. Anything that slows optimisation also regularizes, so the best trial is the one whose learning rate hobbled training enough to stop it fitting noise. The playbook's fix is to add or retune real regularization (weight decay, dropout, label smoothing) and then compare again. Late-rising validation error is not, by itself, a sign of too high an LR.
+    source: Tuning Playbook §"Examining the training curves"
+
+  - id: q16
+    prompt: |
+      ESL splits a linear model's bias into *model bias* and *estimation bias*. Which change can reduce the model bias?
+    correct: Adding interaction or transformed features
+    wrong:
+      - Collecting many more training examples
+      - Reducing the ridge penalty to exactly zero
+      - Bagging many least-squares fits together
+    explanation: |
+      Model bias is the gap between $f$ and the best linear fit $x^\top\beta_*$ in the population. Only enlarging the model class closes it. Dropping the ridge penalty removes *estimation* bias (least squares has none). More data and bagging don't change the class.
+    source: ESL §7.3 (eqs. 7.13–7.14)
+
+  - id: q17
+    prompt: |
+      Replacing least squares with ridge (small $\lambda>0$) lowers expected test error when:
+    correct: The drop in variance exceeds the rise in squared bias
+    wrong:
+      - The true regression function is strongly nonlinear
+      - The ridge penalty lowers the irreducible noise level
+      - There are more features than there are training points
+    explanation: |
+      Ridge adds estimation bias and removes variance, and the decomposition says the net effect is the difference. It can help with $p<N$ too, whenever variance is large (noisy labels, correlated features). "$p>N$" is when ridge is *needed* for a unique solution, not the only case where it helps. Nothing changes $\sigma^2$.
+    source: ESL §7.3 (Fig. 7.2); Bishop PRML §3.2
+
+cards:
+  - id: f1
+    front: Write the bias–variance decomposition of expected squared error at a point $x$, and say what the expectation is over.
+    back: |
+      $$\begin{aligned}\mathbb{E}[(y-\hat f_D)^2]&=\sigma^2+(f-\bar f)^2\\&\quad+\mathbb{E}_D[(\hat f_D-\bar f)^2]\end{aligned}$$
+
+      Here $y=f(x)+\varepsilon$, $\mathrm{Var}\,\varepsilon=\sigma^2$, and $\bar f=\mathbb{E}_D\hat f_D(x)$. The expectation is over training sets $D$ and the test noise, at fixed $x$.
+    source: ESL §7.3 (eq. 7.9)
+
+  - id: f2
+    front: How do learning curves (error vs training-set size) separate high bias from high variance?
+    back: |
+      - **High variance**: low training error and a large gap to validation that narrows slowly as $N$ grows. More data helps.
+      - **High bias**: both curves meet quickly at a plateau well above the noise floor. More data doesn't help; add capacity or features.
+    source: Goodfellow DL §5.2
+
+  - id: f7
+    front: Expected error of kNN regression at $x_0$ (fixed training inputs).
+    back: |
+      $$\begin{aligned}\mathrm{Err}(x_0)&=\sigma^2+\frac{\sigma^2}{k}\\&\quad+\Big[f(x_0)-\frac1k\sum_{l=1}^k f(x_{(l)})\Big]^2\end{aligned}$$
+
+      Variance $\sigma^2/k$ falls with $k$. Bias usually grows with $k$ and shrinks with $N$.
+    source: ESL §7.3 (eq. 7.10)
+
+  - id: f8
+    front: Least squares with $p$ features and $N$ points. What is the variance term averaged over the training inputs, and why?
+    back: |
+      $$\frac1N\sum_i\mathrm{Var}\,\hat f(x_i)=\frac{p}{N}\sigma^2$$
+
+      $\hat f(x_0)=h(x_0)^\top y$ gives $\mathrm{Var}=\sigma^2\|h(x_0)\|^2$, and $\sum_i\|h(x_i)\|^2=\mathrm{tr}(\mathbf{H})=p$ for the idempotent hat matrix $\mathbf{H}=X(X^\top X)^{-1}X^\top$.
+    source: ESL §7.3 (eqs. 7.11–7.12)
+
+  - id: f9
+    front: For binary classification with $f(x_0)=P(Y{=}1\mid x_0)$, how does expected 0–1 error relate to the Bayes error?
+    back: |
+      $$\begin{aligned}\mathrm{Err}(x_0)&=\mathrm{Err}_B(x_0)\\&\quad+|2f(x_0)-1|\,P(\hat G\neq G)\end{aligned}$$
+
+      $\hat G$ thresholds $\hat f$ at ½, and $G$ is the Bayes rule. With $\hat f\sim\mathcal N(\bar f,v)$, $P(\hat G\neq G)\approx\Phi\big(\mathrm{sign}(\tfrac12-f)(\bar f-\tfrac12)/\sqrt v\big)$. Bias and variance interact rather than add.
+    source: ESL Ex. 7.2 (eqs. 7.62–7.63)
+
+  - id: f10
+    front: What is the difference between model bias and estimation bias (ESL)?
+    back: |
+      With $\beta_*$ the best linear fit in the population:
+      - **Model bias** $f(x_0)-x_0^\top\beta_*$: reduced only by enlarging the class (features, interactions).
+      - **Estimation bias** $x_0^\top\beta_*-\mathbb{E}\,x_0^\top\hat\beta$: zero for least squares, positive for ridge or subset selection, and traded for lower variance.
+    source: ESL §7.3 (eqs. 7.13–7.14)
+
+  - id: f6
+    type: open
+    front: Your model overfits. Walk through how you'd diagnose it and what you'd try, in order.
+    back: |
+      1. **Confirm it.** Look for low training loss with validation loss flat or rising (a train–val gap), on learning curves against both $N$ and steps. Rule out leakage, duplicates across splits and train/val distribution mismatch first. A "gap" can be a data bug.
+      2. **Cheap fixes.** Weight decay, dropout, label smoothing, augmentation, early stopping or checkpoint selection.
+      3. **Data.** Collect more, or start from a pretrained model.
+      4. **Model.** Reduce capacity or add inductive bias.
+      5. **Ensembling** or weight averaging if compute allows.
+
+      Watch for the confound: if you compare settings by their best trial, a configuration can win because something (a tiny learning rate) accidentally regularized it. Fix overfitting with real regularization before comparing. Never tune on the test set.
+    source: Goodfellow DL §5.2; Tuning Playbook §"Examining the training curves"
+
+  - id: f11
+    type: open
+    front: Derive the bias–variance decomposition at a whiteboard, naming why each cross term vanishes.
+    back: |
+      1. Set up $y=f(x)+\varepsilon$ with $\mathbb{E}\varepsilon=0$ and $\mathrm{Var}\,\varepsilon=\sigma^2$. $D$ is random, so $\hat f_D(x)$ is random. Define $\bar f=\mathbb{E}_D\hat f_D$.
+      2. Write $y-\hat f=(f-\hat f)+\varepsilon$. Expanding gives $(f-\hat f)^2+\varepsilon^2+2\varepsilon(f-\hat f)$. The cross term has expectation zero because the test noise is independent of $D$ and has mean zero. That leaves $\sigma^2+\mathbb{E}_D(f-\hat f_D)^2$.
+      3. Write $f-\hat f_D=(f-\bar f)+(\bar f-\hat f_D)$. The cross term is $2(f-\bar f)\mathbb{E}_D[\bar f-\hat f_D]=0$, because $f-\bar f$ is constant and $\mathbb{E}_D\hat f_D=\bar f$.
+      4. The result is $\sigma^2+(f-\bar f)^2+\mathrm{Var}_D\hat f_D$: noise, bias², variance. Average over $x$ for the full test MSE.
+
+      Then add the caveats: it's exact only for squared loss, it's pointwise in $x$, and it needs many training sets to measure.
+    source: ESL §7.3; Bishop PRML §3.2 (eqs. 3.37–3.41)
+
+  - id: f12
+    type: open
+    front: Explain the bias–variance trade-off to an interviewer using kNN, then say where the picture breaks.
+    back: |
+      **kNN.** The prediction averages $k$ neighbours' labels. Variance is $\sigma^2/k$, because averaging $k$ independent noises divides it by $k$. Bias is $f(x_0)$ minus the average of $f$ over the neighbours, and it grows as $k$ grows and neighbourhoods widen. Small $k$ wiggles with the noise; large $k$ over-smooths. The best $k$ balances the two, and you pick it by cross-validation. At fixed $k$, more data shrinks neighbourhoods, so bias falls too.
+
+      **Where it breaks.**
+      - *0–1 loss*: error is $\mathrm{Err}_B+|2f-1|P(\hat G\neq G)$, not additive. Bias that leaves the estimate on the right side of ½ is free, and variance can help when the mean is on the wrong side.
+      - *Deep nets*: bias and variance can both fall with width (Neal et al. 2018), and test error can show double descent. The identity still holds; only the U-shape in parameter count fails.
+    source: ESL §7.3, §7.3.1; Neal et al. 2018 §1
+
+  - id: f13
+    type: open
+    front: Can you compute the bias and variance of your model on a real dataset? What would you do instead?
+    back: |
+      Not exactly. Both terms are expectations over training sets drawn from the true distribution, and you have one $D$. Bias also needs $f(x)=\mathbb{E}[y\mid x]$, which you never observe.
+
+      What you can do:
+      - **Simulation**: when you know $f$ and the noise, draw many training sets and measure the spread and offset of the fits (Bishop's 100-dataset experiment).
+      - **Bootstrap proxies**: refit on bootstrap resamples. The spread of predictions at each $x$ approximates the variance. Bias stays entangled with noise.
+      - **Proxies from curves**: the train–val gap and learning curves tell you which term dominates.
+      - **Seeds**: retraining with different seeds isolates the optimisation part of the variance (Neal et al.'s split).
+
+      For decisions, estimate test error directly with held-out data or cross-validation.
+    source: Bishop PRML §3.2; Neal et al. 2018 §3.3
+
+reading:
+  - title: "Hastie, Tibshirani & Friedman, The Elements of Statistical Learning, §7.2–7.3 and Ex. 7.2"
+    url: https://hastie.su.domains/ElemStatLearn/
+    kind: book
+    note: The decomposition, the kNN and linear-model formulas, model vs estimation bias, and the 0–1 loss example (§7.3.1).
+  - title: "Bishop, Pattern Recognition and Machine Learning, §3.2"
+    url: https://www.microsoft.com/en-us/research/publication/pattern-recognition-machine-learning/
+    kind: book
+    note: The 100-dataset ridge experiment (Figs. 3.5–3.6) that makes bias and variance visible, plus the caveat about having one dataset.
+  - title: "Goodfellow, Bengio & Courville, Deep Learning, §5.2 and §5.4"
+    url: https://www.deeplearningbook.org/contents/ml.html
+    kind: book
+    note: Capacity, under- and overfitting, and the estimator-MSE version of the decomposition.
+  - title: "CS229 lecture notes, ch. 8 (bias–variance and double descent)"
+    url: https://cs229.stanford.edu/main_notes.pdf
+    kind: course
+    note: A clean regression derivation (§8.1.1) and a short introduction to double descent.
+  - title: "Neal et al. 2018, A Modern Take on the Bias-Variance Tradeoff in Neural Networks"
+    url: https://arxiv.org/abs/1810.08591
+    kind: paper
+    note: Measures both terms against network width and separates sampling variance from optimisation variance.

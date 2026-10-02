@@ -1,0 +1,560 @@
+id: gen.gans
+area: genmodels
+title: Generative Adversarial Networks
+summary: Training a sampler with no likelihood by playing it against a classifier. The optimal discriminator and the JSD, saturating vs non-saturating losses, why gradient play cycles (bilinear toy, Dirac-GAN) and how R1 fixes it, mode collapse, conditional GANs, and where GANs stand today.
+order: 60
+level: core
+tags: [gans, adversarial-training, jensen-shannon, game-dynamics, mode-collapse, r1-penalty]
+prereqs: [gen.overview, fund.kl-divergence]
+
+explainer:
+  - title: "The problem: a sampler with no likelihood"
+    body: |
+      We want to generate samples that look like the data. A **generator** network $G_\theta$ takes noise $z\sim p_z$ (say $\mathcal N(0,I)$ in $\mathbb R^m$) and outputs $x=G_\theta(z)\in\mathbb R^d$. This defines a model distribution $p_g$ *implicitly*: sampling costs one forward pass, but we cannot evaluate $p_g(x)$.
+
+      **Why maximum likelihood fails.** To compute $p_g(x)$ we would have to invert $G$ and track its Jacobian, which flows achieve only by forcing $G$ to be invertible with $m=d$. With $m<d$ it is worse: $G$ maps an $m$-dimensional space into $\mathbb R^d$, so $p_g$ sits on a set of zero volume and has no density in $\mathbb R^d$ at all (Arjovsky & Bottou, Lemma 1). There is no $\log p_g(x)$ to maximize.
+
+      **Learning by comparison.** We can still *sample* from both $p_{data}$ and $p_g$. So train a second network, the **discriminator** $D_\phi(x)\in(0,1)$, to output the probability that $x$ is real. Wherever $D$ can tell fakes apart, $p_g$ is wrong there, and $\nabla_x D$ says which way to move the fakes.
+
+      **The objective.** $D$ maximizes the log-likelihood of the labels (real $=1$, fake $=0$), which is minus the binary cross-entropy. $G$ minimizes the same quantity:
+
+      $$\min_G\max_D V(D,G)$$
+
+      $$\begin{aligned} V &= \mathbb E_{x\sim p_{data}}[\log D(x)] \\ &\quad+\mathbb E_{z\sim p_z}[\log(1-D(G(z)))] \end{aligned}$$
+
+      This is a **zero-sum game**: one player's gain is the other's loss.
+
+      **Training** alternates $k$ ascent steps on $D$ (the paper used $k=1$) with one descent step on $G$, on minibatches. $G$'s gradient flows *through* $D$: $\nabla_\theta\mathbb E_z[\ell(D(G_\theta(z)))]=\mathbb E_z[\nabla_\theta\,\ell(D(G_\theta(z)))]$, the same reparameterization idea as in a VAE.
+    source: Goodfellow et al. 2014 §3, Alg. 1; Murphy PML2 §26.1, §26.2.2, §26.3.2; Arjovsky & Bottou 2017 §2 (Lemma 1)
+
+  - title: "The optimal discriminator"
+    body: |
+      Fix $G$ and ask what the best $D$ is. First rewrite the second expectation over $x$. A refresher (the "law of the unconscious statistician"): if $x=G(z)$ then $\mathbb E_z[f(G(z))]=\mathbb E_{x\sim p_g}[f(x)]$. So
+
+      $$\begin{aligned} V=\int\big[&p_{data}(x)\log D(x) \\ &+p_g(x)\log(1-D(x))\big]\,dx \end{aligned}$$
+
+      With unlimited capacity, $D(x)$ can be chosen separately at every $x$, so we maximize the integrand pointwise. Write $a=p_{data}(x)$, $b=p_g(x)$, $y=D(x)$:
+
+      $$\begin{aligned} f(y)&=a\log y+b\log(1-y) \\ f'(y)&=\frac{a}{y}-\frac{b}{1-y}=0 \;\Rightarrow\; y=\frac{a}{a+b} \end{aligned}$$
+
+      $f''(y)=-a/y^2-b/(1-y)^2<0$, so this is the maximum:
+
+      $$D^*(x)=\frac{p_{data}(x)}{p_{data}(x)+p_g(x)}$$
+
+      $D$ only matters on the union of the two supports.
+
+      **What it means.** $D^*$ is the Bayes posterior $P(\text{real}\mid x)$ when real and fake are equally likely a priori. Rearranged,
+
+      $$\frac{D^*(x)}{1-D^*(x)}=\frac{p_{data}(x)}{p_g(x)}$$
+
+      so a trained classifier is a **density-ratio estimator**, and its logit estimates $\log p_{data}-\log p_g$. This is what sets GANs apart from VAEs (bounds) and Boltzmann machines (Markov chains). It also means GANs inherit supervised learning's failures: $D$ can overfit or underfit.
+
+      **Worked example.** Three points $\{a,b,c\}$ with $p_{data}=(0.5,0.5,0)$ and $p_g=(0.5,0.25,0.25)$. Then $D^*=(\tfrac12,\tfrac23,0)$: one half where the densities agree, $\tfrac23$ where the data is twice as dense, $0$ where only fakes live.
+
+      ![Illustrative densities. Notice that $D^*$ crosses ½ exactly where the densities cross, and falls to 0 in both tails because the wider $p_g$ dominates there, even though both densities are tiny.](gen.gans/optimal-discriminator-1d)
+    source: Goodfellow et al. 2014 §4.1 (Prop. 1); Murphy PML2 §26.2.2; Goodfellow 2016 tutorial §3.2.1
+
+  - title: "Plugging in D*: the generator minimizes a Jensen–Shannon divergence"
+    body: |
+      **Refresher.** $\mathrm{KL}(p\|q)=\mathbb E_p[\log(p/q)]\ge0$, with equality iff $p=q$. With the mixture $m=\tfrac12(p+q)$, the Jensen–Shannon divergence is
+
+      $$\mathrm{JSD}(p,q)=\tfrac12\mathrm{KL}(p\|m)+\tfrac12\mathrm{KL}(q\|m)$$
+
+      It is symmetric and lies in $[0,\log2]$. It equals $\log 2$ exactly when the supports are disjoint.
+
+      **Derivation.** Substitute $D^*$ into $V$ to get the generator's criterion $C(G)=\max_DV$:
+
+      $$\begin{aligned} C(G)&=\mathbb E_{p_{data}}\Big[\log\frac{p_{data}}{p_{data}+p_g}\Big] \\ &\quad+\mathbb E_{p_g}\Big[\log\frac{p_g}{p_{data}+p_g}\Big] \end{aligned}$$
+
+      The denominators are $p_{data}+p_g=2m$. So each log splits as $\log(p/m)-\log2$, and each expectation is a KL to $m$ minus $\log 2$:
+
+      $$\begin{aligned} C(G)&=\mathrm{KL}(p_{data}\|m)-\log2 \\ &\quad+\mathrm{KL}(p_g\|m)-\log2 \\ &=-\log4+2\,\mathrm{JSD}(p_{data},p_g) \end{aligned}$$
+
+      **Consequences.** Because $\mathrm{JSD}\ge0$ with equality iff the distributions match, the global minimum is $C=-\log4\approx-1.386$ (natural logs), reached only at $p_g=p_{data}$. There $D^*=\tfrac12$ everywhere: the discriminator cannot tell. With disjoint supports, $C=-\log4+2\log2=0$.
+
+      **Worked example, continued.** With $D^*=(\tfrac12,\tfrac23,0)$:
+
+      $$\begin{aligned} C&=\tfrac12\log\tfrac12+\tfrac12\log\tfrac23 \\ &\quad+\tfrac12\log\tfrac12+\tfrac14\log\tfrac13+\tfrac14\log1 \\ &=-1.171 \end{aligned}$$
+
+      so $\mathrm{JSD}=(C+\log4)/2=0.108$.
+
+      **Scope.** This needs an optimal $D$ at every generator step and unlimited capacity. Goodfellow et al.'s convergence result (Prop. 2) also updates $p_g$ directly in function space, where $C$ is convex in $p_g$. With networks updated in parameter space, none of this is guaranteed. **Convention:** PML2 puts $\tfrac12$ in front of both terms of $V$, which gives $\mathrm{JSD}-\log2$ instead.
+    source: Goodfellow et al. 2014 §4.1 (Thm 1), §4.2 (Prop. 2); Murphy PML2 §26.2.2 (eqs. 26.12–26.16)
+
+  - title: "Saturation and the non-saturating loss"
+    body: |
+      ![Left: the two generator losses. Right: the gradient each sends back through D's logit. Where D confidently rejects fakes (shaded), the minimax gradient is nearly zero and the non-saturating one is nearly 1.](gen.gans/saturating-vs-nonsaturating)
+
+      $D$ outputs $D=\sigma(a)$, where $a$ is its logit. Early in training fakes are easy to spot, so $D(G(z))\approx0$. The minimax generator minimizes $\log(1-D(G(z)))$. By the chain rule through the logit,
+
+      $$\frac{\partial}{\partial a}\log\big(1-\sigma(a)\big)=-\sigma(a)=-D$$
+
+      So the signal reaching $G$ is proportional to $D(G(z))$, which is near zero exactly when $G$ is worst. Note *where* it dies. The slope with respect to $D$ itself is $-1/(1-D)\approx-1$, which is not small. It is the sigmoid's own flatness, $\partial D/\partial a=D(1-D)$, that kills it.
+
+      **The fix** (Goodfellow et al. 2014): let $G$ *maximize* $\log D(G(z))$, i.e. minimize $-\log D(G(z))$:
+
+      $$\frac{\partial}{\partial a}\big(-\log\sigma(a)\big)=-(1-\sigma(a))=-(1-D)$$
+
+      This is strong (near 1) when $D$ rejects the fakes and weak once $G$ fools $D$. At $D(G(z))=0.01$ the two gradient magnitudes are $0.01$ and $0.99$, a factor of 99.
+
+      **Same fixed point, different game.** If $p_g=p_{data}$ and $D=\tfrac12$ everywhere, neither loss gives $G$ a direction, so the equilibrium is unchanged. But the game is no longer zero-sum: $D$ still minimizes cross-entropy, while $G$ minimizes cross-entropy with the *target flipped* ("call my fakes real"). In the minimax game, $G$ minimizes the log-probability that $D$ is right. In this one, it maximizes the log-probability that $D$ is wrong.
+
+      **Pitfall.** Code that trains $G$ with BCE against the label "real" implements the non-saturating loss. Many tutorials call this "the minimax loss". It isn't.
+    source: Goodfellow et al. 2014 §3; Goodfellow 2016 tutorial §3.2.2–3.2.3; Murphy PML2 §26.3.1 (Fig. 26.5)
+
+  - title: "What the non-saturating loss optimizes, and disjoint supports"
+    body: |
+      **The implicit objective** (Arjovsky & Bottou, Thm 2.5). Write $p_\theta$ for the generator's distribution $p_g$. When $G$ takes a step, $D$ is held fixed: take $D=D^*$ computed at the current parameters $\theta_0$, so $\log\frac{D^*}{1-D^*}=\log\frac{p_{data}}{p_{\theta_0}}$. Use $-\log D=-\log\frac{D}{1-D}-\log(1-D)$:
+
+      $$\begin{aligned} \mathbb E_{p_\theta}[-\log D^*] &=\mathbb E_{p_\theta}\Big[\log\frac{p_{\theta_0}}{p_{data}}\Big] \\ &\quad-\mathbb E_{p_\theta}[\log(1-D^*)] \end{aligned}$$
+
+      - **First term.** Split the log as $\log\frac{p_{\theta_0}}{p_{data}}=\log\frac{p_\theta}{p_{data}}-\log\frac{p_\theta}{p_{\theta_0}}$. Taking $\mathbb E_{p_\theta}$ gives $\mathrm{KL}(p_\theta\|p_{data})-\mathrm{KL}(p_\theta\|p_{\theta_0})$. The second KL is minimized (zero) at $\theta=\theta_0$, so its gradient vanishes there.
+      - **Second term.** $\mathbb E_{p_\theta}[\log(1-D^*)]$ is the only $\theta$-dependent part of $V(D^*,G_\theta)$. The **envelope theorem** says that differentiating a maximized function needs no derivative of the maximizer: $\frac{d}{d\theta}V(D^*_\theta,\theta)=\partial_\theta V+\partial_DV\cdot\frac{dD^*}{d\theta}$, and $\partial_DV=0$ at the optimum. So this expectation has gradient $\nabla C=\nabla\,2\mathrm{JSD}$, and with the minus sign in front it contributes $-\nabla\,2\mathrm{JSD}$.
+
+      $$\nabla_\theta\mathbb E[-\log D^*]=\nabla_\theta\big[\mathrm{KL}(p_g\|p_{data})-2\,\mathrm{JSD}\big]$$
+
+      **Reading it.** The reverse KL $\mathbb E_{p_g}[\log(p_g/p_{data})]$ charges heavily for fakes where $p_{data}\approx0$, and almost nothing for data modes that $p_g$ ignores. That favours sharp samples and dropped modes. The $-2\,\mathrm{JSD}$ term even pushes the distributions apart.
+
+      **Disjoint supports.** $p_g$ lives on an at-most-$m$-dimensional set, and natural images are believed to concentrate near a low-dimensional manifold. Two such sets generically meet in at most a set of measure zero (Thm 2.2). Then a smooth, perfect $D^*$ exists with $\nabla_xD^*=0$ on both supports, and $\mathrm{JSD}=\log2$ for every nearby $\theta$, so the criterion is flat (Thms 2.1, 2.3). Consequences:
+      - **Minimax loss:** $G$'s gradient goes to $0$ as $D\to D^*$ (Thm 2.4).
+      - **Non-saturating loss:** the gradient does not vanish. But if $D$ is near-perfect up to small independent noise, it is Cauchy-distributed, with infinite variance (Thm 2.6). The updates are unstable.
+
+      The dilemma: train $D$ well and the gradients are useless; train it poorly and $C(G)$ is not the JSD. The paper's remedy is to add noise to both distributions so their supports overlap. WGAN (gen.wgan) is the other answer.
+    source: Arjovsky & Bottou 2017 §2.1–2.2 (Lemma 1; Thms 2.1–2.6)
+
+  - title: "A game, not a minimization: the bilinear toy"
+    body: |
+      Gradient descent on one loss goes downhill on that loss. In a game each player descends *its own* loss, and one player's step can push the other uphill. The simplest case is $V(x,y)=xy$, where $x$ minimizes and $y$ maximizes. The equilibrium is $(0,0)$: there, neither player can improve by moving alone.
+
+      **Continuous time** (infinitesimal steps):
+
+      $$\dot x=-\frac{\partial V}{\partial x}=-y,\qquad \dot y=+\frac{\partial V}{\partial y}=x$$
+
+      Then $\frac{d}{dt}(x^2+y^2)=2x(-y)+2y(x)=0$. The radius is conserved, and the solution circles forever: $x(t)=x_0\cos t-y_0\sin t$, $y(t)=x_0\sin t+y_0\cos t$. In matrix form, $\dot{\mathbf z}=J\mathbf z$ with eigenvalues $\pm i$. Purely imaginary eigenvalues mean rotation. Convergence would need negative real parts.
+
+      **Simultaneous gradient steps** of size $h$: $x'=x-hy$, $y'=y+hx$. The cross terms cancel:
+
+      $$\begin{aligned} x'^2+y'^2&=(x-hy)^2+(y+hx)^2 \\ &=(1+h^2)(x^2+y^2) \end{aligned}$$
+
+      The radius grows by $\sqrt{1+h^2}$ every step, for *any* $h>0$, so the iterates spiral outward. From $(1,1)$ with $h=0.1$, $x^2+y^2$ goes from $2$ to $2.02$ in one step, and the radius from $1.41$ to $2.33$ after 100 steps.
+
+      **Alternating steps** ($y$ sees the new $x$): the update matrix $\begin{pmatrix}1&-h\\h&1-h^2\end{pmatrix}$ has determinant 1 and trace $2-h^2$. So for $h<2$ its eigenvalues lie on the unit circle: bounded cycles, no convergence.
+
+      **Lessons.**
+      - This is not a step-size problem: even the exact flow never arrives.
+      - No single loss tracks progress. $V=xy$ just oscillates, and a GAN's losses likewise don't tell you sample quality.
+      - Two-timescale updates (TTUR: separate learning rates for $D$ and $G$; Heusel et al. 2017) come with local convergence guarantees under assumptions that the next card's example violates.
+    source: Goodfellow 2016 tutorial §5.1, §7.2, §8.2; Mescheder et al. 2018 §2.1, Lemma 2.5; Murphy PML2 §26.3.5; Heusel et al. 2017 (abstract)
+
+  - title: "The Dirac-GAN, and why the R1 penalty fixes it"
+    body: |
+      Mescheder et al. built the smallest GAN with this pathology. Data is a point mass $\delta_0$, the generator is $\delta_\theta$ ($G(z)=\theta$), and $D_\psi(x)=\sigma(\psi x)$ has a linear logit with slope $\psi$. The equilibrium is $\theta=\psi=0$. The objective is
+
+      $$V(\theta,\psi)=\log\tfrac12+\log\big(1-\sigma(\psi\theta)\big)$$
+
+      Using $\frac{d}{du}\log(1-\sigma(u))=-\sigma(u)$:
+
+      $$\begin{aligned} \dot\theta&=-\partial_\theta V=\psi\,\sigma(\psi\theta) \\ \dot\psi&=+\partial_\psi V=-\theta\,\sigma(\psi\theta) \end{aligned}$$
+
+      So $\frac{d}{dt}(\theta^2+\psi^2)=0$ on every trajectory: the bilinear rotation again. Near $0$, $\sigma\approx\tfrac12$ and the eigenvalues are $\pm\tfrac i2$.
+
+      **The story.** If $\theta>0$, $D$ tilts ($\psi<0$) to favour the left, and $G$ slides toward 0. On arrival $D$'s slope is at its largest, so $G$ overshoots, and the cycle repeats. At $\theta=0$, $V$ doesn't depend on $\psi$, so nothing tells $D$ to flatten. In high dimensions the same thing happens off the data manifold: $D$ can keep non-zero gradients orthogonal to it at no cost.
+
+      **R1** penalizes the discriminator's input gradient on real data (with $D$ denoting the logit):
+
+      $$R_1(\psi)=\frac{\gamma}{2}\,\mathbb E_{p_{data}}\|\nabla_xD_\psi(x)\|^2$$
+
+      $D$ maximizes $V-R_1$. Here $\nabla_x(\psi x)=\psi$, so $R_1=\tfrac{\gamma}{2}\psi^2$ and $\dot\psi$ gains a $-\gamma\psi$ term. Linearizing,
+
+      $$J=\begin{pmatrix}0&\tfrac12\\-\tfrac12&-\gamma\end{pmatrix}$$
+
+      $$\lambda=-\frac{\gamma}{2}\pm\sqrt{\frac{\gamma^2}{4}-\frac14}$$
+
+      For every $\gamma>0$ the real parts are negative, so small steps converge locally. For $\gamma<1$ the iterates spiral in, $\gamma=1$ removes the rotation, and $\gamma>1$ is overdamped.
+
+      ![Dirac-GAN gradient play simulated on the exact objective (step 0.25 left, 0.1 right). Unregularized play spirals out or cycles around the equilibrium (star); R1 makes it converge.](gen.gans/dirac-gan-dynamics)
+
+      **Why it's principled.** The penalty is zero at the equilibrium discriminator (flat on the data), so it doesn't move the solution. It only removes the rotation. Their Thm 4.1 proves local convergence for R1 (and R2, the same penalty on fakes) even on low-dimensional manifolds, in the realizable case: some generator matches $p_{data}$ exactly, and $D=0$ near the data. They trained 1024² CelebA-HQ and all-ImageNet GANs with R1 alone. How R1 differs from WGAN-GP's penalty is in gen.wgan.
+    source: Mescheder et al. 2018 §2.2–2.3 (Lemmas 2.2–2.4), §3.3 (Lemma 3.3), §4.1–4.2 (eqs. 9–10, Thm 4.1), §5; Murphy PML2 §26.3.5
+
+  - title: "Mode collapse: what it is and why it happens"
+    body: |
+      ![Synthetic illustration. Every generated sample sits on a real mode, but six of the eight modes are never produced.](gen.gans/mode-collapse)
+
+      **Mode collapse**: $G$ maps many different $z$ to the same few outputs. Complete collapse is rare. Partial collapse, such as many samples sharing a texture or showing the same dog, is common. In **mode hopping**, $G$ jumps from mode to mode as $D$ learns to reject each one. In precision/recall terms, samples look real (high precision) but cover little of the data (low recall). See gen.evaluation for the metrics.
+
+      **Why it happens.** Two accounts, and the sources disagree about their weight:
+      - *Ordering.* The solution of $\min_G\max_D V$ is $p_g=p_{data}$. In $\max_D\min_G V$, though, $G$ is the inner player and best-responds by mapping *every* $z$ to the one $x$ that $D$ currently rates most real. Simultaneous gradient play doesn't privilege either order (Goodfellow tutorial).
+      - *Divergence.* The non-saturating gradient's reverse-KL term barely penalizes missing modes (Arjovsky & Bottou). Goodfellow argues the divergence is not the main cause, for two reasons. GANs trained to approximate the forward KL also collapse. And GANs often use fewer modes than their capacity allows, whereas reverse KL prefers as many modes as the model can fit.
+    source: Goodfellow 2016 tutorial §3.2.5, §5.1.1; Murphy PML2 §26.3.3; Arjovsky & Bottou 2017 §2.2.2
+
+  - title: "Remedies for collapse and instability"
+    body: |
+      Salimans et al. (2016) offer four heuristics that encourage convergence. Only the first targets collapse directly.
+      - **Minibatch discrimination.** $D$ scores each sample independently, so no gradient tells $G$'s outputs to differ. Give $D$ features measuring each sample's similarity to the rest of the batch, so a too-uniform batch is easy to spot.
+      - **Feature matching.** $G$ minimizes $\|\mathbb E_{p_{data}}f(x)-\mathbb E_zf(G(z))\|^2$, where $f$ is an intermediate layer of $D$. Matching statistics, rather than maximizing $D$'s current output, stops $G$ from over-fitting to one particular $D$.
+      - **Historical averaging.** Add $\|\theta-\frac1t\sum_{i\le t}\theta_i\|^2$ to each player's cost. Inspired by fictitious play, it damps the orbits that plain gradient play falls into (the rotation in the bilinear and Dirac-GAN cards).
+      - **One-sided label smoothing.** Use target $0.9$ for real data and $0$ for fakes. Deep nets tend to give overconfident outputs, especially on adversarially constructed inputs like $G$'s samples. Smoothing keeps $D$ estimating soft probabilities, closer to a density ratio, instead of extreme logits. With targets $\alpha$ (real) and $\beta$ (fake),
+
+      $$D^*(x)=\frac{\alpha\,p_{data}(x)+\beta\,p_g(x)}{p_{data}(x)+p_g(x)}$$
+
+      If $\beta>0$, then where $p_{data}\approx0$ we get $D^*\approx\beta>0$: fakes there are rewarded, not pushed toward the data. So only the real targets are smoothed.
+
+      Larger batches, a higher-capacity $D$, and regularizing both players also reduce collapse (PML2).
+    source: Salimans et al. 2016 §3.1–3.4; Goodfellow 2016 tutorial §4.2; Murphy PML2 §26.3.3
+
+  - title: "Conditional GANs, architectures, and where GANs stand"
+    body: |
+      **Conditional GANs** give the condition $y$ (a class, text embedding or image) to *both* players:
+
+      $$\begin{aligned} \min_G\max_D\;&\mathbb E[\log D(x\mid y)] \\ &+\mathbb E[\log(1-D(G(z\mid y)\mid y))] \end{aligned}$$
+
+      $D$ must see $y$. Otherwise $G$ can produce realistic samples that ignore $y$, and nothing penalizes it. Ways to condition: concatenate an embedding of $y$ to $z$ and to $D$'s input, inject $y$ at several layers, use a projection discriminator (add an inner product between an embedding of $y$ and $D$'s features to its logit), or add an auxiliary loss that makes $D$ classify $y$. **pix2pix** handles paired image-to-image translation with a U-Net generator and a *PatchGAN* discriminator that classifies local patches. **CycleGAN** handles unpaired translation with two generators and a cycle loss $\|F(G(x))-x\|_1$.
+
+      **Architectures and tricks** (named here; details elsewhere):
+      - *DCGAN*: strided and transposed convolutions instead of pooling, batch norm in both nets except $G$'s output and $D$'s input, ReLU in $G$, LeakyReLU in $D$, and Adam.
+      - *Spectral normalization* of $D$'s layers (gen.wgan).
+      - *Progressive growing*: train at 4×4 and add layers up to 1024². *StyleGAN* injects style vectors layer by layer, for coarse and fine control.
+      - *Truncation trick*: draw latents closer to their mean. Samples become more typical and less varied, so precision rises and recall falls. Full truncation gives zero recall.
+
+      **Where GANs stand.** Diffusion models overtook GANs on image synthesis (Dhariwal & Nichol 2021). GANs capture less diversity, collapse without carefully chosen hyperparameters and regularizers, and are hard to scale. Diffusion has a stationary regression objective and good coverage. GANs still sample in one forward pass, and adversarial losses survive:
+      - patch-based adversarial plus perceptual losses (distances in a pretrained network's feature space) in the VQGAN and latent-diffusion autoencoders, which keep reconstructions sharp;
+      - super-resolution;
+      - adversarial diffusion distillation for 1–4-step samplers (gen.distillation).
+    source: Mirza & Osindero 2014 §3.2; Murphy PML2 §26.4, §26.6.2, §26.6.4, §26.7.1; Goodfellow 2016 tutorial §3.3; Kynkäänniemi et al. 2019 §5 (Fig. 5); Dhariwal & Nichol 2021 §1; Rombach et al. 2022 §3.1
+
+  - title: "What interviewers probe"
+    body: |
+      The standard chain: derive $D^*$ → what $G$ then minimizes → why the non-saturating loss → what it optimizes → why play rotates → how R1 fixes it. The formulas are in the next card. Follow-ups that catch people out:
+      - **Does training actually minimize the JSD?** No. $D$ is never optimal, updates are in non-convex parameter space, and the non-saturating loss is used anyway.
+      - **Does a smaller learning rate fix the oscillation?** No: the continuous flow circles too. Use R1 or instance noise.
+      - **Can I watch the loss to know when to stop?** No, losses oscillate. Evaluate samples (FID, precision/recall).
+      - **Mode collapse?** Max–min ordering, plus the reverse KL (contested). Minibatch features target it. The other Salimans heuristics, larger batches and R1 help by stabilizing training.
+      - **Why did diffusion win?** Stability, coverage and scaling. Adversarial losses survive in autoencoders, super-resolution and distillation.
+
+      **Common wrong answers:** "BCE with flipped labels is the minimax loss" (it's the non-saturating loss). "GANs minimize the forward KL" (no: the JSD under an optimal $D$). "The two generator losses give the same gradient because they share a fixed point" (no: $-D$ vs $-(1-D)$ through the logit).
+    source: Goodfellow et al. 2014 §3–4; Arjovsky & Bottou 2017 §2; Mescheder et al. 2018 §2–3, Table 1; Murphy PML2 §26.3
+
+  - title: "Key results"
+    body: |
+      - Game and optimal discriminator:
+
+      $$\begin{aligned} V&=\mathbb E_{data}\log D+\mathbb E_z\log(1-D(G(z))) \\ D^*&=\frac{p_{data}}{p_{data}+p_g} \end{aligned}$$
+
+      - Generator criterion. Its minimum is $-\log4$ at $p_g=p_{data}$ with $D^*=\tfrac12$, and it equals $0$ for disjoint supports:
+
+      $$C(G)=-\log4+2\,\mathrm{JSD}(p_{data},p_g)$$
+
+      - Gradients through the logit $a$ of $D=\sigma(a)$: minimax $-D$, non-saturating $-(1-D)$.
+      - Non-saturating loss with $D^*$ frozen:
+
+      $$\nabla\,\mathbb E[-\log D^*]=\nabla\big[\mathrm{KL}(p_g\|p_{data})-2\mathrm{JSD}\big]$$
+
+      - Disjoint low-dimensional supports give $\mathrm{JSD}=\log 2$ (flat), the minimax gradient $\to0$, and Cauchy-noisy non-saturating gradients.
+      - Bilinear $xy$: the flow conserves $x^2+y^2$, and simultaneous steps multiply it by $1+h^2$.
+      - Dirac-GAN eigenvalues: $\pm\frac i2$ unregularized, $-\frac\gamma2\pm\sqrt{\gamma^2/4-1/4}$ with R1.
+      - One-sided label smoothing: $D^*=\dfrac{\alpha p_{data}+\beta p_g}{p_{data}+p_g}$, so keep $\beta=0$.
+    source: Goodfellow et al. 2014 §4; Arjovsky & Bottou 2017 §2; Mescheder et al. 2018 §2–3; Salimans et al. 2016 §3.4
+
+quiz:
+  - id: q1
+    prompt: |
+      A discriminator trained to optimality against a fixed generator outputs $D(x_0)=0.8$. What is $p_g(x_0)/p_{data}(x_0)$?
+    correct: "0.25"
+    wrong:
+      - "4.00"
+      - "0.20"
+      - "0.80"
+    explanation: |
+      $D^*/(1-D^*)=p_{data}/p_g$, so $p_{data}/p_g=0.8/0.2=4$ and $p_g/p_{data}=0.25$. Answering 4 inverts the ratio. 0.2 and 0.8 read $D$ itself as a density or a ratio, but $D$ is a posterior probability, $P(\text{real}\mid x)$ under equal priors.
+    source: Goodfellow et al. 2014 §4.1 (Prop. 1); Murphy PML2 §26.2.2 (eq. 26.11)
+
+  - id: q2
+    prompt: |
+      ![Two illustrative Gaussian densities ($p_{data}$ filled and narrower, $p_g$ wider) and four candidate discriminator curves (white).](gen.gans/which-dstar-quiz)
+
+      Both densities are Gaussian, and $p_g$ has the larger variance. Which panel shows the optimal discriminator $D^*$?
+    correct: B
+    wrong:
+      - A
+      - C
+      - D
+    explanation: |
+      $D^*=p_{data}/(p_{data}+p_g)$ depends only on the *ratio* of the densities. It crosses ½ where they cross: once between the two peaks, and once in the far-left tail, where the wider $p_g$ overtakes the narrow $p_{data}$. It falls to 0 in both tails (B). C is the tempting one: it is right in the middle but stays near 1 on the far left, ignoring that a wider Gaussian's tail always overtakes a narrower one's. A is $p_g/(p_{data}+p_g)$, with the labels swapped. D is the data density rescaled, which confuses density height with the ratio.
+    source: Goodfellow et al. 2014 §4.1 (Prop. 1)
+
+  - id: q3
+    prompt: |
+      In the original minimax game with the discriminator kept optimal, which statement is **false**? (Natural logs.)
+    correct: G then minimizes the forward KL from data to model
+    wrong:
+      - At $p_g=p_{data}$ the value of the game is $-\log 4$
+      - With disjoint supports the value of the game is $0$
+      - At the optimum the discriminator outputs ½ everywhere
+    explanation: |
+      Substituting $D^*$ gives $C(G)=-\log4+2\,\mathrm{JSD}$, so the generator minimizes the Jensen–Shannon divergence, not $\mathrm{KL}(p_{data}\|p_g)$. The forward KL is what maximum likelihood minimizes. The other three statements follow from the same formula: JSD is 0 at $p_g=p_{data}$ (value $-\log4$, with $D^*=\tfrac12$) and $\log2$ for disjoint supports (value $0$).
+    source: Goodfellow et al. 2014 §4.1 (Thm 1)
+
+  - id: q4
+    prompt: |
+      Two points $\{a,b\}$: $p_{data}=(0.5,\,0.5)$ and $p_g=(1,\,0)$. With the optimal discriminator, what is $C(G)=\max_DV$? (Natural logs.)
+    correct: $-0.955$
+    wrong:
+      - $-1.386$
+      - $-0.549$
+      - $0.000$
+    explanation: |
+      $D^*(a)=0.5/1.5=\tfrac13$ and $D^*(b)=0.5/0.5=1$. Then $C=0.5\log\tfrac13+0.5\log1+1\cdot\log\tfrac23=-0.549-0.405=-0.955$, so $\mathrm{JSD}=(C+\log4)/2=0.216$. $-0.549$ forgets the generator's term $\mathbb E_{p_g}\log(1-D^*)$. $-1.386=-\log4$ would need $p_g=p_{data}$. $0$ would need disjoint supports, but the two distributions overlap at $a$.
+    source: Goodfellow et al. 2014 §4.1 (eqs. 4–6)
+
+  - id: q5
+    prompt: |
+      Early in training, a fake has $D(G(z))=0.02$, where $D=\sigma(a)$. By what factor is the gradient of the non-saturating loss $-\log D$ with respect to the logit $a$ larger than that of the minimax loss $\log(1-D)$?
+    correct: "49"
+    wrong:
+      - "1"
+      - "3.91"
+      - "0.02"
+    explanation: |
+      Through the logit, $\partial_a\log(1-\sigma(a))=-D=-0.02$ and $\partial_a(-\log\sigma(a))=-(1-D)=-0.98$, a ratio of 49. "1" confuses having the same fixed point with having the same gradient. $3.91=-\log0.02$ is a loss *value*, not a gradient ratio. 0.02 inverts the comparison: the minimax loss is the weak one when $D$ rejects fakes.
+    source: Goodfellow et al. 2014 §3; Goodfellow 2016 tutorial §3.2.3
+
+  - id: q6
+    prompt: |
+      $p_{data}$ and $p_g$ lie on disjoint low-dimensional manifolds, and $D$ is trained ever closer to optimal. With the **minimax** generator loss $\log(1-D(G(z)))$, the generator's gradient:
+    correct: Tends to zero as $D$ approaches $D^*$
+    wrong:
+      - Stays informative, since the JSD shrinks as G moves closer
+      - Matches the non-saturating gradient, since the two losses share a fixed point
+      - Becomes heavy-tailed, with infinite variance
+    explanation: |
+      With disjoint supports a smooth perfect $D^*$ exists that is locally constant (so $\nabla_xD^*=0$) on both supports. Arjovsky & Bottou's Thm 2.4 bounds the minimax generator gradient by a quantity that goes to 0 as $\|D-D^*\|\to0$. The JSD does not shrink as $G$ approaches: it stays at $\log2$ until the supports overlap. Heavy, Cauchy-distributed gradients are their Thm 2.6 result for the *non-saturating* loss with a noisy discriminator.
+    source: Arjovsky & Bottou 2017 §2.1 (Thms 2.1, 2.3), §2.2.1 (Thm 2.4), §2.2.2 (Thm 2.6)
+
+  - id: q7
+    prompt: |
+      Arjovsky & Bottou show the non-saturating gradient equals $\nabla[\mathrm{KL}(p_\theta\|p_{data})-2\mathrm{JSD}]$ at $\theta_0$. Along the way, a term $-\nabla_\theta\mathrm{KL}(p_\theta\|p_{\theta_0})$ appears and is dropped. Why is dropping it valid?
+    correct: This KL is zero and minimal at $\theta=\theta_0$, so its gradient vanishes
+    wrong:
+      - $D^*$ is frozen, so this KL term does not depend on $\theta$ at all
+      - The envelope theorem deletes every term in which the frozen $D^*$ appears
+      - KL is symmetric when $\theta=\theta_0$, so the two directions cancel out
+    explanation: |
+      $\mathrm{KL}(p_\theta\|p_{\theta_0})\ge0$, with equality at $\theta=\theta_0$, so $\theta_0$ is a minimizer and the gradient vanishes there (only there). The term *does* depend on $\theta$ through $p_\theta$; freezing $D^*$ only fixes $p_{\theta_0}$. The envelope argument is what turns the $\log(1-D^*)$ term into $\nabla2\mathrm{JSD}$, and it doesn't delete anything. KL symmetry is not involved.
+    source: Arjovsky & Bottou 2017 §2.2.2 (Thm 2.5 and proof)
+
+  - id: q8
+    prompt: |
+      Simultaneous gradient play on $V(x,y)=xy$ ($x$ minimizes, $y$ maximizes) starts at $(1,2)$ with step size $0.2$. After one step, $x^2+y^2$ equals:
+    correct: "5.20"
+    wrong:
+      - "5.00"
+      - "4.80"
+      - "6.00"
+    explanation: |
+      The update is $x'=x-0.2y=0.6$ and $y'=y+0.2x=2.2$, so $x'^2+y'^2=0.36+4.84=5.20=(1+h^2)\cdot5$. The cross terms cancel, so the squared radius is multiplied by $1+h^2$ every step and the iterates spiral outward. $5.00$ is what the continuous-time flow conserves; simultaneous steps don't. $4.80$ is the sign slip $1-h^2$, and $6.00$ multiplies by $1+h$.
+    source: Goodfellow 2016 tutorial §8.2; Mescheder et al. 2018 §2.2 (Lemma 2.4)
+
+  - id: q9
+    prompt: |
+      The Dirac-GAN (data $\delta_0$, generator $\delta_\theta$, $D_\psi(x)=\sigma(\psi x)$) is trained with an R1 penalty of weight $\gamma=0.5$ on the discriminator. Near the equilibrium, with small steps, the iterates:
+    correct: Spiral inward to the equilibrium
+    wrong:
+      - Circle at a constant radius, as without R1
+      - Converge with no rotation at all
+      - Spiral outward, but more slowly than before
+    explanation: |
+      The linearized Jacobian $\begin{pmatrix}0&1/2\\-1/2&-\gamma\end{pmatrix}$ has eigenvalues $-\gamma/2\pm\sqrt{\gamma^2/4-1/4}=-0.25\pm0.433i$: a negative real part (convergence) with an imaginary part (rotation). Rotation disappears only at $\gamma\ge1$, the critical value. Any $\gamma>0$ makes the real parts negative, so the iterates neither circle nor spiral out.
+    source: Mescheder et al. 2018 §3.3 (Lemma 3.3)
+
+  - id: q10
+    prompt: |
+      Why does unregularized gradient play fail to converge on the Dirac-GAN?
+    correct: At $\theta=0$ nothing pulls D's slope back to zero, so G overshoots
+    wrong:
+      - The generator family cannot represent the data distribution at all
+      - The step size is too large; small enough steps would then converge
+      - The JSD is flat near $\theta=0$, so the generator's gradient vanishes
+    explanation: |
+      At $\theta=0$ the objective doesn't depend on $\psi$, so $D$ has no incentive to return to the flat equilibrium discriminator. A tilted $D$ keeps pushing $G$ past the data. The generator *can* represent $\delta_0$ (at $\theta=0$). Step size isn't the cause: the continuous-time flow conserves $\theta^2+\psi^2$ and circles forever. The JSD between two distinct point masses is indeed flat ($\log2$ for every $\theta\ne0$), but $D$ is not optimal during play, so $G$ still receives non-zero gradients. They rotate the iterates rather than vanish.
+    source: Mescheder et al. 2018 §2.2–2.3 (Lemmas 2.2–2.3)
+
+  - id: q11
+    prompt: |
+      One-sided label smoothing replaces the real-data target 1 by 0.9 and leaves the fake target at 0. Why not also smooth the fake target to, say, 0.1?
+    correct: Fakes off the data would get $D^*\approx\beta>0$, a reward instead of a push
+    wrong:
+      - A nonzero fake target would push $D^*$ above 1 wherever $p_g$ exceeds $p_{data}$
+      - Smoothing only the real target leaves $D^*$ completely unchanged everywhere
+      - A nonzero fake target would turn the zero-sum game into a non-zero-sum one
+    explanation: |
+      With targets $\alpha$ and $\beta$, $D^*=(\alpha p_{data}+\beta p_g)/(p_{data}+p_g)$. Where $p_{data}\approx0$ but $p_g$ is large, $D^*\approx\beta>0$, so spurious fakes look somewhat real and are not pushed toward the data. $D^*$ never exceeds $\max(\alpha,\beta)<1$. Smoothing the real target alone does change $D^*$: it scales it by $\alpha$, without changing its shape. Any smoothing, one-sided included, already breaks the zero-sum structure, so that can't be the reason to keep $\beta=0$.
+    source: Salimans et al. 2016 §3.4; Goodfellow 2016 tutorial §4.2 (eq. 15)
+
+  - id: q12
+    prompt: |
+      Applying stronger truncation to a trained GAN, i.e. drawing latents closer to their mean, typically:
+    correct: Raises precision and lowers recall
+    wrong:
+      - Raises both precision and recall
+      - Lowers precision and raises recall
+      - Leaves precision and recall unchanged
+    explanation: |
+      Here precision is the fraction of samples that land on the real-data manifold, and recall is the fraction of the data manifold that samples cover. Truncated latents give more typical, higher-quality but less varied samples. Kynkäänniemi et al. measure precision rising and recall falling as truncation increases, with zero recall at full truncation. The trade-off is the same as the fidelity–diversity trade-off of guidance in diffusion.
+    source: Kynkäänniemi et al. 2019 §5 (Fig. 5)
+
+  - id: q13
+    prompt: |
+      The solution of $\min_G\max_D V$ is $p_g=p_{data}$, yet simultaneous gradient play often collapses onto a few modes. Which mechanism explains collapse even though the minimax solution is $p_{data}$?
+    correct: Play can act like max–min, where G maps all $z$ to D's favourite $x$
+    wrong:
+      - The JSD is minimized by fitting one mode well, so collapse is optimal
+      - The non-saturating loss moves the global optimum to a single mode
+      - Batch statistics inside D reward the generator for low sample diversity
+    explanation: |
+      In $\max_D\min_G V$ the generator is the inner player, and its best response to a fixed $D$ is to put all mass on the single point $D$ rates most real. Simultaneous updates don't enforce min–max ordering. The JSD's minimizer is $p_{data}$ itself, and the non-saturating loss keeps the same fixed point. Batch-level features in $D$ are a *remedy* (minibatch discrimination), not a cause.
+    source: Goodfellow 2016 tutorial §5.1.1
+
+  - id: q14
+    prompt: |
+      In a conditional GAN, the generator receives $(z,y)$ but the discriminator sees only $x$. What should you expect?
+    correct: Realistic samples that may ignore $y$, as D can't penalize a mismatch
+    wrong:
+      - Correctly conditioned samples, since the generator is explicitly told $y$
+      - Divergent training, since the discriminator's input is missing $y$
+      - Guaranteed collapse onto the single most frequent value of $y$
+    explanation: |
+      The generator's only training signal is $D$. If $D$ judges $x$ alone, any realistic image fools it, whatever $y$ was, so $G$ has no reason to use $y$. The critic must see $(x,y)$ to penalize realistic but wrongly conditioned samples. That is why cGANs feed $y$ to both players. Nothing about this setup forces divergence or collapse onto one class.
+    source: Mirza & Osindero 2014 §3.2; Murphy PML2 §26.4
+
+cards:
+  - id: f1
+    front: Write the GAN minimax objective and say what the discriminator's part of it is.
+    back: |
+      $$\begin{aligned} \min_G\max_D\;&\mathbb E_{p_{data}}[\log D(x)] \\ &+\mathbb E_{p_z}[\log(1-D(G(z)))] \end{aligned}$$
+
+      For $D$ it is the label log-likelihood (minus binary cross-entropy) of classifying real as 1 and fake as 0. The original algorithm alternates $k$ discriminator ascent steps ($k=1$ in the paper) with one generator descent step.
+    source: Goodfellow et al. 2014 §3, Alg. 1
+
+  - id: f2
+    front: Optimal discriminator for a fixed generator, and what quantity it estimates.
+    back: |
+      $$D^*(x)=\frac{p_{data}(x)}{p_{data}(x)+p_g(x)}$$
+
+      $D^*/(1-D^*)=p_{data}/p_g$, so the logit estimates $\log p_{data}-\log p_g$ (density-ratio estimation by classification). This assumes unlimited capacity, and $D$ matters only on the union of the supports.
+    source: Goodfellow et al. 2014 §4.1 (Prop. 1); Goodfellow 2016 tutorial §3.2.1
+
+  - id: f3
+    front: Value of the game at $D^*$ as a function of $G$; its minimum; its value for disjoint supports.
+    back: |
+      $$C(G)=-\log4+2\,\mathrm{JSD}(p_{data},p_g)$$
+
+      The minimum is $-\log4\approx-1.386$ (natural logs), only at $p_g=p_{data}$, where $D^*=\tfrac12$. With disjoint supports, $\mathrm{JSD}=\log2$ and $C=0$. PML2's version with weights $\tfrac12$ gives $\mathrm{JSD}-\log2$.
+    source: Goodfellow et al. 2014 §4.1 (Thm 1); Murphy PML2 §26.2.2
+
+  - id: f4
+    front: With $D^*$ frozen at the current generator, the non-saturating loss $-\log D(G(z))$ follows the gradient of which divergence? What does each term do?
+    back: |
+      $$\mathrm{KL}(p_g\|p_{data})-2\,\mathrm{JSD}(p_g,p_{data})$$
+
+      The reverse KL heavily penalizes fakes off the data and barely penalizes missing modes, so it is mode-seeking. The $-2\,\mathrm{JSD}$ term has the "wrong" sign and pushes the distributions apart (Arjovsky & Bottou, Thm 2.5).
+    source: Arjovsky & Bottou 2017 §2.2.2 (Thm 2.5)
+
+  - id: f5
+    front: Define the Dirac-GAN and give the eigenvalues of the gradient field at equilibrium, with and without an R1 penalty of weight $\gamma$.
+    back: |
+      Data $\delta_0$, generator $\delta_\theta$, discriminator logit $\psi x$. Equilibrium $\theta=\psi=0$.
+      - Unregularized: $\pm\tfrac i2$. The flow conserves $\theta^2+\psi^2$ and simultaneous GD spirals out.
+      - With R1: $-\frac\gamma2\pm\sqrt{\gamma^2/4-1/4}$. These converge for any $\gamma>0$, with no rotation at $\gamma\ge1$.
+    source: Mescheder et al. 2018 §2.2 (Lemmas 2.2–2.4), §3.3 (Lemma 3.3)
+
+  - id: f6
+    front: State the R1 and R2 penalties. Who are they applied to, and what is their effect?
+    back: |
+      $$\begin{aligned} R_1&=\tfrac\gamma2\,\mathbb E_{p_{data}}\|\nabla_xD_\psi(x)\|^2 \\ R_2&=\tfrac\gamma2\,\mathbb E_{p_\theta}\|\nabla_xD_\psi(x)\|^2 \end{aligned}$$
+
+      They are subtracted from the discriminator's objective, with $D_\psi$ = the logit. They are zero-centred: they push $D$ toward zero input-gradient on real data (R1) or on fakes (R2), i.e. toward the equilibrium discriminator, without moving the equilibrium. Thm 4.1 gives local convergence even on low-dimensional manifolds (realizable case). On the Dirac-GAN, by contrast, unregularized training, WGAN and WGAN-GP with fixed critic steps fail to converge.
+    source: Mescheder et al. 2018 §4.1–4.2 (eqs. 9–10, Thm 4.1), Table 1
+
+  - id: f7
+    front: Salimans et al. (2016) GAN remedies, one line each.
+    back: |
+      - **Feature matching:** $G$ matches the mean of an intermediate $D$ layer on real vs fake.
+      - **Minibatch discrimination:** $D$ gets cross-sample similarity features, so it can spot a batch with no diversity.
+      - **Historical averaging:** penalize $\|\theta-\text{running mean of past }\theta\|^2$.
+      - **One-sided label smoothing:** real target $0.9$, fake target $0$.
+    source: Salimans et al. 2016 §3.1–3.4
+
+  - id: f8
+    front: Conditional GAN objective, and ways to give the condition $y$ to the discriminator.
+    back: |
+      $$\begin{aligned} \min_G\max_D\;&\mathbb E[\log D(x\mid y)] \\ &+\mathbb E[\log(1-D(G(z\mid y)\mid y))] \end{aligned}$$
+
+      Ways to condition $D$: concatenate an embedding of $y$ to its input or to features, inject $y$ at several layers, use a projection discriminator, or add an auxiliary classification loss on $y$. $D$ must see $y$, or $G$ can ignore it.
+    source: Mirza & Osindero 2014 §3.2; Murphy PML2 §26.4
+
+  - id: f9
+    type: open
+    front: Derive the optimal discriminator, then show that with it the generator minimizes a Jensen–Shannon divergence. State the assumptions.
+    back: |
+      1. By the law of the unconscious statistician, $V=\int p_{data}\log D+p_g\log(1-D)\,dx$.
+      2. Pointwise: $f(y)=a\log y+b\log(1-y)$ gives $f'=a/y-b/(1-y)=0$, so $y=a/(a+b)$. And $f''<0$, so it is a maximum. Hence $D^*=p_{data}/(p_{data}+p_g)$.
+      3. Substitute, and note $p_{data}+p_g=2m$ with $m$ the mixture. Each expectation becomes $\mathrm{KL}(\cdot\|m)-\log2$, so $C(G)=-\log4+2\,\mathrm{JSD}$.
+      4. $\mathrm{JSD}\ge0$, with equality iff $p_g=p_{data}$. So the global minimum is $-\log4$, with $D^*=\tfrac12$.
+
+      Assumptions: $D$ optimal at every step, infinite capacity, and (for the convergence claim, Prop. 2) updates of $p_g$ in function space, where the criterion is convex. None of these hold for networks trained by alternating SGD. In practice the non-saturating loss is used, whose implicit objective is $\mathrm{KL}(p_g\|p_{data})-2\,\mathrm{JSD}$.
+    source: Goodfellow et al. 2014 §4.1–4.2; Arjovsky & Bottou 2017 §2.2.2
+
+  - id: f10
+    type: open
+    front: Explain why GAN training can fail to converge even with an arbitrarily small learning rate, and how a zero-centred gradient penalty helps.
+    back: |
+      - **A game, not a minimization.** Each player descends its own loss. Near equilibrium, the Jacobian of the joint gradient field can have purely imaginary eigenvalues, which means rotation.
+      - **Bilinear toy $xy$.** The continuous flow conserves $x^2+y^2$ and circles forever. Simultaneous steps multiply it by $1+h^2$ (spiral out). Alternating steps cycle for $h<2$. So a small step size cannot help: the exact flow never arrives.
+      - **Dirac-GAN** (data $\delta_0$, $G=\theta$, logit $\psi x$). The same rotation, with eigenvalues $\pm i/2$. At $\theta=0$ the objective ignores $\psi$, so $D$ is never pushed back to a flat slope and keeps flinging $G$ past the data. In high dimensions this corresponds to $D$ keeping gradients orthogonal to the data manifold.
+      - **R1**, $\frac\gamma2\mathbb E_{data}\|\nabla_xD\|^2$, adds $-\gamma\psi$ to $D$'s dynamics. The eigenvalues become $-\gamma/2\pm\sqrt{\gamma^2/4-1/4}$, with negative real part, so the iterates converge locally. It is zero at the equilibrium discriminator, so the solution doesn't move.
+      - Mescheder et al. also show instance noise converges. WGAN and WGAN-GP with a fixed number of critic steps do not converge on this example, and TTUR doesn't help here.
+    source: Goodfellow 2016 tutorial §5.1, §8.2; Mescheder et al. 2018 §2–4
+
+  - id: f11
+    type: open
+    front: "Interview question: what is mode collapse, why does it happen, how would you detect it, and what would you try?"
+    back: |
+      - **What:** $G$ maps many $z$ to a few outputs. Partial collapse (shared textures, the same object from different views) is common. Mode hopping is cycling between modes as $D$ catches up.
+      - **Why:** (i) Simultaneous play can act like $\max_D\min_G$, where $G$'s best response is a single point $D$ likes. (ii) The non-saturating gradient follows $\mathrm{KL}(p_g\|p_{data})-2\mathrm{JSD}$, and the reverse KL barely charges for missing modes. (iii) $D$ scores samples independently, so nothing pushes outputs apart. Sources disagree on how much (ii) matters: Goodfellow notes forward-KL-approximating GANs collapse too.
+      - **Detect:** low recall with high precision (k-NN manifold metrics), duplicates among nearest neighbours of samples, low within-class diversity, and on toy data, counting covered modes.
+      - **Try:** minibatch discrimination or batch-level features, feature matching, R1 or spectral normalization for stabler dynamics, a larger batch, more $D$ capacity, and one-sided label smoothing.
+    source: Goodfellow 2016 tutorial §5.1.1; Arjovsky & Bottou 2017 §2.2.2; Salimans et al. 2016 §3; Murphy PML2 §26.3.3; Kynkäänniemi et al. 2019 §5
+
+  - id: f12
+    type: open
+    front: Why did diffusion models displace GANs for image synthesis, and where are adversarial losses still used?
+    back: |
+      - **Stability.** A GAN is a two-player game with no monotone loss, and it needs careful hyperparameters and regularizers to avoid collapse. Diffusion trains on a stationary regression objective (denoising), which is a plain minimization.
+      - **Coverage.** GANs trade diversity for fidelity and capture less of the distribution. Diffusion is likelihood-based (a weighted ELBO) and covers modes.
+      - **Scaling.** GANs are difficult to scale and to apply to new domains. Diffusion models were found to improve reliably with more compute (Nichol & Dhariwal, as summarized by Dhariwal & Nichol).
+      - **What GANs keep:** one-pass sampling.
+      - **Where adversarial losses live on:** patch-based adversarial plus perceptual losses in VQGAN and latent-diffusion autoencoders (sharp reconstructions), super-resolution, and adversarial diffusion distillation for 1–4-step generation.
+    source: Dhariwal & Nichol 2021 §1; Rombach et al. 2022 §3.1; Murphy PML2 §26.3.3
+
+reading:
+  - title: "Goodfellow et al. 2014, Generative Adversarial Nets, §3–4"
+    url: https://arxiv.org/abs/1406.2661
+    kind: paper
+    note: The value function, Algorithm 1, the optimal discriminator (Prop. 1) and the −log 4 + 2·JSD theorem. Short and readable.
+  - title: "Goodfellow 2016, NIPS 2016 Tutorial: Generative Adversarial Networks, §3.2, §4.2, §5.1, §8.2"
+    url: https://arxiv.org/abs/1701.00160
+    kind: paper
+    note: The cost functions (minimax, non-saturating, maximum-likelihood game), one-sided label smoothing, mode collapse via min–max vs max–min, and the xy game solved in closed form.
+  - title: "Arjovsky & Bottou 2017, Towards Principled Methods for Training GANs, §2"
+    url: https://arxiv.org/abs/1701.04862
+    kind: paper
+    note: Perfect discriminators on low-dimensional supports, vanishing minimax gradients, and the KL − 2·JSD objective of the −log D loss.
+  - title: "Mescheder, Geiger & Nowozin 2018, Which Training Methods for GANs do actually Converge?, §2–4"
+    url: https://arxiv.org/abs/1801.04406
+    kind: paper
+    note: The Dirac-GAN, an eigenvalue analysis of which training methods converge, and the R1/R2 penalties with a local convergence proof.
+  - title: "Murphy, Probabilistic Machine Learning: Advanced Topics, §26.2–26.4"
+    url: https://probml.github.io/pml-book/book2.html
+    kind: book
+    note: The learning-by-comparison view (density ratios, f-divergences, IPMs), GAN losses, convergence analysis including the Dirac-GAN, and conditional GANs.

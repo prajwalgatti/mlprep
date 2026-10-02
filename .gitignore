@@ -1,0 +1,12 @@
+build/
+DerivedData/
+*.xcresult
+xcuserdata/
+.DS_Store
+__pycache__/
+tools/figures/_previews/
+sources/*
+!sources/INDEX*.md
+build/
+Config/Local.xcconfig
+docs/design-before/

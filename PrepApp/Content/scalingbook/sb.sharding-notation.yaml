@@ -1,0 +1,370 @@
+id: sb.sharding-notation
+area: scalingbook
+title: "Sharded Arrays: Meshes and Sharding Notation"
+summary: The book's notation for splitting arrays over a device mesh (A[I_X, J_Y]), how to compute per-device and total memory, how JAX expresses the same thing, and the first sharded matmul rule, which needs no communication at all.
+order: 50
+level: core
+tags: [scaling-book, sharding, parallelism, jax]
+prereqs: [sb.tpu-networking]
+
+explainer:
+  - title: Why shard, and two kinds of shape
+    source: Scaling Book ch. 3 (Sharding) §"Partitioning Notation and Collective Operations"
+    body: |
+      Training on ten thousand chips computes the same function as training on one. What changes is where the numbers live. A large model's weights, optimizer state and activations do not fit in one chip's HBM, so each array is split into pieces stored on different chips. The book calls this **sharding** (or partitioning).
+
+      Memory is not the only reason. Even when a model fits on fewer chips, spreading it over more gives more FLOPs/s, which shortens training steps or cuts inference latency. The art of scaling is choosing shardings that keep the computation efficient.
+
+      Every sharded array has two shapes:
+
+      - its **global** (logical) shape: the shape of the whole array, as if unsharded;
+      - its **local** (device) shape: the shape of the piece one device actually stores.
+
+      **Example.** A $(4, 128)$ array split over 4 devices, two ways along each dimension, has global shape $(4, 128)$ and local shape $(2, 64)$ on every device. Each device stores a quarter of the bytes.
+
+      The local shape is what determines memory use per chip, and, as later lessons show, how much each chip must compute and communicate. The notation below lets us read the local shape straight off the description of a sharding.
+  - title: Meshes and the sharding notation
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    body: |
+      **Device mesh.** Arrange the devices in a 2D or 3D grid and give each grid axis a name, conventionally $X$, $Y$, $Z$. For example, 4 TPUs as a $2\times2$ grid with axes $X$ and $Y$: `Mesh({'X': 2, 'Y': 2})`. Write $|X|$ for the number of devices along axis $X$.
+
+      **Sharding.** Name each array dimension with a letter and attach, as a subscript, the mesh axis it is split over. For a matrix with dimensions $I$ and $J$:
+
+      - $A[I_X, J_Y]$: dimension $I$ is split into $|X|$ equal blocks along mesh axis $X$, and $J$ into $|Y|$ blocks along $Y$. Device $(x, y)$ holds row block $x$, column block $y$.
+      - Local shape: $(|I|/|X|,\ |J|/|Y|)$.
+
+      On the $2\times2$ mesh, each device of $A[I_X, J_Y]$ holds one quarter.
+
+      ![Which device holds each block of A under four shardings on a 2×2 mesh. Split cells are held by several devices; in the fully replicated panel every device holds every block.](sb.sharding-notation/sharding-patterns)
+
+      A dimension with no subscript is not split: every device along the relevant mesh axes has all of it. The book describes a sharding completely by the mesh (axis names and sizes) plus these subscripts.
+  - title: Replication, multi-axis sharding, and one rule
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    body: |
+      Three more cases complete the notation.
+
+      **Replication.** $A[I, J]$ with no subscripts is **fully replicated**: every device stores the whole array. $A[I_X, J]$ splits rows over $X$ but not over $Y$, so devices that differ only in their $Y$ coordinate hold identical copies. The array is **partially replicated** across $Y$.
+
+      **Several axes on one dimension.** $A[I_{XY}, J]$ treats $X$ and $Y$ as one flattened axis of $|X|\cdot|Y|$ devices and splits $I$ into that many blocks. The order of subscripts sets the order in which blocks are laid out over the grid, so $A[I_{XY}, J]$ and $A[I_{YX}, J]$ put the same-sized blocks on different devices.
+
+      **A mesh axis can be used only once per array.** $A[I_X, J_X]$ is forbidden. Once axis $X$ has been used to split $I$, it is "spent"; splitting $J$ over it too has no consistent meaning.
+
+      **Memory accounting.** If an array has $S$ bytes and its subscripts use mesh axes whose sizes multiply to $P$, each device holds $S/P$ bytes. The mesh has $N$ devices in total, so all devices together hold $N\cdot S/P$ bytes: $N/P$ complete copies. The factor $N/P$ is the product of the sizes of the mesh axes the array does **not** use.
+  - title: Worked examples of memory accounting
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding", Question 1
+    body: |
+      **Example 1** (book pop quiz). $\text{fp32}[1024, 4096]$ with sharding $A[I_{XY}, J]$ on mesh $\{X{:}\,8, Y{:}\,2\}$.
+
+      - $I$ is split over $8\cdot2 = 16$ devices: local shape $\text{fp32}[64, 4096]$.
+      - Bytes per device: $4\cdot64\cdot4096 = 1$ MiB.
+      - Reading it from HBM on an H100 at $3.4\times10^{12}$ B/s takes about $0.3$ µs, though a transfer this small would in practice be dominated by fixed overheads.
+
+      **Example 2** (book pop quiz). $\text{int8}[128, 2048]$ with $A[I_{XY}, J]$ on $\{X{:}\,2, Y{:}\,8, Z{:}\,2\}$, 32 devices.
+
+      - Local shape $\text{int8}[128/16, 2048] = [8, 2048]$: 16 KiB per device.
+      - $Z$ is unused, so there are $|Z| = 2$ complete copies: total $2 \times 128 \times 2048 = 512$ KiB. Check: $32 \times 16$ KiB $= 512$ KiB.
+
+      **Example 3** (book Q1). $A[I_X, J, K, \ldots]$ on $\{X{:}\,4, Y{:}\,8, Z{:}\,2\}$. Each device holds $1/4$ of the array, and there are $|Y|\cdot|Z| = 16$ devices per distinct shard. Total bytes across all chips are 16× the size of one copy.
+
+      The pattern in all three: divide by the axes you use, multiply by the axes you don't.
+
+      **One more freedom.** Mesh axes need not match hardware axes one to one. A $4\times4\times4$ TPU v5p cube can be described as the 2D mesh $\{X{:}\,16, Y{:}\,4\}$, with $X$ spanning two physical axes. This matters later: an axis that spans several physical axes has more links, and so more bandwidth.
+  - title: How JAX writes the same thing
+    source: Scaling Book ch. 3 (Sharding) §"How do we describe this in code?"; Scaling Book ch. 10 §"How Does Parallelism Work in JAX?"
+    body: |
+      JAX's sharding API mirrors the notation almost exactly.
+
+      ```python
+      mesh = jax.make_mesh((4, 2), ('X', 'Y'))
+      def P(*a):
+          return jax.NamedSharding(
+              mesh, jax.sharding.PartitionSpec(*a))
+      A = jnp.zeros((8, 2048), jnp.bfloat16,
+                    device=P('X', 'Y'))
+      B = jnp.zeros((2048, 8192), jnp.bfloat16,
+                    device=P(None, 'Y'))
+      ```
+
+      - `jax.make_mesh` names an 8-device $4\times2$ grid.
+      - A `PartitionSpec` lists, per array dimension, the mesh axis it is split over, or `None`. `P('X', 'Y')` is $A[I_X, J_Y]$; `P(None, 'Y')` is $B[J, K_Y]$; `P(('X', 'Y'))` would be $[I_{XY}]$.
+
+      Local shapes: $A$ is $[8/4, 2048/2] = [2, 1024]$ per device, $B$ is $[2048, 8192/2] = [2048, 4096]$.
+
+      **Arrays behave as if unsharded.** `B.shape` reports the global shape $(2048, 8192)$; `B.addressable_shards` reveals the local pieces. You write ordinary code, for example `jnp.einsum('BD,DF->BF', A, B)` inside `jax.jit` with an `out_shardings` argument. The compiler then inserts whatever communication the shardings require.
+
+      Lesson 300 covers the three JAX modes in detail. The rest of this chapter explains what communication gets inserted and what it costs, which is what you need to judge whether the compiler did something sensible.
+  - title: Computing on sharded arrays
+    source: Scaling Book ch. 3 (Sharding) §"Computation With Sharded Arrays"
+    body: |
+      What does sharding cost when we compute?
+
+      **Elementwise operations cost nothing extra**, provided the operands are sharded the same way: $A[I_X, J_Y] + B[I_X, J_Y]$ is just each device adding its own blocks. (If they were sharded differently, one would first have to be moved to match.)
+
+      **Matrix multiplies** are where communication appears, and nearly all of a model's work is matmuls. The useful mental model is **block matrix multiplication**. Cut both matrices into blocks; the product's blocks follow the ordinary rule with blocks in place of numbers:
+
+      $$\begin{aligned} C_{00} &= A_{00}B_{00} + A_{01}B_{10} \\ C_{01} &= A_{00}B_{01} + A_{01}B_{11} \end{aligned}$$
+
+      and so on. Each output block is a sum, over the **contracted** dimension $J$ (the one summed away, shared by $A$ and $B$), of products of input blocks.
+
+      So a sharded matmul reduces to three steps: move some blocks between devices, multiply blocks locally, and add up partial results. The whole question is which blocks must move, and how much that costs. The book sorts every case into four types, decided by how the contracted dimension is sharded. This lesson does the easy one; the next does the rest.
+  - title: "Case 1: the contracted dimension is not sharded"
+    source: Scaling Book ch. 3 (Sharding) §"Case 1"
+    body: |
+      **Rule.** If neither input is sharded along the contracted dimension, and the two inputs don't use the same mesh axis on their other dimensions, the multiply needs **no communication**. The output simply inherits the inputs' shardings:
+
+      $$A[I_X, J]\cdot B[J, K_Y] \rightarrow C[I_X, K_Y].$$
+
+      **Why.** Device $(x, y)$ holds row block $x$ of $A$, with all of $J$, and column block $y$ of $B$, also with all of $J$. Output block $C_{xy}$ needs exactly those two pieces and nothing else, so each device computes its own block of $C$ completely.
+
+      ![Case 1 on a 2×2 mesh: device (x, y) forms output block (x, y) from row block x of A and column block y of B](sb.sharding-notation/case1-blocks)
+
+      The same reasoning covers the partial versions: $A[I, J]\cdot B[J, K] \to C[I, K]$; $A[I_X, J]\cdot B[J, K]\to C[I_X, K]$; $A[I, J]\cdot B[J, K_Y]\to C[I, K_Y]$.
+
+      **Hidden cost: duplicated work.** In $A[I_X, J]\cdot B[J, K] \to C[I_X, K]$ on an $\{X, Y\}$ mesh, the $|Y|$ devices sharing an $x$ all compute the same block. Each device does $2|I||J||K|/|X|$ FLOPs, so a fraction $1 - 1/|Y|$ of the cluster's FLOPs is redundant. Case 1 is communication-free, but not necessarily compute-efficient.
+  - title: What interviewers probe
+    source: Scaling Book ch. 3 (Sharding) §"What Have We Learned?"
+    body: |
+      - *What does $A[I_X, J_Y]$ mean?* $I$ split over mesh axis $X$, $J$ over $Y$; device $(x, y)$ holds block $(x, y)$; local shape $(|I|/|X|, |J|/|Y|)$.
+      - *How much memory per device, and in total?* Divide by the sizes of the axes used; the total is that times $N$, i.e. one copy times the sizes of the unused axes.
+      - *Is $A[I_X, J_X]$ legal?* No; a mesh axis can split only one dimension of an array.
+      - *Difference between $I_{XY}$ and $I_{YX}$?* Same block size, different assignment of blocks to devices.
+      - *When does a sharded matmul need no communication?* When the contracted dimension is unsharded in both inputs and no mesh axis appears on both inputs' other dimensions (Case 1).
+      - *Is the communication-free case free?* No communication, but replicated axes repeat the same FLOPs.
+      - *How does JAX express it?* `Mesh` + `PartitionSpec` (`NamedSharding`); arrays keep their global shape, and `jit` inserts the collectives.
+  - title: Key results
+    source: Scaling Book ch. 3 (Sharding)
+    body: |
+      $$A[I_X, J_Y]: \text{ local shape } \Big(\frac{|I|}{|X|}, \frac{|J|}{|Y|}\Big)$$
+
+      $$\text{bytes per device} = \frac{S}{\prod_\text{used}|X_i|}$$
+
+      $$\text{copies} = \prod_\text{unused}|X_i|$$
+
+      $$A[I_X, J]\cdot B[J, K_Y] \rightarrow C[I_X, K_Y]$$
+
+      The last line is Case 1, which needs no communication.
+
+      - A mesh axis may appear at most once per array; $I_{XY}$ flattens two axes, and order matters for placement.
+      - Unsubscripted dimensions are replicated along unused mesh axes.
+      - Elementwise ops on identically sharded arrays need no communication.
+      - Mesh axes are logical: one can span several physical axes.
+      - JAX: `P('X', 'Y')` is $[I_X, J_Y]$, `P(None, 'Y')` is $[J, K_Y]$; `.shape` is global.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    prompt: |
+      A $\text{bf16}[4096, 8192]$ array has sharding $A[I_X, J_Y]$ on mesh $\{X{:}\,4, Y{:}\,8\}$. What is its local shape, and how many bytes does each device hold?
+    correct: $[1024, 1024]$, 2 MiB
+    wrong:
+      - $[1024, 8192]$, 16 MiB
+      - $[512, 2048]$, 2 MiB
+      - $[1024, 1024]$, 1 MiB
+    explanation: |
+      $I$ is split 4 ways ($4096/4 = 1024$) and $J$ 8 ways ($8192/8 = 1024$). In bf16, $2\cdot1024\cdot1024 = 2$ MiB. $[512, 2048]$ swaps which axis splits which dimension; 1 MiB forgets that bf16 has 2 bytes per element.
+  - id: q2
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding", Question 1
+    prompt: |
+      The same $\text{bf16}[4096, 8192]$ array is instead sharded $A[I_X, J]$ on $\{X{:}\,4, Y{:}\,8\}$. How much memory does it occupy summed over all 32 devices?
+    correct: 512 MiB, i.e. 8 full copies
+    wrong:
+      - 64 MiB, i.e. one full copy
+      - 16 MiB, i.e. one quarter of a copy
+      - 2048 MiB, i.e. 32 full copies
+    explanation: |
+      Each device holds $[1024, 8192]$ = 16 MiB. Over 32 devices that is 512 MiB. One copy is $2\cdot4096\cdot8192 = 64$ MiB, so there are $512/64 = 8 = |Y|$ copies, one per value of the unused axis. 32 copies would mean full replication.
+  - id: q3
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    prompt: |
+      On mesh $\{X{:}\,4, Y{:}\,2\}$, which sharding of a matrix $A[I, J]$ is **not** allowed?
+    correct: $A[I_X, J_X]$
+    wrong:
+      - $A[I_{XY}, J]$
+      - $A[I_Y, J_X]$
+      - $A[I, J]$
+    explanation: |
+      A mesh axis can split at most one dimension of an array; using $X$ for both $I$ and $J$ has no consistent meaning. Flattening two axes onto one dimension ($I_{XY}$), using the axes in either order, and full replication are all valid.
+  - id: q4
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    prompt: |
+      How do the shardings $A[I_{XY}, J]$ and $A[I_{YX}, J]$ differ on a $\{X{:}\,4, Y{:}\,2\}$ mesh?
+    correct: Same per-device memory; blocks go to different devices
+    wrong:
+      - One splits I into 8 blocks, the other into only 4
+      - They are identical in every respect, placement included
+      - One of them also replicates the whole array along Y
+    explanation: |
+      Both split $I$ into $4\cdot2 = 8$ blocks, so local shapes match. The subscript order sets how blocks are laid out over the grid, so which device holds which block differs. That matters when another array's sharding must line up with this one.
+  - id: q5
+    source: Scaling Book ch. 3 (Sharding), Question 1
+    prompt: |
+      An array has sharding $A[I_X, J_Z]$ on mesh $\{X{:}\,4, Y{:}\,8, Z{:}\,2\}$. Summed over all devices, how many complete copies of the array are stored?
+    correct: 8
+    wrong:
+      - 16
+      - 2
+      - 64
+    explanation: |
+      The used axes $X$ and $Z$ split the array into $4\cdot2 = 8$ distinct shards. There are $64$ devices, so each shard is stored $64/8 = 8$ times, the size of the unused axis $Y$. 16 would be the answer for $A[I_X, J]$ (unused $Y\cdot Z$).
+  - id: q6
+    source: Scaling Book ch. 3 (Sharding) §"Case 1"
+    prompt: |
+      What is the result, and what communication is needed, for $A[I_X, J]\cdot B[J, K_Y]$ on a 2D mesh?
+    correct: $C[I_X, K_Y]$ with no communication
+    wrong:
+      - $C[I, K]$ after an AllGather of both inputs
+      - $C[I_X, K_Y]$ after an AllReduce over Y
+      - $C[I_X, K]$ after an AllGather of B over Y
+    explanation: |
+      The contracted dimension $J$ is whole on every device, and $X$ and $Y$ are different axes. Device $(x, y)$ has row block $x$ of $A$ and column block $y$ of $B$, which is exactly what block $(x, y)$ of $C$ needs. Nothing is partially summed, so no AllReduce is required.
+  - id: q7
+    source: Scaling Book ch. 3 (Sharding) §"Case 1"; Scaling Book ch. 4 §"Counting Dots"
+    prompt: |
+      $A[I_X, J]\cdot B[J, K_Y]$ with $|I| = |J| = |K| = 8192$ in bf16 runs on a $\{X{:}\,4, Y{:}\,2\}$ mesh of TPU v5e chips ($1.97\times10^{14}$ FLOPs/s). How long does the matmul take per device, if compute-bound?
+    correct: About 0.7 ms
+    wrong:
+      - About 5.6 ms
+      - About 1.4 ms
+      - About 0.35 ms
+    explanation: |
+      Each device computes a $[2048, 4096]$ block of $C$ with full $J$: $2\cdot2048\cdot8192\cdot4096 \approx 1.37\times10^{11}$ FLOPs, or ≈ 0.70 ms. 5.6 ms is the whole unsharded matmul on one chip; 1.4 ms would split only over $X$.
+  - id: q8
+    source: Scaling Book ch. 3 (Sharding) §"Case 1"; Scaling Book ch. 4, Question 2
+    prompt: |
+      $A[I_X, J]\cdot B[J, K]\rightarrow C[I_X, K]$ runs on a $\{X{:}\,2, Y{:}\,4\}$ mesh. What fraction of the FLOPs done by the 8 devices is redundant?
+    correct: Three quarters
+    wrong:
+      - None, because no communication is needed
+      - Half
+      - One quarter
+    explanation: |
+      Neither input is split over $Y$, so the four devices that share an $x$ coordinate compute the same block of $C$. Each device does $2|I||J||K|/2$ FLOPs; the cluster does 4× the useful work, so three quarters is redundant. Needing no communication is a different question from using compute well.
+  - id: q9
+    source: Scaling Book ch. 3 (Sharding) §"How do we describe this in code?"
+    prompt: |
+      On `mesh = jax.make_mesh((4, 2), ('X', 'Y'))`, an array of global shape $(8, 2048)$ is created with `P('X', 'Y')`. What does `A.shape` return, and what is each device's local shape?
+    correct: $(8, 2048)$ globally; $(2, 1024)$ per device
+    wrong:
+      - $(2, 1024)$ globally; $(2, 1024)$ per device
+      - $(8, 2048)$ globally; $(4, 1024)$ per device
+      - $(8, 2048)$ globally; $(2, 2048)$ per device
+    explanation: |
+      JAX arrays report their global shape; the pieces are in `A.addressable_shards`. `P('X', 'Y')` splits dimension 0 over $|X| = 4$ and dimension 1 over $|Y| = 2$: $(8/4, 2048/2) = (2, 1024)$. $(2, 2048)$ would be `P('X', None)`.
+  - id: q10
+    source: Scaling Book ch. 3 (Sharding) §"Computation With Sharded Arrays"
+    prompt: |
+      On a $\{X, Y\}$ mesh, which of these elementwise operations requires communication?
+    correct: $A[I_X, J] + B[I, J_X]$
+    wrong:
+      - $A[I_X, J_Y] + B[I_X, J_Y]$
+      - $A[I, J] + B[I, J]$
+      - $\exp(A[I_X, J_Y])$
+    explanation: |
+      Elementwise ops are free only when operands are sharded identically, so each device already holds matching blocks. In $A[I_X, J] + B[I, J_X]$, device $x$ holds a row block of $A$ but a column block of $B$; one operand must be re-laid out first. The other three operate on matching (or fully replicated) blocks.
+  - id: q13
+    source: Scaling Book ch. 3 (Sharding) §"How do we describe this in code?"; Scaling Book ch. 3 §"A unified notation for sharding"
+    prompt: |
+      On a mesh with axes `'X'` and `'Y'`, which statement about JAX `PartitionSpec`s for a matrix is **false**?
+    correct: "`P(('X', 'Y'))` and `P('X', 'Y')` describe the same sharding"
+    wrong:
+      - "`P(None, 'Y')` splits only the second dimension, over Y"
+      - "`P('X', None)` replicates each row block across the Y axis"
+      - "`P()` means every device holds the whole matrix"
+    explanation: |
+      `P(('X', 'Y'))` puts both mesh axes on the **first** dimension, $A[I_{XY}, J]$; `P('X', 'Y')` splits the first dimension over $X$ and the second over $Y$, $A[I_X, J_Y]$. Same bytes per device, different blocks. The other three statements are correct.
+  - id: q14
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"; Scaling Book ch. 2 §"TPU specs"
+    prompt: |
+      A $\text{bf16}[8192, 4096]$ array has sharding $A[I_{XZ}, J_Y]$ on a TPU v5e mesh $\{X{:}\,2, Y{:}\,8, Z{:}\,4\}$ (HBM $8.2\times10^{11}$ B/s). How many bytes does each device hold, how many copies exist in total, and how long does one device take to read its shard?
+    correct: 1 MiB; 1 copy; about 1.3 µs
+    wrong:
+      - 1 MiB; 4 copies; about 1.3 µs
+      - 8 MiB; 1 copy; about 10 µs
+      - 2 MiB; 2 copies; about 2.6 µs
+    explanation: |
+      $I$ is split over $X\cdot Z = 8$ devices and $J$ over $Y = 8$: local shape $[1024, 512]$, i.e. $2\cdot1024\cdot512 = 1$ MiB. Every mesh axis is used, so there is exactly one copy (64 devices × 1 MiB = 64 MiB = the array). Reading it: $1.05\times10^6/8.2\times10^{11} \approx 1.3$ µs. "4 copies" forgets that $Z$ is used on $I$.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    front: What does the sharding $A[I_X, J_Y]$ mean, and what is the local shape?
+    back: |
+      Dimension $I$ is split over mesh axis $X$, $J$ over $Y$; device $(x, y)$ holds block $(x, y)$. Local shape $(|I|/|X|, |J|/|Y|)$.
+  - id: f2
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    front: An array of $S$ bytes is sharded over mesh axes whose sizes multiply to $P$, on a mesh of $N$ devices. Bytes per device and total?
+    back: |
+      $S/P$ per device; $N S/P$ in total, i.e. $N/P$ copies (the product of the unused axis sizes).
+  - id: f3
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    front: What do $A[I, J]$, $A[I_X, J]$ and $A[I_{XY}, J]$ mean on an $\{X, Y\}$ mesh?
+    back: |
+      Fully replicated; rows split over $X$ and replicated across $Y$; rows split over all $|X||Y|$ devices (subscript order sets block placement).
+  - id: f4
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    front: Why is $A[I_X, J_X]$ forbidden?
+    back: |
+      Each mesh axis can split at most one dimension of an array. Once $X$ splits $I$ it is "spent".
+  - id: f5
+    source: Scaling Book ch. 3 (Sharding) §"Case 1"
+    front: State Case 1 of sharded matmuls.
+    back: |
+      If the contracted dim is unsharded in both inputs (and no mesh axis is reused across their other dims), multiply locally with no communication; the output inherits the shardings, e.g. $A[I_X, J]\cdot B[J, K_Y]\to C[I_X, K_Y]$.
+  - id: f6
+    source: Scaling Book ch. 3 (Sharding) §"How do we describe this in code?"
+    front: How do JAX `PartitionSpec`s map onto the book's notation?
+    back: |
+      One entry per array dimension naming its mesh axis or `None`: `P('X', 'Y')` = $[I_X, J_Y]$, `P(None, 'Y')` = $[J, K_Y]$, `P(('X', 'Y'))` = $[I_{XY}]$. Arrays keep their global `.shape`; local pieces are in `.addressable_shards`.
+  - id: f7
+    source: Scaling Book ch. 3 (Sharding) §"Computation With Sharded Arrays"
+    front: When are elementwise ops on sharded arrays communication-free?
+    back: |
+      When all operands are sharded identically (or are replicated), so every device already holds matching blocks.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"A unified notation for sharding"
+    front: Explain the book's sharding notation to an interviewer, and show how to compute per-device and total memory for an array.
+    back: |
+      - A device mesh is a named grid of devices, e.g. `{X: 8, Y: 2}`.
+      - Subscripts say which mesh axis splits which array dimension: $A[I_X, J_Y]$, $A[I_{XY}, J]$; no subscript means not split.
+      - Each axis may be used once per array; subscript order fixes block placement.
+      - Per device: divide the array's bytes by the product of the used axis sizes.
+      - Total: multiply by the unused axis sizes (replication).
+      - Example: int8[128, 2048] as $A[I_{XY}, J]$ on {X: 2, Y: 8, Z: 2} → [8, 2048] = 16 KiB per device; 2 copies (Z) = 512 KiB total.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"Computation With Sharded Arrays", §"Case 1"
+    front: Using block matrix multiplication, explain why $A[I_X, J]\cdot B[J, K_Y]$ needs no communication, and what it can still waste.
+    back: |
+      - Block rule: $C_{xy} = \sum_j A_{xj} B_{jy}$, a sum over blocks of the contracted dim.
+      - Device $(x, y)$ holds all of row block $x$ of $A$ (every $j$) and all of column block $y$ of $B$.
+      - So it forms $C_{xy}$ completely; the output is naturally $C[I_X, K_Y]$.
+      - Communication appears only when the contracted dim is split, because then each device has only some terms of the sum.
+      - Waste: if an input is replicated along an axis the output also doesn't use (e.g. $A[I_X, J]\cdot B[J, K]$ on $\{X, Y\}$), devices along that axis repeat the same FLOPs.
+  - id: f10
+    type: open
+    source: Scaling Book ch. 3 (Sharding) §"How do we describe this in code?"; Scaling Book ch. 10 §"How Does Parallelism Work in JAX?"
+    front: Describe how JAX represents and computes on sharded arrays, and why you still need to understand communication costs.
+    back: |
+      - `jax.make_mesh` names devices; `NamedSharding(mesh, PartitionSpec(...))` places each array.
+      - Arrays expose the global shape; you write unsharded-looking code under `jax.jit`, optionally with `out_shardings`.
+      - The compiler propagates shardings and inserts collectives (AllGather, AllReduce, …) where operands don't line up.
+      - It can choose badly (e.g. a huge unnecessary AllGather), so you need to predict what communication a sharding implies and what it costs, then constrain intermediate shardings or write the communication by hand.
+
+reading:
+  - title: "Scaling Book ch. 3: Sharded Matrices and How to Multiply Them"
+    url: https://jax-ml.github.io/scaling-book/sharding/
+    kind: book
+    note: '"Partitioning Notation", "How do we describe this in code?" and Case 1; the colour diagrams of each sharding are worth a look.'
+  - title: "JAX docs: Distributed arrays and automatic parallelization"
+    url: https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html
+    kind: docs
+    note: Mesh, PartitionSpec and NamedSharding in practice, with visualized shardings.
+  - title: "Xu et al. (2021), GSPMD: General and Scalable Parallelization for ML Computation Graphs"
+    url: https://arxiv.org/abs/2105.04663
+    kind: paper
+    note: The compiler system behind this style of annotation-driven sharding, and how it propagates shardings.
+  - title: "Edward Yang, Computing sharding with einsum"
+    url: https://blog.ezyang.com/2026/01/computing-sharding-with-einsum/
+    kind: blog
+    note: A PyTorch-side writeup of the same rules for sharded matrix multiplication, recommended in the book's further reading.

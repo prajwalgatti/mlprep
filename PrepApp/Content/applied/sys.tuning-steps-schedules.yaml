@@ -1,0 +1,451 @@
+id: sys.tuning-steps-schedules
+area: applied
+title: "Tuning Playbook: Step Budgets and LR Schedules"
+summary: How long to train in compute-bound and non-compute-bound regimes, why learning rates should decay (the SGD noise floor), the common schedule families, and how to extend a schedule.
+order: 340
+level: intermediate
+tags: [tuning, learning-rate-schedule, training-budget, tuning-playbook]
+prereqs: [sys.tuning-batch-size]
+
+explainer:
+  - title: "Two regimes: compute-bound or not"
+    body: |
+      How many steps should each run take? The playbook first asks which regime the workload is in.
+
+      **Compute-bound.** Training is limited by how long we are willing to wait, not by data. Training longer or more efficiently keeps lowering the training loss, and with proper tuning the validation loss too. Here *speeding up training is the same as improving it*, and the optimal training time is "as long as we can afford".
+
+      **Not compute-bound.** We can afford to train as long as we like, and eventually more steps stop helping. The training loss can keep inching down while the validation loss stays flat, or rises (problematic overfitting). The job is to train long enough to reach the best result without wasting steps.
+
+      **The budget is a tension.** A generous budget makes tuning easier, especially for decay schedules, which interact strongly with the budget; with a stingy one, the schedule must be tuned to perfection. But long trials mean fewer experiments, and an oversized initial budget is hard to cut later, once the schedule has been tuned to it.
+
+      **Gradient variance costs steps.** In either regime, anything that increases the variance of gradients across batches slows progress per step, so reaching a given loss takes more steps. Three common culprits:
+      - a smaller batch size (the noise scale from the batch-size lesson);
+      - data augmentation (more varied examples, so gradients disagree more);
+      - some regularizers, such as dropout (random masks add noise).
+
+      Why? The next card shows that SGD hovers at a noise floor proportional to the gradient variance times the LR. More variance means a higher floor, so the run must decay to a smaller LR to get below it, and small LRs make slow progress. So when you add augmentation or dropout, expect to raise the step budget. When the optimizer or schedule improves, you may be able to lower it.
+    source: Tuning Playbook §"Determining the number of steps for each training run", §"Choosing the initial configuration"
+
+  - title: "Why the learning rate should decay: the noise floor"
+    body: |
+      ![Expected loss of SGD on a noisy quadratic with 30 eigendirections (exact recursion, synthetic model). A high constant LR stalls at its floor (dotted); a low LR is slow; decaying from high to low gets both.](sys.tuning-steps-schedules/noise-floor)
+
+      **Model** (the noisy quadratic model of Zhang et al. 2019). Take $L(x)=\tfrac12 hx^2$ (one Hessian eigendirection, curvature $h>0$). SGD sees $g=hx+\xi$. The assumptions: the noise is *additive*, drawn fresh each step independently of $x_t$, with mean 0 and constant variance $\sigma^2/B$, where $\sigma^2$ is the per-example gradient variance along this direction. The update is
+
+      $$x_{t+1}=(1-\eta h)\,x_t-\eta\,\xi_t.$$
+
+      **Mean (the "bias" part).** Taking expectations,
+
+      $$\mathbb{E}x_t=(1-\eta h)^t x_0,$$
+
+      which shrinks geometrically if $0<\eta h<2$. For $\eta h\le1$, a *larger* $\eta$ shrinks it faster.
+
+      **Variance (the "noise" part).** $x_t$ and $\xi_t$ are independent, so $v_{t+1}=(1-\eta h)^2v_t+\eta^2\sigma^2/B$. The fixed point $v^*$ solves $v^*\big(1-(1-\eta h)^2\big)=\eta^2\sigma^2/B$:
+
+      $$v^*=\frac{\eta\,\sigma^2}{B\,h\,(2-\eta h)}.$$
+
+      **The floor.** The stationary excess loss is
+
+      $$\tfrac12 h v^*=\frac{\eta\sigma^2}{2B(2-\eta h)}\approx\frac{\eta\sigma^2}{4B}.$$
+
+      The "≈" needs $\eta h\ll1$; as $\eta h\to2$ the floor blows up (the stability limit of the diagnostics lesson). Example: $\eta=0.1$, $\sigma^2=1$, $B=1$, small $h$ gives $\approx0.025$. In $d$ dimensions each eigendirection contributes its own floor, so the total is about $\eta\,\mathrm{tr}(C)/(4B)$, with $C$ the per-example gradient covariance. Real gradient noise shrinks as the loss falls and is correlated with $H$, so treat this as a model, not a law.
+
+      **What it means.** A constant LR never converges. It hovers at a floor proportional to $\eta/B$. A large $\eta$ removes the initial error fast but has a high floor; a small $\eta$ has a low floor but crawls, especially along low-curvature directions where $(1-\eta h)^t$ decays slowly. The best plan is a large LR early and a small one late, which is what a decay schedule does. The same formula shows that halving $\eta$ and doubling $B$ lower the floor equally, the basis of Smith et al.'s "don't decay the learning rate, increase the batch size". It also explains the playbook's remedies for noisy late-training metrics: decay the LR, use a larger batch, or average the iterates.
+    source: Zhang et al. 2019 §3.1 (eqs. 3–4); Smith et al. 2018 §2 (η/B equivalence); Tuning Playbook FAQ "What is the best learning rate decay schedule family?"
+
+  - title: "Schedule families"
+    body: |
+      ![Five schedules over a 10k-step run, each after 500 steps of linear warmup (shaded).](sys.tuning-steps-schedules/schedule-families)
+
+      Let $\eta_{max}$ be the peak LR, $w$ the warmup steps, $T$ the total steps, and $\tau=(t-w)/(T-w)\in[0,1]$ the fraction of the post-warmup run completed.
+      - **Linear warmup** (any family): $\eta_t=\eta_{max}\,t/w$ for $t<w$. The diagnostics lesson covers why.
+      - **Constant**: $\eta_t=\eta_{max}$. The playbook's recommended *starting* point, before any decay is added.
+      - **Step (piecewise constant)**: multiply by e.g. 0.1 at fixed fractions of training. This is the classic ResNet recipe.
+      - **Linear decay**: $\eta_t=\eta_{max}(1-\tau)$.
+      - **Cosine decay** (SGDR without restarts):
+
+      $$\eta_t=\eta_{min}+\tfrac12(\eta_{max}-\eta_{min})\big(1+\cos\pi\tau\big)$$
+
+      It stays near the peak early, falls fastest mid-run, and flattens near the end.
+      - **Inverse square root**: $\eta_t=\eta_{max}\sqrt{w/t}$ for $t\ge w$, from the original Transformer. It never reaches zero and is not tied to $T$.
+
+      **What the playbook says.**
+      - Which family is best is an **open problem**. It's unclear how to design rigorous experiments to settle it.
+      - It *is* confident that some **non-constant schedule matters, and that tuning it matters**. Different learning rates work best at different stages, which is the noise-floor argument, and a schedule makes it more likely you hit a good LR at each stage.
+      - As defaults it prefers **linear or cosine decay**. Many other families are probably fine.
+
+      Note that linear and cosine depend on $T$: their shape is tied to the planned run length. This is why the step budget and the schedule interact so strongly, and why schedules transfer poorly between run lengths.
+    source: Tuning Playbook FAQs "What is the best learning rate decay schedule family?", "Which learning rate decay should I use as a default?", §"Choosing the initial configuration"; Loshchilov & Hutter 2017 §3
+
+  - title: "Choosing max_train_steps when not compute-bound"
+    body: |
+      **Rule 1: never tune `max_train_steps` inside a study.** Pick one value and use it for every trial. If trials had different budgets, longer runs would win partly for that reason, and the comparison of other hyperparameters would be confounded.
+
+      **Rule 2: select checkpoints retrospectively.** Save checkpoints often, keep the best $N$ by validation metric, and pick the best at the end. Then training longer can *never* make the selected result worse (given frequent checkpoints), so when in doubt, err on the long side.
+
+      **Rule 3: let the best step tell you how to adjust.** For each trial, note the step where the best checkpoint occurred:
+      - always within the first 10% of training: the budget is far too long;
+      - consistently in the last 25%: train longer and re-tune the decay schedule.
+
+      **An initial guess from an LR sweep.** This assumes the training set can be fit almost perfectly with a constant LR. "Perfectly fit" is informal: with log loss the training loss keeps creeping down as the weights grow, so take the point where training error reaches about zero.
+      1. Find any configuration that fits the training set, with some step count $N$.
+      2. Run a constant-LR sweep (a grid is fine in 1-D) with no augmentation and no regularization, each for $N$ steps.
+      3. The step at which the fastest trial reaches perfect training performance is the first guess for `max_train_steps`.
+
+      **The self-deception trap.** If every LR in the sweep is too small, even the fastest trial is slow, and you'd conclude a huge budget is needed. Check that the best LR is not at the edge of the sweep.
+
+      **Keep revisiting.** The ideal step count changes with architecture or data. Augmentation and dropout add gradient noise and need more steps; a better-tuned optimizer or schedule may need fewer.
+    source: Tuning Playbook §"Deciding how long to train when training is not compute-bound", §"Algorithm for picking an initial candidate for max_train_steps…"
+
+  - title: "Compute-bound: tuning in rounds"
+    body: |
+      Should every trial run as long as we can afford? No: production-length trials leave time for very few experiments, while conclusions from 10%-length runs may not hold at 100%. The playbook's compromise is to **tune in rounds with increasing per-trial budgets**, usually 1–3, by default two:
+      - **Round 1**: many shorter runs to find good model and optimizer hyperparameters.
+      - **Round 2**: a few long runs on the best points, to get the final model.
+
+      **What transfers from short to long runs?** The authors' guesses, from most to least likely:
+      1. **Very likely**: fixes for early-training instability, namely *warmup length* and *initialization*. Instability shows up early, so short runs see it.
+      2. **Likely**: dramatic architecture wins (with counterexamples).
+      3. **Might**: optimizer hyperparameters (loosely), data augmentation, regularization. If the training set can't be fit, regularization may not help much anyway.
+      4. **Unlikely**: the **learning-rate schedule**.
+
+      **Why schedules transfer worst.** Linear and cosine schedules are defined relative to $T$. There is also a selection bias: Wu et al. (2018) showed that optimising LRs on a *short* horizon prefers step sizes too small by orders of magnitude. In the noise-floor model, lowering $\eta$ drops the loss at once (a lower floor), while the cost, slower progress on low-curvature directions, shows up only later.
+
+      **Where the playbook disagrees with Chinchilla.** Chinchilla's recipe, a cosine cycle matched to each run's length, worked across scales; the playbook cites it as suggesting that even decay schedules transfer. The authors don't believe this holds in general. Counterexample: an inverse-sqrt schedule tuned short and run long spends most steps at too small an LR (next card). Most schedules are "good enough" at extreme budgets, but tuning still pays.
+    source: Tuning Playbook §"Deciding how long to train when training is compute-bound", §"Round 1"; Wu et al. 2018 §1; Hoffmann et al. 2022 App. B
+
+  - title: "Round 2: extending a schedule without starving it"
+    body: |
+      ![Extending a 10k-step Round 1 schedule to 30k steps. Top: the inverse-sqrt tail (shaded) runs below anything Round 1 tested.](sys.tuning-steps-schedules/round2-extension)
+
+      The biggest question going from one round to the next is how to adjust the decay schedule. The common pitfall is **spending all the extra steps at too small a learning rate.**
+
+      **Worked example: inverse-sqrt decay.** With $w=1000$, $\eta_t=\eta_{max}\sqrt{1000/t}$.
+      - Round 1 ends at $t=10\text{k}$ with $\eta=\eta_{max}\sqrt{0.1}\approx0.32\,\eta_{max}$.
+      - Simply running to 30k continues the decay to $\eta_{max}\sqrt{1/30}\approx0.18\,\eta_{max}$.
+      - The last 20k steps, **two-thirds of Round 2**, run below Round 1's final LR, the smallest post-warmup LR Round 1 ever validated.
+
+      Most of the extra compute is spent in a regime that was never tuned, and at a small LR whose progress is slow (the noise-floor tradeoff).
+
+      **The playbook's speculative advice:** use the extra steps to *extend the time at high LR*.
+      - **Linear schedule**: keep the Round 1 decay *length* (e.g. the final 5k steps) and lengthen the constant phase before it.
+      - **Cosine**: keep the Round 1 peak LR and stretch the cosine to the new `max_train_steps`, as Chinchilla does by matching the cycle to the run.
+
+      **More rounds.** For mature teams with very expensive production runs, the compute-efficient ideal is many rounds with exponentially growing run lengths. Each round re-checks earlier choices, and new ideas are progressively de-risked at longer horizons. For most projects that is overkill, and two rounds suffice.
+    source: Tuning Playbook §"Round 2", §"Deciding how long to train when training is compute-bound"
+
+  - title: "Complicated schedules in papers"
+    body: |
+      Papers sometimes report odd piecewise schedules ("×0.2 at epoch 37, ×0.5 at epoch 61, …"). Readers wonder how anyone arrived at them.
+
+      **How they usually arise.** The schedule is tuned by hand against the validation set during a single run:
+      1. Start with a simple decay or a constant LR.
+      2. When validation performance stalls, pause, then resume with a steeper decay or a smaller constant LR.
+      3. Repeat until the deadline.
+
+      The resulting schedule is a record of one person's reactions to one run's validation curve.
+
+      **Why not copy it.** The best schedule depends on many other choices: batch size, optimizer, step budget, regularization and architecture. A schedule fitted to someone else's pipeline is unlikely to suit yours. If anything, copy the *algorithm* that produced it. That is rarely possible when the algorithm was human judgement.
+
+      **Validation-driven schedules are fine if automated.** An automatic rule such as "reduce on plateau" with fixed patience and factor is reproducible. Human-in-the-loop versions are brittle and can't be reproduced, so the playbook recommends avoiding them. If you publish results that used one, make the procedure fully reproducible.
+
+      **Connection to the rest of the playbook.** This is the incremental strategy's warning against changes that ride along by accident. A hand-tuned schedule bakes in a sequence of untested decisions. A simple family (linear or cosine) with a tuned peak LR and length is easier to reason about and to re-tune when the pipeline changes.
+    source: Tuning Playbook FAQ "Why do some papers have complicated learning rate schedules?"
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Why decay the learning rate at all?"* SGD with constant $\eta$ hovers at an excess loss $\approx\eta\sigma^2/(4B)$. A high LR makes fast early progress, and a low LR reaches a low floor. Decay gets both.
+      - *"Decay the LR or grow the batch?"* The floor depends on $\eta/B$, so either lowers it. Growing the batch also cuts the step count (Smith et al.).
+      - *"How do you pick the number of steps?"* Not compute-bound: fix it across a study, use retrospective checkpoint selection, and adjust from where the best checkpoint lands. The initial guess comes from the fastest trial of a constant-LR sweep to fit the training set. Compute-bound: as long as affordable, but tune in rounds with short runs first.
+      - *"What transfers from short runs?"* Warmup and initialization most reliably, then big architecture wins. Optimizer and regularization settings transfer loosely, and schedules poorly.
+      - *"Why do short-horizon LR searches pick LRs that are too small?"* A lower LR lowers the noise floor immediately; its slower long-run progress is invisible on a short horizon (Wu et al. 2018).
+      - *"You have 3× more compute for the final run. How do you change a cosine schedule?"* Keep the peak LR and stretch the cycle to the new length. For linear decay, keep the decay length and extend the constant phase. Don't let an inverse-sqrt tail run on.
+      - *"Should max_train_steps be a tuned hyperparameter?"* No. Tuning it confounds every comparison in the study.
+    source: Tuning Playbook §"Determining the number of steps for each training run", FAQs on schedules
+
+  - title: "Key results"
+    body: |
+      - Compute-bound: faster training = better training; tune in rounds (short runs, then a few long ones). Not compute-bound: train long enough, with retrospective checkpoint selection.
+      - Smaller batches, augmentation and dropout add gradient variance and need more steps.
+      - SGD on a noisy quadratic:
+
+      $$\begin{aligned}v^*&=\frac{\eta\sigma^2}{Bh(2-\eta h)}\\ \tfrac12hv^*&\approx\frac{\eta\sigma^2}{4B}\end{aligned}$$
+
+      so a constant LR stalls at a floor $\propto\eta/B$. Decay schedules get fast early progress and a low final floor.
+      - Cosine:
+
+      $$\eta_t=\eta_{min}+\tfrac12(\eta_{max}-\eta_{min})(1+\cos\pi\tau)$$
+
+      Linear: $\eta_{max}(1-\tau)$. Inverse sqrt: $\eta_{max}\sqrt{w/t}$.
+      - The best family is open. Some decay matters. Defaults: linear or cosine. Start constant.
+      - Never tune `max_train_steps` in a study. Best checkpoint in the first 10% means too long; in the last 25%, train longer.
+      - Transfer from short runs: warmup/init > architecture > optimizer/regularization > schedule. Short horizons bias the LR low.
+      - Round 2: spend the extra steps at high LR (extend the constant phase; stretch cosine). Don't copy hand-tuned piecewise schedules.
+    source: Tuning Playbook §"Determining the number of steps for each training run"; Smith et al. 2018; Wu et al. 2018
+
+quiz:
+  - id: q1
+    prompt: |
+      SGD with a constant LR on $L=\frac12hx^2$ with gradient noise variance $\sigma^2/B$ reaches a stationary excess loss of about $\eta\sigma^2/(4B)$ when $\eta h\ll1$. Which change **halves** that floor?
+    correct: Halving $\eta$, or doubling $B$
+    wrong:
+      - Halving $\eta$ only; batch size has no effect on the floor
+      - Doubling $h$, the curvature
+      - Doubling both $\eta$ and $B$
+    explanation: |
+      The floor is proportional to $\eta/B$ (exactly $\eta\sigma^2/(2B(2-\eta h))$), so halving $\eta$ and doubling $B$ have the same effect. Doubling both leaves it unchanged. In this model, where the noise is specified directly as gradient variance, curvature cancels to first order; in models where gradient noise scales with $h$ it would not. This $\eta/B$ equivalence is Smith et al.'s argument for growing the batch instead of decaying the LR.
+    source: Zhang et al. 2019 §3.1; Smith et al. 2018 §2
+
+  - id: q2
+    prompt: |
+      In the noisy-quadratic derivation, which recursion gives the variance $v_t$ of $x_t$ under $x_{t+1}=(1-\eta h)x_t-\eta\xi_t$, where $\mathrm{Var}\,\xi=\sigma^2/B$?
+    correct: '$v_{t+1}=(1-\eta h)^2v_t+\eta^2\sigma^2/B$'
+    wrong:
+      - '$v_{t+1}=(1-\eta h)v_t+\eta\sigma^2/B$'
+      - '$v_{t+1}=(1-\eta h)^2v_t+\eta\sigma^2/B$'
+      - '$v_{t+1}=(1-\eta h)^2v_t$'
+    explanation: |
+      Variance scales by the square of a constant factor, and the independent noise term adds $\eta^2\mathrm{Var}\,\xi$. Dropping the noise term gives the deterministic contraction, which converges to zero. That omission is exactly why constant-LR SGD does *not* converge.
+    source: Zhang et al. 2019 §3.1 (eq. 3)
+
+  - id: q3
+    prompt: |
+      ![Expected loss for three LR choices on a noisy quadratic (synthetic model).](sys.tuning-steps-schedules/noise-floor-quiz)
+
+      Why does the "constant, high" curve flatten so early?
+    correct: It has reached its noise floor, which is proportional to $\eta$
+    wrong:
+      - It has diverged because $\eta h>2$ in some direction
+      - It has converged to the exact minimum
+      - The low-curvature directions have stopped receiving any gradient
+    explanation: |
+      With a high constant LR, the mean error decays quickly, but the variance settles at $v^*\propto\eta$, so the loss plateaus well above the minimum. A diverging run would grow, not flatten. Cosine decay starts the same way but keeps lowering the floor as $\eta$ falls.
+    source: Zhang et al. 2019 §3.1
+
+  - id: q4
+    prompt: |
+      What does the playbook say about the best learning-rate decay schedule *family*?
+    correct: It's open, but some tuned non-constant schedule matters
+    wrong:
+      - Cosine decay is provably optimal for SGD and Adam
+      - Constant LR is best once the peak LR is well tuned
+      - Step decay at 50% and 75% is best for every workload
+    explanation: |
+      The authors don't know the best family and doubt it can easily be settled experimentally. They are confident that some decay helps, because different LRs suit different stages, and they default to linear or cosine. A constant LR is only the recommended *starting* point.
+    source: Tuning Playbook FAQs "What is the best learning rate decay schedule family?", "Which learning rate decay should I use as a default?"
+
+  - id: q5
+    prompt: |
+      Why should `max_train_steps` be fixed across all trials of a study rather than tuned?
+    correct: Unequal budgets would confound the comparison
+    wrong:
+      - Varying it would make the decay schedule impossible to define
+      - Quasi-random search cannot sample integer hyperparameters
+      - The best step count is the same for every configuration anyway
+    explanation: |
+      The study compares other hyperparameters, and budget differences would leak into that comparison. Instead, fix a budget, use retrospective checkpoint selection, and read where the best step lands to refine the budget for the next round.
+    source: Tuning Playbook §"Deciding how long to train when training is not compute-bound"
+
+  - id: q6
+    prompt: |
+      Across a study, the best checkpoint of nearly every trial occurs in the last 20% of training. What does the playbook suggest?
+    correct: Train longer and re-tune the decay schedule
+    wrong:
+      - Cut `max_train_steps` by 80%
+      - Switch to prospective early stopping with patience
+      - Lower the learning rate to slow convergence
+    explanation: |
+      Best checkpoints consistently in the last quarter mean the runs were still improving, so a longer budget may help. Because the schedule is tied to the length, re-tune it too. Best checkpoints within the first 10% would mean the opposite.
+    source: Tuning Playbook §"Deciding how long to train when training is not compute-bound"
+
+  - id: q7
+    prompt: |
+      To guess an initial `max_train_steps`, you run a constant-LR sweep, and all LRs take a very long time to fit the training set. The fastest uses the largest LR in the sweep. What is the risk?
+    correct: The LRs may all be too small, wrongly suggesting a huge step budget
+    wrong:
+      - The training set is too hard to fit, so regularization is needed
+      - The LR sweep should have used data augmentation as well
+      - Constant LRs cannot fit training sets, so the method fails
+    explanation: |
+      The guess comes from the fastest trial. If the best LR sits at the sweep's upper edge, faster trials probably exist beyond it. The playbook calls this self-deception through a bad search space. Always check that the best LR is not at a boundary.
+    source: Tuning Playbook §"Algorithm for picking an initial candidate for max_train_steps…"
+
+  - id: q8
+    prompt: |
+      According to the playbook's Round 1 guidance, which hyperparameter found with short runs is **most** likely to transfer to long runs?
+    correct: Warmup length
+    wrong:
+      - Learning-rate decay schedule
+      - Dropout rate
+      - Data augmentation strength
+    explanation: |
+      Early-training instability shows up early, so short runs can resolve warmup and initialization. The authors call these the closest thing to a sure bet. Regularization and augmentation "might" transfer, and the schedule is "unlikely" to.
+    source: Tuning Playbook §"Round 1"
+
+  - id: q9
+    prompt: |
+      Round 1 used inverse-sqrt decay $\eta_t=\eta_{max}\sqrt{1000/t}$ for 10k steps. Round 2 simply runs it to 30k steps. What fraction of Round 2 runs below Round 1's final LR (the smallest post-warmup LR it validated)?
+    correct: About two-thirds
+    wrong:
+      - About one-third
+      - About 10%
+      - None, because the schedule is unchanged
+    explanation: |
+      Round 1's final LR is $\eta_{max}\sqrt{0.1}\approx0.32\eta_{max}$, reached at step 10k. Every step after that is lower, which is 20k of 30k steps, about 67%. The playbook warns against spending the extra steps at too small an LR.
+    source: Tuning Playbook §"Round 1", §"Round 2"
+
+  - id: q10
+    prompt: |
+      Round 1 used linear decay over the final 5k of 10k steps. How does the playbook (speculatively) suggest extending it to a 40k-step Round 2?
+    correct: Keep the 5k decay; extend the constant phase to 35k
+    wrong:
+      - Stretch the decay to cover all 40k steps from step 0
+      - Keep the 10k schedule and train the last 30k at the final LR
+      - Restart the same 10k schedule four times
+    explanation: |
+      The advice is to use the extra steps at high LR: keep the decay length, extend the plateau before it. Training 30k steps at the final (smallest) LR is exactly the starving pitfall. For cosine, the advice is to keep the peak LR and stretch the cycle to the new length.
+    source: Tuning Playbook §"Round 2"
+
+  - id: q11
+    prompt: |
+      Wu et al. (2018) found that tuning LRs against a short horizon picks LRs that are too small. Which mechanism explains this?
+    correct: A lower LR cuts the noise floor now; its cost shows later
+    wrong:
+      - Short horizons make the minibatch gradient noise larger
+      - Large LRs always diverge within the first 100 steps
+      - Short horizons favour large LRs, which then get corrected downward
+    explanation: |
+      On a noisy quadratic, decreasing $\eta$ reduces the stationary variance right away, a visible loss drop. The cost, slower decay of the mean error along low-curvature directions, accumulates over a long horizon a short evaluation never sees. Their meta-optimisation picked LRs too small by orders of magnitude.
+    source: Wu et al. 2018 §1; Tuning Playbook §"Round 1"
+
+  - id: q12
+    prompt: |
+      You copy a paper's schedule ("LR ×0.2 at epoch 37, ×0.5 at epoch 61, ×0.1 at epoch 88") but train with twice their batch size and different augmentation. What is the most likely outcome?
+    correct: The schedule is mistuned for your pipeline, so results lag
+    wrong:
+      - It works as is, because milestones in epochs are batch-independent
+      - It works once every LR in it is doubled for the larger batch
+      - It works once the epoch milestones are halved for the larger batch
+    explanation: |
+      Such schedules usually record one person's reactions to one run's validation curve. With a doubled batch you take half the steps per epoch and the noise scale changes; new augmentation changes how fast the model fits. Mechanical fixes (doubling LRs, moving milestones) assume rules that rarely hold exactly. The playbook's advice: copy the *algorithm* if it is automatable, otherwise use a simple family (linear or cosine) tuned in your setting.
+    source: Tuning Playbook FAQ "Why do some papers have complicated learning rate schedules?"
+
+  - id: q13
+    prompt: |
+      You add strong data augmentation and dropout to a model that was not compute-bound. What should you expect about the step budget?
+    correct: It may need to rise, because these add gradient variance
+    wrong:
+      - It can fall, because regularization speeds convergence
+      - It is unaffected, since only batch size changes gradient noise
+      - It should be tuned within the next study alongside dropout
+    explanation: |
+      Augmentation and dropout increase the variance of gradients across batches, which slows progress per step, so reaching a given loss takes more steps. The budget is revisited between studies, never tuned within one.
+    source: Tuning Playbook §"Determining the number of steps for each training run"
+
+cards:
+  - id: f1
+    front: Define compute-bound and not compute-bound training, and what each implies for the step budget.
+    back: |
+      - **Compute-bound**: limited by how long we can wait; more training keeps helping. Train as long as affordable, and tune in rounds of increasing length.
+      - **Not compute-bound**: more steps eventually stop helping. Train long enough, with retrospective checkpoint selection, without wasting steps.
+    source: Tuning Playbook §"Determining the number of steps for each training run"
+
+  - id: f2
+    front: Stationary variance and excess loss of constant-LR SGD on $\frac12hx^2$ with gradient noise $\sigma^2/B$.
+    back: |
+      $$v^*=\frac{\eta\sigma^2}{Bh(2-\eta h)}$$
+
+      $$\tfrac12hv^*=\frac{\eta\sigma^2}{2B(2-\eta h)}\approx\frac{\eta\sigma^2}{4B}$$
+
+      The floor is proportional to $\eta/B$ (assumes additive, constant-variance noise and $\eta h\ll1$; in $d$ dimensions it sums over eigendirections).
+    source: Zhang et al. 2019 §3.1 (eqs. 3–4)
+
+  - id: f3
+    front: Write the cosine, linear and inverse-sqrt schedules (after warmup).
+    back: |
+      With $\tau=(t-w)/(T-w)$:
+      - Cosine: $\eta_{min}+\tfrac12(\eta_{max}-\eta_{min})(1+\cos\pi\tau)$
+      - Linear: $\eta_{max}(1-\tau)$
+      - Inverse sqrt: $\eta_{max}\sqrt{w/t}$, $t\ge w$
+    source: Loshchilov & Hutter 2017 §3; Tuning Playbook FAQs on schedules
+
+  - id: f4
+    front: Three rules for max_train_steps when training is not compute-bound.
+    back: |
+      1. Never tune it within a study; use one value for all trials.
+      2. Use retrospective checkpoint selection (keep the best $N$ checkpoints).
+      3. Adjust from where the best step lands: first 10% → too long; last 25% → train longer and re-tune the decay.
+    source: Tuning Playbook §"Deciding how long to train when training is not compute-bound"
+
+  - id: f5
+    front: The playbook's ranking of which hyperparameters transfer from short to long runs.
+    back: |
+      1. Very likely: warmup length, initialization.
+      2. Likely: dramatic architecture wins.
+      3. Might: optimizer hyperparameters (loosely), augmentation, regularization.
+      4. Unlikely: the LR schedule.
+    source: Tuning Playbook §"Round 1"
+
+  - id: f6
+    front: How to extend a linear or cosine schedule from Round 1 to a longer Round 2.
+    back: |
+      Spend the extra steps at high LR. Linear: keep the decay length, extend the constant phase. Cosine: keep the peak LR, stretch the cycle to the new `max_train_steps`. Pitfall: running the extra steps at a tiny LR (e.g. an extended inverse-sqrt tail).
+    source: Tuning Playbook §"Round 2"
+
+  - id: f7
+    front: The LR-sweep algorithm for an initial max_train_steps.
+    back: |
+      Find any configuration that fits the training set in $N$ steps. Run a constant-LR sweep (no augmentation, no regularization) for $N$ steps. The step at which the fastest trial fits the training set is the initial guess. Check that the best LR is not at the sweep's edge.
+    source: Tuning Playbook §"Algorithm for picking an initial candidate for max_train_steps…"
+
+  - id: f8
+    type: open
+    front: Derive why constant-LR SGD does not converge and what that implies for schedules.
+    back: |
+      - Model: $L=\frac12hx^2$, $g=hx+\xi$, $\mathrm{Var}\,\xi=\sigma^2/B$. Update $x_{t+1}=(1-\eta h)x_t-\eta\xi_t$.
+      - Assumptions: additive noise, fresh each step, independent of $x$, constant variance.
+      - Mean: $\mathbb{E}x_t=(1-\eta h)^tx_0\to0$ for $0<\eta h<2$, faster for larger $\eta$ while $\eta h\le1$.
+      - Variance: $v_{t+1}=(1-\eta h)^2v_t+\eta^2\sigma^2/B$, with fixed point $v^*=\eta\sigma^2/(Bh(2-\eta h))$.
+      - Excess loss: $\tfrac12hv^*\approx\eta\sigma^2/(4B)$, a floor proportional to $\eta/B$.
+      - Tradeoff: large $\eta$ = fast bias decay, high floor; small $\eta$ = low floor, slow, especially for small $h$.
+      - So use a large LR early and decay it later. Equivalently, grow the batch (Smith et al.). Iterate averaging also reduces the variance term.
+    source: Zhang et al. 2019 §3.1; Smith et al. 2018 §2; Tuning Playbook FAQ "What is the best learning rate decay schedule family?"
+
+  - id: f9
+    type: open
+    front: "Your production run will be 10× longer than your tuning runs. How do you plan the tuning?"
+    back: |
+      - The workload is compute-bound, so tune in rounds. Round 1: many short runs (e.g. 10% length) for architecture and optimizer hyperparameters. Round 2: a few full-length runs on the best points.
+      - Trust Round 1 most for warmup and initialization, then large architecture wins. Treat optimizer, regularization and augmentation settings as loose. Expect the schedule not to transfer.
+      - Beware short-horizon bias: LRs that look best on short runs tend to be too small.
+      - When extending: keep the peak LR; for cosine, stretch to the new length; for linear, extend the plateau and keep the decay length. Never let most extra steps run at a tiny LR.
+      - If the budget allows, add an intermediate round (e.g. 30%) to check that conclusions hold as length grows.
+    source: Tuning Playbook §"Deciding how long to train when training is compute-bound", §"Round 1", §"Round 2"
+
+  - id: f10
+    type: open
+    front: Explain to an interviewer why hand-tuned piecewise LR schedules in papers are a poor thing to copy.
+    back: |
+      - They usually come from a human pausing a run when validation stalls and resuming at a lower LR, repeatedly, until a deadline.
+      - The result encodes one pipeline's dynamics (batch size, optimizer, data, budget) and one validation curve's noise, so it rarely suits another pipeline.
+      - It can't be reproduced unless the decision rule was written down. The playbook asks authors to make such schedules fully reproducible.
+      - Better: a simple family (linear or cosine) whose peak LR and length are tuned in your setting, or an automated validation-driven rule with fixed hyperparameters.
+    source: Tuning Playbook FAQ "Why do some papers have complicated learning rate schedules?"
+
+reading:
+  - title: "Deep Learning Tuning Playbook: 'Determining the number of steps for each training run'"
+    url: https://github.com/google-research/tuning_playbook#determining-the-number-of-steps-for-each-training-run
+    kind: docs
+    note: Compute-bound vs not, the LR-sweep algorithm, and the Round 1/Round 2 transfer advice.
+  - title: "Smith, Kindermans, Ying & Le 2018, Don't Decay the Learning Rate, Increase the Batch Size"
+    url: https://arxiv.org/abs/1711.00489
+    kind: paper
+    note: "§2 develops the SGD noise scale ηN/B; §5.1 shows on a Wide ResNet that decaying the LR and growing the batch give equivalent training curves."
+  - title: "Wu, Ren, Liao & Grosse 2018, Understanding Short-Horizon Bias in Stochastic Meta-Optimization"
+    url: https://arxiv.org/abs/1803.02021
+    kind: paper
+    note: Analyses short vs long horizons on a noisy quadratic and shows that short horizons choose step sizes that are too small.
+  - title: "Loshchilov & Hutter 2017, SGDR: Stochastic Gradient Descent with Warm Restarts"
+    url: https://arxiv.org/abs/1608.03983
+    kind: paper
+    note: "§3 defines cosine annealing, the most common LR schedule in modern training."

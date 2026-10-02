@@ -1,0 +1,380 @@
+id: sb.transformer-memory
+area: scalingbook
+title: "MoE, Rematerialization and KV Caches"
+summary: The memory side of Transformer math. How mixture-of-experts changes parameters, FLOPs and the batch needed to be compute-bound; why training activations are huge and what rematerialization costs; how big KV caches are; and why decode attention is always bandwidth-bound.
+order: 110
+level: core
+tags: [scaling-book, moe, rematerialization, kv-cache, memory]
+prereqs: [sb.transformer-accounting]
+
+explainer:
+  - title: Mixture of experts in one card
+    source: Scaling Book ch. 4 (Transformers) §"Sparsity and Mixture-of-Experts"
+    body: |
+      A **mixture-of-experts (MoE)** layer replaces the single MLP with $E$ independent MLPs ("experts"). A small router picks $k$ of them for each token, and their outputs are combined. To first order an MoE is a dense model with $E$ MLP blocks per layer, of which each token uses $k$.
+
+      - **Parameters:** the MLP's $3DF$ becomes $3EDF$, so $E\times$ more.
+      - **FLOPs per token:** $k\times$ the dense MLP's, since only $k$ experts run.
+      - **Sparsity** $E/k$: typically 8–64. DeepSeek-V3 has effectively $k = 8$ of $E = 256$ routed experts.
+
+      So an MoE buys parameters (capacity) without paying proportional FLOPs. The 6ND rule uses the **activated** parameters per token.
+
+      **New communication.** When experts are sharded across devices on the same axis as the batch or sequence, each token must be sent to the device holding its experts and the result sent back. That is two **AllToAll**s per MoE layer (lesson 80), each costing about a quarter of a comparable AllGather on a TPU ring.
+
+      **The catch is bytes.** Every expert's weights must still be stored and, at each step, loaded for whichever tokens chose it. The next card shows what that does to the roofline.
+  - title: "MoE roofline: the batch must grow by E/k"
+    source: Scaling Book ch. 4 (Transformers), Question 8; Scaling Book ch. 7, Question 5
+    body: |
+      Repeat lesson 20's matmul roofline for one MoE weight matrix in a step that processes $B$ tokens. Assume int8 weights, bf16 math on a v5e, and that every expert receives some tokens, so all $E$ expert matrices are loaded.
+
+      - **Bytes** (weights dominate): $E\cdot D\cdot F$.
+      - **FLOPs:** each token uses $k$ experts, $2\,k\,B\,D\,F$.
+
+      $$\frac{2kBDF}{EDF} > 240 \iff B > 120\cdot\frac{E}{k}.$$
+
+      Without int8 weights it would be $240\,E/k$.
+
+      **Worked example** (book Q8). DeepSeek-style $E = 256$, $k = 8$: $B > 120\times32 = 3840$ tokens per step, against 120 for a dense model with the same int8 setup. Each expert sees only $k/E$ of the batch, so its weights are reused far less.
+
+      **Consequence.** MoEs are harder to run efficiently at small batch: decoding, or training with little data parallelism per expert copy. That is why expert parallelism (sharding experts across chips, so each chip loads only its own) is the usual partner of MoE. Lesson 360 shows the same $E/k$ factor inflating the data-parallel batch threshold on GPUs.
+
+      **Scope.** The derivation assumes all experts are touched each step and that routing is roughly balanced. With very small batches, fewer experts are loaded and the arithmetic changes.
+  - title: Why training activations are huge
+    source: Scaling Book ch. 4 (Transformers) §"Gradient checkpointing"
+    body: |
+      Backpropagation trades memory for compute. To avoid recomputing the forward pass layer by layer (which would cost $O(L^2)$ FLOPs), it **saves** the intermediate values of the forward pass, costing $O(L)$ memory.
+
+      **Why intermediates are needed.** The chain rule evaluates derivatives at forward values. For $f(x) = \exp(g(x))$,
+
+      $$\frac{df}{dx} = \exp(g(x))\cdot\frac{dg}{dx}.$$
+
+      The backward pass needs both $g(x)$ and $\exp(g(x))$. Unless we recompute them, both must be stored.
+
+      **How much.** The book counts roughly 20 intermediate tensors per layer of a Transformer, each about $BT\times D$ in size. Some are really $F$-wide, so this is a rough count. In bf16:
+
+      $$\text{bytes} \approx 2\times20\times BT\times D\times L.$$
+
+      **Worked example** (book). $BT = 4$M tokens per batch, $L = 64$, $D = 8192$:
+
+      $$2\cdot20\cdot4\times10^{6}\cdot8192\cdot64 \approx 84\ \text{TB}.$$
+
+      Compare: this ≈ 69B-parameter model's weights plus Adam state are ≈ 0.7 TB at the book's 10 bytes/param, two orders of magnitude below 84 TB. At training batch sizes, **activations, not weights, dominate memory**. Hence rematerialization.
+  - title: "Rematerialization: trading FLOPs for memory"
+    source: Scaling Book ch. 4 (Transformers) §"Gradient checkpointing", Question 6
+    body: |
+      **Rematerialization** (remat, gradient or activation checkpointing) saves only some intermediates and recomputes the rest during the backward pass. In JAX it is controlled by `jax.checkpoint` (alias `jax.remat`) and its policies.
+
+      **Block remat.** Save only each layer's input: 1 checkpoint per layer instead of about 20. The example drops from 84 TB to $2\cdot BT\cdot D\cdot L \approx 4.2$ TB. The backward pass must rerun each layer's forward first, so FLOPs go from $2 + 4 = 6$ to $2 + 2 + 4 = 8$ per parameter per token: **≈ 8ND**.
+
+      **Save only big matmul outputs.** Keep the outputs of the 7 large matmuls (Q, K, V, O and the three MLP matrices), and recompute the cheap elementwise ops and parts of attention. That is about 7 saved tensors per layer.
+
+      **What does that recompute cost?** (book Q6). The attention score matrix and $\text{softmax}\cdot V$ are not saved, so the backward pass redoes both: $2BT^2NH$ forward FLOPs each, **$4BT^2NH$** extra per layer. Plus $O(BTD)$ and $O(BTF)$ elementwise work. That is small unless the context is long.
+
+      ![Saved tensors per layer vs training FLOPs for three checkpointing policies (rough counts)](sb.transformer-memory/remat-tradeoff)
+
+      In practice the policy is chosen to fit memory with the least recompute. MFU counts only the 6ND model FLOPs, so recomputation shows up as lower MFU.
+  - title: The KV cache
+    source: Scaling Book ch. 4 (Transformers) §"Key-Value (KV) caching"; Scaling Book ch. 8 §"What's the LLaMA Serving Story?"
+    body: |
+      Generation (decoding) produces one token at a time. Each new token's attention needs the keys and values of every earlier token, so they are kept in a **KV cache** rather than recomputed. The cache is filled by **prefill** (processing the prompt) and extended by one token per **generation** step (lesson 210).
+
+      Per sequence the cache is an array $[2, S, L, K, H]$: keys and values, for each of $S$ tokens, $L$ layers, $K$ KV heads of dimension $H$. Its size is
+
+      $$\text{KV bytes} = 2\cdot S\cdot L\cdot K\cdot H\cdot b,$$
+
+      where $b$ is bytes per value.
+
+      **Book example.** $S = 8192$, $L = 64$, $KH = 8192$ (MHA), int8: $2\cdot8192\cdot64\cdot8192 = 8$ GiB for one sequence.
+
+      **LLaMA-3 70B** ($L = 80$, $K = 8$, $H = 128$), int8: $2\cdot80\cdot8\cdot128 = 160$ KiB per token. That is 5 GiB at 32k context. With full MHA ($K = 64$) it would be 1.25 MiB per token.
+
+      ![int8 KV cache per sequence for LLaMA-3 70B shapes, GQA (K = 8) vs MHA (K = 64), against one v5e's 16 GiB](sb.transformer-memory/kv-vs-context)
+
+      This is why GQA and MQA ($K \ll N$) exist. During serving, the cache, not the weights, often limits how many sequences fit (lesson 230).
+  - title: Attention's intensity, prefill vs decode
+    source: Scaling Book ch. 4 (Transformers), Question 4; Scaling Book ch. 7 §"What about attention?"
+    body: |
+      Is dot-product attention compute- or bandwidth-bound? Assume a Flash-style kernel that never writes the score matrix to HBM, and bf16.
+
+      - **Bytes:** read $Q$ and write the output, $2\cdot2BTNH$; read $K$ and $V$, $2\cdot2BSKH$. Total $4BHK(TG + S)$, using $N = KG$.
+      - **FLOPs:** scores plus values, $4BTSNH = 4BTSKGH$.
+
+      $$I = \frac{4BTSKGH}{4BHK(TG + S)} = \frac{TSG}{TG + S}.$$
+
+      **Prefill / training** ($T = S$): $I = TG/(G + 1)$, which grows with $T$. On a v5e it is compute-bound once $T > 240(G+1)/G$: 480 tokens for MHA, about 270 for $G = 8$. (The book's ch. 4 Q4 answer says 240: that is the large-$G$ limit, where $TG/(G+1)\to T$. Ch. 7 gives 480, which follows from $T/2 > 240$ for MHA.)
+
+      **Decode** ($T = 1$): $I = SG/(G + S) \to G$ for long contexts. That is 1 FLOP/byte for MHA and 8 for $G = 8$, against a ridge of 240. **Decode attention is always bandwidth-bound**, whatever the batch: each sequence reads its own cache, so batching adds bytes as fast as FLOPs (the per-example-weights case of lesson 20).
+
+      ![Attention intensity: prefill grows with sequence length; decode saturates at G, far below the ridge](sb.transformer-memory/attention-intensity)
+
+      Raising $G$ (fewer KV heads) helps a little; shrinking or quantizing the cache helps directly.
+  - title: Summary of the memory accounting
+    source: Scaling Book ch. 4 (Transformers) §"What Should You Take Away from this Section?"; Scaling Book ch. 5 §"Data Parallelism"
+    body: |
+      Parameters and FLOPs are as in lesson 100 (MLP $3DF$ and $18BTDF$; attention $4DNH$ and $24BTDNH + 12BT^2NH$; vocabulary $DV$), plus, for MoE, ×$E$ parameters and ×$k$ FLOPs in the MLP.
+
+      **Memory during training** (no sharding yet):
+
+      - weights + optimizer state: 10 bytes/param with bf16 weights and fp32 Adam moments (lesson 130); ≈ 0.7 TB for a 70B model;
+      - activations: ≈ $2\cdot20\cdot BTDL$ bytes without remat (tens of TB at millions of tokens per batch), ≈ $2\cdot BTDL$ with block remat, in between for "save matmul outputs".
+
+      **Memory during inference:**
+
+      - weights, often int8 or lower;
+      - KV cache, $2SLKH$ values per sequence, times the batch: it grows with both context and the number of concurrent sequences;
+      - activations: negligible (Flash-style attention never stores the score matrix).
+
+      **Takeaways.** Activations dominate training memory, so remat policy matters; KV caches dominate inference memory, so $K$, the KV precision and the context length matter. Training ≈ 6ND (≈ 8ND with full remat).
+
+      These are the inputs to every parallelism decision in chapters 5–8.
+  - title: What interviewers probe
+    source: Scaling Book ch. 4 (Transformers)
+    body: |
+      - *What does MoE change?* Params ×$E$, FLOPs ×$k$; two AllToAlls per layer for expert routing; critical batch ×$E/k$ (int8 weights on v5e: $B > 120E/k$, 3840 for DeepSeek).
+      - *Why rematerialize?* Saved activations (≈ 20 per layer, ≈ 84 TB in the book example) dwarf weights at training batch sizes.
+      - *Cost of block remat?* One extra forward per layer: 6ND → ≈ 8ND, memory ≈ 20× lower.
+      - *Save only big matmul outputs: what's recomputed?* Attention scores and $\text{softmax}\cdot V$: $4BT^2NH$ extra per layer, plus elementwise ops.
+      - *KV cache size?* $2SLKH$ values per sequence: 160 KiB per token for LLaMA-3 70B in int8.
+      - *Why is decode attention bandwidth-bound even at large batch?* Intensity $SG/(G+S) \approx G$; each sequence has its own cache, so batching adds bytes as fast as FLOPs.
+  - title: Key results
+    source: Scaling Book ch. 4 (Transformers)
+    body: |
+      $$\text{MoE: } B > 120\cdot\frac{E}{k}$$
+
+      This is for int8 weights with bf16 math on a v5e.
+
+      $$\text{activations} \approx 2\cdot20\cdot BTDL \text{ bytes}$$
+
+      With block remat, activations drop to $\approx 2\,BTDL$ and FLOPs rise to $\approx 8ND$.
+
+      $$\text{KV} = 2\,S\,L\,K\,H \text{ values per sequence}$$
+
+      $$I_\text{attn} = \frac{TSG}{TG + S}$$
+
+      - Prefill: $I = TG/(G+1)$, compute-bound for $T \gtrsim 480$ (MHA). Decode: $I \to G$, always bandwidth-bound.
+      - Saving only the 7 matmul outputs costs $4BT^2NH$ recompute per layer.
+      - LLaMA-3 70B KV: 160 KiB/token (int8), 5 GiB at 32k. MHA would be 8× more.
+
+quiz:
+  - id: q1
+    source: Scaling Book ch. 4 (Transformers) §"Sparsity and Mixture-of-Experts"
+    prompt: |
+      A dense layer's MLP is replaced by an MoE with $E = 64$ experts of the same size, with $k = 4$ active per token. How do the MLP's parameters and per-token FLOPs change?
+    correct: Params ×64; FLOPs per token ×4
+    wrong:
+      - Params ×4; FLOPs per token ×64
+      - Params ×64; FLOPs per token ×64
+      - Params ×16; FLOPs per token ×1
+    explanation: |
+      Every expert's weights exist ($E\times$ params), but each token runs only $k$ of them ($k\times$ FLOPs). That gap is the whole point of MoE; it also means $E/k = 16\times$ fewer FLOPs per byte of weights.
+  - id: q2
+    source: Scaling Book ch. 4 (Transformers), Question 8
+    prompt: |
+      An MoE with int8 weights and bf16 math runs on a TPU v5e (bf16 ridge ≈ 240). With $E = 256$ and $k = 8$, roughly how many tokens per step are needed for the expert matmuls to be compute-bound?
+    correct: About 3840
+    wrong:
+      - About 120
+      - About 7680
+      - About 30
+    explanation: |
+      Bytes $\approx EDF$ (all experts loaded), FLOPs $2kBDF$: $2kB/E > 240$, so $B > 120E/k = 120\times32 = 3840$. 120 is the dense int8-weight answer; 7680 would be bf16 weights.
+  - id: q3
+    source: Scaling Book ch. 4 (Transformers), Question 8; Scaling Book ch. 7, Question 5
+    prompt: |
+      Same roofline, but with **bf16** weights, $E = 64$, $k = 2$, on a v5e. What batch is needed?
+    correct: About 7680 tokens
+    wrong:
+      - About 3840 tokens
+      - About 240 tokens
+      - About 480 tokens
+    explanation: |
+      bf16 weights: bytes $2EDF$, FLOPs $2kBDF$, so $kB/E > 240$ and $B > 240E/k = 240\times32 = 7680$. 3840 would be int8 weights; 240 forgets that only $k/E$ of the batch reaches each expert; 480 multiplies by $k$ instead of dividing.
+  - id: q4
+    source: Scaling Book ch. 4 (Transformers) §"Gradient checkpointing"
+    prompt: |
+      With the book's rough count of 20 saved $BT\times D$ tensors per layer (bf16), how much activation memory does a batch of $BT = 10^6$ tokens need for $L = 32$, $D = 4096$, with no remat and with block remat?
+    correct: ≈ 5.2 TB without remat; ≈ 0.26 TB with block remat
+    wrong:
+      - ≈ 2.6 TB without remat; ≈ 0.13 TB with block remat
+      - ≈ 5.2 TB without remat; ≈ 2.6 TB with block remat
+      - ≈ 0.26 TB without remat; ≈ 0.013 TB with block remat
+    explanation: |
+      $2\cdot20\cdot10^6\cdot4096\cdot32 \approx 5.2\times10^{12}$ bytes. Block remat keeps 1 tensor per layer instead of 20: $\approx 0.26$ TB. The first distractor forgets bf16's 2 bytes; the second treats block remat as a 2× saving instead of ≈ 20×.
+  - id: q5
+    source: Scaling Book ch. 4 (Transformers) §"Gradient checkpointing"
+    prompt: |
+      With block rematerialization (save only each layer's input), roughly how many training FLOPs does a dense model need per parameter per token?
+    correct: About 8
+    wrong:
+      - About 6
+      - About 12
+      - About 7
+    explanation: |
+      The backward pass first reruns each layer's forward (2) before its usual backward (4), on top of the original forward (2): 8. The 6 of 6ND assumes everything was saved.
+  - id: q6
+    source: Scaling Book ch. 4 (Transformers), Question 6
+    prompt: |
+      Training saves only the outputs of the 7 big matmuls per layer (Q, K, V, O and three MLP matrices). Ignoring elementwise ops, how many extra FLOPs per layer does the backward pass need?
+    correct: $4BT^2NH$
+    wrong:
+      - $12BT^2NH$
+      - $18BTDF$
+      - None, since all matmul outputs were saved
+    explanation: |
+      The attention score matrix and $\text{softmax}\cdot V$ are matmul outputs too, but not among the 7 saved, so both are recomputed: $2BT^2NH$ forward FLOPs each, $4BT^2NH$ total. $12BT^2NH$ is their full training cost, which they pay anyway.
+  - id: q7
+    source: Scaling Book ch. 8 §"What's the LLaMA Serving Story?"; Scaling Book ch. 4 §"Key-Value (KV) caching"
+    prompt: |
+      LLaMA-3 70B has $L = 80$, $K = 8$ KV heads and $H = 128$. With an int8 KV cache, how large is the cache for one 32k-token sequence?
+    correct: About 5.4 GB
+    wrong:
+      - About 43 GB
+      - About 2.7 GB
+      - About 0.17 GB
+    explanation: |
+      Per token: $2\cdot80\cdot8\cdot128 = 163{,}840$ bytes. Times 32,768 tokens: $5.37\times10^9$ bytes (5 GiB). With MHA ($K = 64$) it would be 8× larger, ≈ 43 GB; 2.7 GB forgets the factor 2 for keys plus values.
+  - id: q8
+    source: Scaling Book ch. 4 (Transformers), Question 4
+    prompt: |
+      During decoding with an 8k-token context and GQA with $G = 8$ query heads per KV head, what is the approximate arithmetic intensity of dot-product attention?
+    correct: About 8 FLOPs/byte, so bandwidth-bound
+    wrong:
+      - About 4096 FLOPs/byte, so compute-bound
+      - About 240 FLOPs/byte, right at the ridge
+      - About 1 FLOP/byte, the same as MHA
+    explanation: |
+      With $T = 1$, $I = SG/(G+S) \approx G = 8$, about 30× below a v5e's ridge. 4096 would be the prefill-style $S/2$; 1 is the MHA value. Grouping query heads raises the intensity to about $G$, but not near the ridge.
+  - id: q9
+    source: Scaling Book ch. 4 (Transformers), Question 4; Scaling Book ch. 7 §"What about attention?"
+    prompt: |
+      In prefill ($T = S$) with MHA ($G = 1$), roughly above what sequence length is dot-product attention compute-bound on a TPU v5e (ridge ≈ 240)?
+    correct: About 480 tokens
+    wrong:
+      - About 240 tokens
+      - About 65k tokens
+      - It is never compute-bound
+    explanation: |
+      Prefill intensity $= TG/(G+1) = T/2$ for MHA, so $T/2 > 240$ needs $T > 480$. With $G = 8$ the threshold drops to ≈ 270. The book's ch. 4 Q4 answer quotes 240, which holds only in the large-$G$ limit ($TG/(G+1)\to T$); for MHA ch. 7's 480 is right. 65k is the T = 8D FLOP crossover, a different question.
+  - id: q10
+    source: Scaling Book ch. 7 (Inference) §"What about attention?"; Scaling Book ch. 4, Question 4
+    prompt: |
+      Which statement is **false**?
+    correct: Bigger decode batches raise attention intensity, as for MLPs
+    wrong:
+      - Decode attention intensity approaches G for long contexts
+      - KV-cache memory grows linearly with both batch and context length
+      - GQA shrinks the KV cache by a factor of N/K relative to MHA
+    explanation: |
+      MLP matmuls share weights across the batch, so more tokens means more reuse. In attention every sequence reads its own KV cache, so batch size cancels: $I = SG/(G+S)$ has no $B$. The other three statements are true.
+  - id: q11
+    source: Scaling Book ch. 4 (Transformers) §"Sparsity and Mixture-of-Experts"
+    prompt: |
+      In an MoE layer whose experts are sharded across devices on the same mesh axis as the batch, what extra communication does each layer need?
+    correct: Two AllToAlls, to dispatch tokens and bring results back
+    wrong:
+      - One AllReduce of the expert weights per step
+      - An AllGather of every expert's weights to every device
+      - No communication, because each token picks its own expert
+    explanation: |
+      Tokens live on their batch shard but their experts live elsewhere: an AllToAll sends each token to its experts' devices, and a second returns the outputs. Gathering all experts would defeat the purpose of sharding them.
+  - id: q12
+    source: Scaling Book ch. 4 (Transformers) §"Key-Value (KV) caching"
+    prompt: |
+      ![int8 KV cache per sequence vs context for MHA (K = 64) and GQA (K = 8), LLaMA-3 70B shapes](sb.transformer-memory/kv-vs-context)
+
+      Using the figure's shapes ($L = 80$, $H = 128$, int8), at roughly what context length does a single **MHA** sequence's cache fill one v5e's 16 GiB?
+    correct: About 13k tokens
+    wrong:
+      - About 105k tokens
+      - About 2k tokens
+      - About 64k tokens
+    explanation: |
+      MHA: $2\cdot80\cdot64\cdot128 = 1.25$ MiB per token, and 16 GiB / 1.25 MiB ≈ 13,100 tokens. 105k is the GQA ($K = 8$) crossing, 8× later. In serving, the cache, not the weights, often caps the batch.
+
+cards:
+  - id: f1
+    source: Scaling Book ch. 4 (Transformers) §"Sparsity and Mixture-of-Experts"
+    front: How does an MoE layer change parameters, FLOPs and communication?
+    back: |
+      Params ×$E$, per-token FLOPs ×$k$ (sparsity $E/k$, typically 8–64), plus two AllToAlls per layer when experts are sharded along the batch/sequence axis.
+  - id: f2
+    source: Scaling Book ch. 4 (Transformers), Question 8
+    front: Batch needed for an MoE matmul to be compute-bound (int8 weights, bf16 math, v5e)?
+    back: |
+      $B > 120\,E/k$ (bf16 weights: $240\,E/k$), assuming all experts are loaded each step. DeepSeek ($E = 256$, $k = 8$): 3840 tokens.
+  - id: f3
+    source: Scaling Book ch. 4 (Transformers) §"Gradient checkpointing"
+    front: Training activation memory without remat, and with block remat?
+    back: |
+      ≈ $2\cdot20\cdot BTDL$ bytes (bf16, ≈ 20 saved tensors per layer, rough). Block remat ≈ $2\cdot BTDL$, at ≈ 8ND FLOPs instead of 6ND.
+  - id: f4
+    source: Scaling Book ch. 4 (Transformers), Question 6
+    front: Recompute cost of saving only the 7 big matmul outputs per layer?
+    back: |
+      Attention scores and $\text{softmax}\cdot V$ are recomputed: $4BT^2NH$ FLOPs per layer, plus $O(BTD)$, $O(BTF)$ elementwise work.
+  - id: f5
+    source: Scaling Book ch. 4 (Transformers) §"Key-Value (KV) caching"
+    front: KV cache shape and size per sequence?
+    back: |
+      $[2, S, L, K, H]$: $2SLKH$ values. E.g. $S = 8192$, $L = 64$, $KH = 8192$, int8 → 8 GiB; LLaMA-3 70B int8 → 160 KiB/token.
+  - id: f6
+    source: Scaling Book ch. 4 (Transformers), Question 4
+    front: Arithmetic intensity of dot-product attention (Flash-style, bf16)?
+    back: |
+      $$I = \frac{TSG}{TG + S}$$
+
+      Prefill ($T = S$): $TG/(G+1)$. Decode ($T = 1$): $\to G$.
+  - id: f7
+    type: open
+    source: Scaling Book ch. 4 (Transformers) §"Gradient checkpointing", Question 6
+    front: Explain rematerialization to an interviewer. Why it's needed, the main policies, and their FLOP and memory costs.
+    back: |
+      - Backprop needs forward intermediates ($f = e^{g}$ needs $g$ and $e^g$); saving all of them costs ≈ 20 $BT\times D$ tensors per layer: ≈ 84 TB for 4M tokens, $L = 64$, $D = 8192$.
+      - Block remat: save each layer's input only (≈ 20× less memory), rerun the layer's forward in backward: 6ND → ≈ 8ND.
+      - Save big matmul outputs: ≈ 7 tensors/layer; recompute attention scores and $\text{softmax}\cdot V$ ($4BT^2NH$) and elementwise ops.
+      - Choose the cheapest policy that fits memory; recompute lowers MFU since MFU counts only 6ND.
+      - JAX: `jax.checkpoint` / `jax.remat` with policies.
+  - id: f8
+    type: open
+    source: Scaling Book ch. 4 (Transformers), Question 4; Scaling Book ch. 7 §"What about attention?"
+    front: Derive why decode attention is bandwidth-bound at any batch size, while prefill attention is compute-bound.
+    back: |
+      - Bytes: read $Q$ and write out ($4BTNH$), read $K, V$ ($4BSKH$) = $4BHK(TG+S)$.
+      - FLOPs: $4BTSNH = 4BTSKGH$.
+      - $I = TSG/(TG+S)$; $B$ cancels because each sequence has its own cache.
+      - Prefill $T = S$: $TG/(G+1)$, compute-bound past a few hundred tokens.
+      - Decode $T = 1$: $\approx G$ (1 for MHA, 8 for G = 8) ≪ 240, so bandwidth-bound.
+      - Levers: shrink or quantize the KV cache, raise $G$ (GQA/MQA), share KVs; not batch size.
+  - id: f9
+    type: open
+    source: Scaling Book ch. 4 (Transformers) §"Sparsity and Mixture-of-Experts", Question 8
+    front: What makes MoE models harder to serve or train efficiently than dense models of equal FLOPs, and how is it mitigated?
+    back: |
+      - Weights ×$E$ but FLOPs ×$k$: each expert sees only $k/E$ of the tokens, so weight reuse falls by $E/k$.
+      - Roofline: $B > 120E/k$ (int8 weights, v5e), e.g. 3840 for DeepSeek, vs 120 dense.
+      - Memory: all $E$ experts must be stored.
+      - Communication: two AllToAlls per layer to route tokens.
+      - Mitigations: expert parallelism (each chip holds and loads only its experts); large batches; balanced routing; AllToAll is cheap on tori (¼ of AllGather).
+  - id: f10
+    source: Scaling Book ch. 4 (Transformers) §"Gradient checkpointing"
+    front: Why do activations, not weights, dominate training memory at scale?
+    back: |
+      Activations scale with tokens per batch × D × L (≈ 2·20·BTDL bytes); weights + Adam are ≈ 10 bytes/param. At millions of tokens per batch, activations reach tens of TB vs < 1 TB of weights and optimizer state for a 70B-scale model.
+
+reading:
+  - title: "Scaling Book ch. 4: All the Transformer Math You Need to Know"
+    url: https://jax-ml.github.io/scaling-book/transformers/
+    kind: book
+    note: '"Sparsity and MoE", "Gradient checkpointing", "KV caching", and Problems 4, 6 and 8.'
+  - title: "JAX docs: gradient checkpointing with jax.checkpoint"
+    url: https://docs.jax.dev/en/latest/gradient-checkpointing.html
+    kind: docs
+    note: Remat policies (e.g. saving only dot outputs) as used in practice.
+  - title: "Chen et al. (2016), Training Deep Nets with Sublinear Memory Cost"
+    url: https://arxiv.org/abs/1604.06174
+    kind: paper
+    note: The classic analysis of checkpointing's memory and recompute trade-off.
+  - title: "DeepSeek-AI (2024), DeepSeek-V3 Technical Report"
+    url: https://arxiv.org/abs/2412.19437
+    kind: paper
+    note: A large fine-grained MoE (256 routed experts, 8 active) and the systems needed to train it.

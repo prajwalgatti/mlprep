@@ -1,0 +1,512 @@
+id: sys.memory-anatomy
+area: applied
+title: Where GPU memory goes when training
+summary: A full memory budget for training a transformer, built from its hyperparameters. Covers bytes per parameter for each optimizer, the parameter count, a term-by-term derivation of activation memory, logits and buffers, peak vs steady state, and which lever fixes which term.
+order: 90
+level: core
+tags: [memory, activations, optimizer-state, transformer, mixed-precision, oom]
+prereqs: [sys.mixed-precision]
+
+explainer:
+  - title: "The problem: a 14 GB model that won't train on 80 GB"
+    body: |
+      A 7B-parameter model is 14 GB in bf16, at 2 bytes per parameter. Inference fits easily on an 80 GB H100. Training the same model with Adam runs out of memory before the first step finishes. Where does the memory go?
+
+      **Four consumers**, the first three together called **model states** (the ZeRO paper's term):
+      1. **Parameters**, often in two copies (half-precision working copy and fp32 master).
+      2. **Gradients**, one per parameter.
+      3. **Optimizer state**: Adam keeps a first moment $m$ and a second moment $v$ per parameter, in fp32.
+      4. **Activations**: tensors computed in the forward pass and kept for the backward pass. They scale with micro-batch size $b$ and sequence length $s$, not with the parameter count.
+
+      Model states depend only on $N$, the number of parameters. Activations depend on the batch and sequence length, so they are the part you can trade away.
+
+      **The rest**, called **residual** memory in ZeRO:
+      - **CUDA context and kernels**: typically 1–2 GB, allocated as soon as anything touches the GPU.
+      - **Temporary buffers**: matmul (GEMM) scratch workspaces, flattened gradient buffers for all-reduce or norm computation, communication buckets, all-gathered parameter shards.
+      - **Fragmentation**: free memory split into pieces too small for the next request. ZeRO reports OOMs with over 30% of memory nominally free in extreme cases.
+
+      **Units.** 1 GB $=10^9$ bytes and 1 GiB $=2^{30}$ bytes. GPU memory is sized in binary units: an "80 GB" H100 has about 80 GiB of HBM. nvidia-smi shows about 81,559 MiB ($\approx79.6$ GiB $\approx85.5\times10^9$ bytes), and PyTorch reports a total of about 79 GiB. From that, subtract the CUDA context and allocator overhead. This lesson's estimates are in $10^9$-byte GB, so convert before comparing.
+
+      **Notation** (Megatron/Korthikanti): $b$ is the micro-batch size in sequences, $s$ the sequence length, $h$ the hidden size, $a$ the number of attention heads, $L$ the number of layers, $V$ the vocabulary size.
+    source: Rajbhandari et al. 2020 §3, §3.2; Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - title: "Model states: bytes per parameter"
+    body: |
+      Count bytes per parameter for each tensor an optimizer must keep.
+      - **SGD, fp32**: weight 4 + gradient 4 = **8**.
+      - **SGD with momentum, fp32**: add a 4-byte momentum buffer: **12**.
+      - **Adam, fp32**: weight 4 + gradient 4 + $m$ 4 + $v$ 4 = **16**.
+      - **Adam, mixed precision** (`sys.mixed-precision`): bf16 weight 2 + bf16 gradient 2 + fp32 master 4 + $m$ 4 + $v$ 4 = **16**.
+      - **Adam, mixed, with an fp32 gradient accumulation buffer** (nanotron and others): **20**.
+      - **8-bit Adam** (bitsandbytes): $m$ and $v$ take 1 byte each but the fp32 master stays, so the optimizer part is $4+1+1=6$ and the total is $2+2+6=10$.
+
+      ZeRO writes the mixed-precision case as $2N+2N+KN$, with $K=12$ the optimizer multiplier (master, $m$, $v$). It uses $\Psi$ for the parameter count where we use $N$.
+
+      **Why optimizer state dominates.** In mixed-precision Adam, 12 of the 16 bytes are optimizer state (counting the master copy, as ZeRO does). The bf16 weights you actually compute with are only 2 of the 16.
+
+      **Totals.** A round 7B model needs $16\times7\times10^9=112$ GB of model states, or 140 GB with the fp32 gradient buffer. That is more than an H100 before a single activation is stored. A 1.5B model needs 24 GB, which is ZeRO's GPT-2 example: 3 GB of fp16 weights could not train on a 32 GB GPU.
+
+      **What does *not* help here.** Mixed precision: still 16 bytes. Smaller batches: model states don't depend on the batch. Activation checkpointing: it targets activations only.
+
+      **What does help.** Sharding across GPUs (ZeRO/FSDP), offloading to CPU, low-precision or factored optimizer state, and freezing most weights. With LoRA the frozen base needs no gradients or optimizer state, only its 2-byte weights.
+    source: Rajbhandari et al. 2020 §3.1; Ultra-Scale Playbook "Memory usage in Transformers › Weights/grads/optimizer states memory"; EleutherAI Transformer Math 101 "Optimizer States", "Gradients"
+
+  - title: "Counting parameters from (h, L, V)"
+    body: |
+      To use "16 bytes per parameter" you need $N$. For a GPT-style layer (multi-head attention, a $4h$ MLP, biases, two LayerNorms):
+      - **Attention.** $W_Q,W_K,W_V$ are each $h\times h$ with an $h$ bias, and the output projection is $h\times h$ with an $h$ bias: $4h^2+4h$.
+      - **MLP.** $h\to4h$ ($4h^2$ weights, $4h$ bias) then $4h\to h$ ($4h^2$ weights, $h$ bias): $8h^2+5h$.
+      - **Two LayerNorms**, each with a gain and a bias of size $h$: $4h$.
+
+      Per layer that is $12h^2+13h$. Add the token embedding $Vh$ (tied with the output projection) and a final LayerNorm $2h$:
+
+      $$N=Vh+L(12h^2+13h)+2h.$$
+
+      The $12Lh^2$ term dominates at large $h$: 4 parts attention, 8 parts MLP.
+
+      **Worked example.** $h=4096$, $L=32$, $V=32000$:
+
+      $$\begin{aligned}12Lh^2&\approx6.44\times10^9\\Vh&\approx0.13\times10^9\\N&\approx6.58\times10^9\end{aligned}$$
+
+      Model states: $16N\approx105$ GB. ("7B" figures elsewhere use a round $7\times10^9$. Llama-2-7B, with SwiGLU ($d_{ff}=11008$) and untied embeddings, has $6.74\times10^9$ parameters, or 108 GB of model states.)
+
+      The formula excludes learned positional embeddings. GPT-2/3-style models add $s_{max}h$ for them.
+
+      **Variants change the constant.**
+      - A **SwiGLU** MLP has three $h\times d_{ff}$ matrices. With $d_{ff}=\tfrac83h$ that is again $8h^2$.
+      - **Grouped-query attention** shrinks $W_K$ and $W_V$ to $h\times(h\,n_{kv}/a)$, where $n_{kv}$ is the number of key/value heads.
+      - **Untied** input and output embeddings add another $Vh$.
+
+      Real "7B" models (Llama, Mistral) use these variants. Recount for the architecture you have, and say which you assumed. (Parameter and FLOP counting in general: `llm.params-flops`.)
+    source: Ultra-Scale Playbook "Memory usage in Transformers" (parameter formula); Korthikanti et al. 2022 §3
+
+  - title: "Why activations are stored, and the attention block"
+    body: |
+      **Why backprop needs forward tensors.** Each op's backward needs some of its forward inputs or outputs.
+      - **Linear** $Y=XW$: the weight gradient is $\partial L/\partial W=X^\top\,\partial L/\partial Y$, so $X$ must be kept.
+      - **Elementwise nonlinearity** $y=f(x)$: the backward is $f'(x)\odot\partial L/\partial y$, so $x$ is kept.
+      - **Dropout**: the same random mask must be reapplied, so the mask is kept (1 byte per element).
+      - **Softmax** $p=\mathrm{softmax}(z)$: the backward uses $p$ itself, $\partial L/\partial z=p\odot(g-\langle g,p\rangle)$, so the output is kept.
+      - **LayerNorm**: the input is kept. Its per-row mean and variance are $O(sb)$, negligible next to $O(sbh)$.
+
+      Because every one of these is a per-token tensor, activation memory scales with $b\cdot s$.
+
+      **Conventions** (Korthikanti et al. §4): 16-bit activations (2 bytes per element), 1-byte dropout masks. All sizes are in **bytes**. An $s\times b\times h$ tensor therefore costs $2sbh$ bytes. Residual additions need nothing stored.
+
+      **Attention block** (with $a$ heads, scores are $a\times s\times s$ per sequence):
+      - Input to the Q, K, V projections (shared): $2sbh$.
+      - $Q$ and $K$ for the $QK^\top$ backward: $4sbh$.
+      - Softmax output: $2as^2b$.
+      - Attention-dropout mask: $as^2b$.
+      - Dropout output and $V$, both needed by the $PV$ product: $2as^2b+2sbh$.
+      - Input to the output projection: $2sbh$.
+      - Output dropout mask: $sbh$.
+
+      Summing gives the attention total:
+
+      $$\begin{aligned}&(2+4+2+2+1)\,sbh+(2+1+2)\,as^2b\\&=11sbh+5as^2b.\end{aligned}$$
+
+      The $5as^2b$ term comes from keeping three versions of the $s\times s$ score matrix: softmax output (2 bytes), dropout mask (1) and dropout output (2). It is the only term quadratic in $s$.
+    source: Korthikanti et al. 2022 §4, §4.1
+
+  - title: "The full layer: sbh(34 + 5as/h)"
+    body: |
+      ![Share of each term in one layer's activation bytes for $h=4096$, $a=32$, $b=1$. The quadratic score term takes over as $s$ grows.](sys.memory-anatomy/activation-breakdown)
+
+      **MLP block** ($h\to4h\to h$ with GeLU):
+      - Input to the first linear: $2sbh$.
+      - Input to GeLU (the $4h$-wide pre-activation): $8sbh$.
+      - Input to the second linear (GeLU output, $4h$ wide): $8sbh$.
+      - Dropout mask: $sbh$.
+
+      The MLP total is $19sbh$.
+
+      **Two LayerNorms**: $2sbh$ each, $4sbh$ in total.
+
+      **Per layer:**
+
+      $$\begin{aligned}&11sbh+5as^2b+19sbh+4sbh\\&=sbh\Big(34+\frac{5as}{h}\Big)\text{ bytes.}\end{aligned}$$
+
+      Across $L$ layers, multiply by $L$. Korthikanti et al. show that the embedding dropout, final LayerNorm and logits add under 0.01% for their 22B model. That is not true for every model (next card).
+
+      **Reading it.** The "34" is the linear-in-$s$ part. $5as/h$ is the score part, relative to it, and it grows with $s$. When $5as/h>34$, the attention scores dominate.
+
+      **Worked example: GPT-3 175B**, with $s=2048$, $b=1$, $h=12288$, $a=96$, $L=96$:
+
+      $$\begin{aligned}\frac{5as}{h}&=\frac{5\cdot96\cdot2048}{12288}=80\\sbh&\approx2.52\times10^{7}\\ \text{per layer}&\approx2.52\times10^7\times114\\&\approx2.87\text{ GB}\end{aligned}$$
+
+      Over 96 layers that is about **275 GB of activations for a single sequence**, against 2.8 TB of model states. Both need splitting across GPUs, which is why the techniques in Korthikanti's paper exist.
+    source: Korthikanti et al. 2022 §4.1 (eq. 1), §4.3; numbers recomputed
+
+  - title: "Modern layers: FlashAttention, no dropout, SwiGLU"
+    body: |
+      The $34+5as/h$ formula describes a 2020-era GPT layer. Recount for what you actually run.
+
+      **FlashAttention** computes attention in tiles and never writes the $s\times s$ score matrix to memory. In the backward pass it recomputes the scores from $Q$, $K$, $V$ and per-row softmax statistics (an $O(sba)$ vector). All three $as^2b$ terms disappear, and attention keeps $Q$, $K$, $V$, its output and the input, which are already counted. A FlashAttention layer is therefore about $34sbh$, **linear in $s$**.
+
+      **No dropout**, as in most LLM pretraining, removes the two 1-byte masks outside attention, giving about $32sbh$.
+
+      **SwiGLU** (gate and up projections of width $d_{ff}=\tfrac83h$, multiplied elementwise) saves the input ($2sbh$) plus several $d_{ff}$-wide tensors of $2\cdot\tfrac83sbh\approx5.3sbh$ each. Eager PyTorch saves five tensors: the input, the gate pre-activation, SiLU(gate) (kept by the multiply), the up projection and the product. That is about $23.3sbh$. A fused SwiGLU kernel recomputes SiLU in the backward and saves four, about $18sbh$, the same as GeLU without dropout. A Llama-style layer (FlashAttention, no dropout, SwiGLU) is therefore about $37sbh$ in eager mode and $32sbh$ fused.
+
+      **Worked example: 6.6B config** ($h=4096$, $a=32$, $L=32$, $s=4096$, $b=1$):
+      - Scores stored: $5as/h=160$, so a layer is $sbh(194)\approx3.25$ GB. Over 32 layers that is **104 GB**.
+      - FlashAttention ($34sbh$): about 0.57 GB per layer, **18.3 GB** in total.
+
+      **Doubling $s$ to 8192.** With FlashAttention, memory exactly doubles. With stored scores it grows $3.65\times$. It approaches $4\times$ as the quadratic term dominates, but the linear $34sbh$ part only doubles.
+
+      **Tensor and sequence parallelism** divide these terms across GPUs, and activation checkpointing replaces them with $2sbh$ per layer plus recomputation (`sys.tensor-parallel`, `sys.activation-checkpointing`).
+    source: Korthikanti et al. 2022 §4.1, §5; Dao et al. 2022 (FlashAttention) §3.1; numbers recomputed
+
+  - title: "Logits, buffers, and the shape of a step"
+    body: |
+      ![Memory over two training steps of a 1.97B model ($h=2560$, $L=24$), $s=4096$, $b=8$, FlashAttention. Computed from the formulas, so illustrative. Adam state appears only at the first optimizer step, so step 2 peaks 16 GB higher and crosses the H100's capacity.](sys.memory-anatomy/memory-timeline)
+
+      **Logits.** The output projection produces $s\cdot b\cdot V$ logits, usually kept in fp32 for the loss, at $4sbV$ bytes. Their gradient has the same size. With $s=4096$, $b=1$ and $V=128{,}000$, that is about **2.1 GB each**. That is 3.7 layers' worth of FlashAttention activations for the 6.6B config, not negligible with large vocabularies. Fused or chunked cross-entropy avoids materialising them all at once.
+
+      **Temporary buffers.** A flattened fp32 gradient buffer for all-reduce or norm computation costs $4N$ bytes: 6 GB for 1.5B parameters (ZeRO's example). A dense embedding gradient is another $Vh$ tensor. Others include communication buckets, all-gathered shards under FSDP, temporary copies made by multi-tensor ("foreach") optimizer kernels, and matmul (GEMM) workspaces.
+
+      **One step's timeline.**
+      - **Forward**: activations build up layer by layer.
+      - **Backward**: each layer's activations are freed after its gradient is computed, while gradients accumulate.
+      - **Optimizer step**: gradients plus optimizer state. Gradients are freed at `zero_grad(set_to_none=True)`, the default since PyTorch 2.0. With `set_to_none=False` they persist into the next forward and add $2N$ bytes to the peak.
+
+      The peak is usually at the forward/backward boundary: model states plus all activations.
+
+      **"It OOMs on step 2, not step 1."** PyTorch optimizers allocate their state lazily, inside the first `step()`. Step 1's forward ran without Adam's $8N$ bytes of $m$ and $v$, and every later forward carries them. In the figure, step 1 peaks at 80 GB and step 2 at 96 GB, against an H100's ≈85.5 GB. The caching allocator's first-step warm-up also makes step 1 look different (memory profiling: `sys.profiling`).
+
+      **Inference** keeps only the weights (2 bytes per parameter in bf16) plus a KV cache. EleutherAI's heuristic is about $1.2\times$ the weight memory without a large cache. A 7B model needs about 17 GB to serve and 112 GB of model states to train.
+    source: Korthikanti et al. 2022 §4.3; Rajbhandari et al. 2020 §3.2; Ultra-Scale Playbook "Memory usage in Transformers › Profiling the memory usage"; EleutherAI Transformer Math 101 "Total Inference Memory"
+
+  - title: "A full budget, and which lever to pull"
+    body: |
+      ![States for a 1.27B model stay flat while activations grow with $s$: linearly with FlashAttention, quadratically when scores are stored. Computed from the formulas, $b=1$.](sys.memory-anatomy/memory-vs-seq)
+
+      **Worked budget.** A 13B GPT-style model ($h=5120$, $L=40$, $a=40$, $V=32000$), $s=4096$, $b=1$, bf16 mixed-precision Adam, FlashAttention, one GPU:
+      - $N=Vh+L(12h^2+13h)\approx12.7\times10^9$.
+      - Model states: $16N\approx204$ GB.
+      - Activations: $34sbhL\approx28.5$ GB.
+      - Logits and their gradient: $2\times4sbV\approx1.0$ GB.
+      - CUDA context: 1–2 GB.
+      - **Total about 235 GB. It does not fit on an H100 (≈80 GiB ≈ 85.5 GB).**
+
+      **Diagnose before you pull.** Model states are 87% of the budget, so activation tricks cannot fix this. Even zero activation memory leaves 204 GB. The first lever is to **shard model states**: ZeRO-3/FSDP over 8 GPUs gives $204/8\approx25.5$ GB per GPU, and with activations about 57 GB fits.
+
+      **Lever → term it targets** (one line each, taught later):
+      - Micro-batch size + gradient accumulation → activations ∝ $b$ (`sys.gradient-accumulation`).
+      - Activation checkpointing → activations, down to $2sbh$ per layer plus recompute (`sys.activation-checkpointing`).
+      - Tensor, sequence and pipeline parallelism → split activations and parameters across GPUs (`sys.tensor-parallel`, `sys.pipeline-parallel`).
+      - ZeRO/FSDP → shard optimizer state, gradients, then parameters (`sys.zero`, `sys.fsdp`).
+      - CPU offload, 8-bit or factored optimizers → optimizer state.
+      - LoRA/QLoRA for fine-tuning → no gradients or optimizer state for the frozen base (`llm.lora`).
+
+      **Scope.** These formulas count the dominant tensors of a dense GPT-style layer. Real usage adds allocator overhead and framework buffers, so treat an estimate within about 10–20% of capacity as "will probably OOM".
+    source: Korthikanti et al. 2022 §4; Rajbhandari et al. 2020 §3; Ultra-Scale Playbook "Memory usage in Transformers"; numbers recomputed
+
+  - title: "What interviewers probe"
+    body: |
+      - *"Estimate memory to fine-tune a 7B model with Adam."* Model states take $16\times7\text{e}9=112$ GB (140 GB with an fp32 gradient buffer). Activations take about $34sbhL$ with FlashAttention, about 18 GB at 4k context with $b=1$. It does not fit one 80 GB GPU: shard, or use LoRA (about 14 GB of frozen weights plus small adapter states).
+      - *"What is the 34 in 34sbh?"* Bytes per $sbh$ element-slot in a GeLU layer with dropout. Attention linear parts 11 (QKV input 2, Q and K 4, V 2, output-projection input 2, mask 1), MLP 19 (2 + 8 + 8 + 1), LayerNorms 4.
+      - *"Why does activation memory dominate at long context?"* The $5as^2b$ score term grows quadratically, and even the linear $34sbh$ part grows while model states stay fixed. FlashAttention removes the quadratic part.
+      - *"Why OOM on the second step?"* Adam's $m$ and $v$ ($8N$ bytes) are allocated in the first `step()`, so only later forwards carry them.
+      - *"Does mixed precision halve memory?"* Activations, yes. Model states, no: still 16 bytes per parameter.
+      - *"Why is inference so much cheaper?"* No gradients, no optimizer state, and activations are discarded layer by layer. Only weights and the KV cache stay.
+      - *"Is activation memory proportional to batch size?"* Yes, linear in $b$. In $s$ it is linear with FlashAttention, and partly quadratic without.
+    source: Korthikanti et al. 2022 §4.1; Rajbhandari et al. 2020 §3.1; Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - title: "Key results"
+    body: |
+      - Model states (bytes/param): SGD 8, SGD+momentum 12, Adam fp32 16, mixed Adam 16 ($2+2+4+4+4$), with an fp32 gradient buffer 20, 8-bit Adam about 10. ZeRO writes $(2+2+K)\Psi$ with $K=12$.
+      - Parameter count:
+
+      $$N=Vh+L(12h^2+13h)+2h$$
+
+      - Activations per layer (16-bit activations, 1-byte masks):
+
+      $$\begin{aligned}&sbh\Big(34+\frac{5as}{h}\Big)\\&=\underbrace{11sbh}_{\text{attn}}+\underbrace{5as^2b}_{\text{scores}}+\underbrace{19sbh}_{\text{MLP}}+\underbrace{4sbh}_{\text{LN}}\end{aligned}$$
+
+      - With FlashAttention, about $34sbh$ (about $32sbh$ without dropout). Linear in $b$ and $s$.
+      - Logits: $4sbV$ bytes in fp32, the same again for the gradient.
+      - Overheads: CUDA context 1–2 GB, temporary fp32 buffers ($4N$ for a flattened gradient buffer), fragmentation.
+      - Peak at the forward/backward boundary. Optimizer state appears at the first `step()`, hence OOM on step 2.
+      - Examples: 7B → 112 GB of states. GPT-3 layer at $s=2048$ → 2.87 GB. 6.6B at 4k: 104 GB of activations without FlashAttention, 18.3 GB with it.
+    source: Korthikanti et al. 2022 §4; Rajbhandari et al. 2020 §3; Ultra-Scale Playbook "Memory usage in Transformers"
+
+quiz:
+  - id: q1
+    prompt: |
+      A GPT-style model with $h=4096$, $L=32$, $V=32000$ has $N\approx6.58\times10^9$ parameters. How much memory do its model states take with mixed-precision Adam (bf16 weights and gradients, fp32 master, $m$, $v$)?
+    correct: '≈ 105 GB'
+    wrong:
+      - '≈ 13 GB'
+      - '≈ 79 GB'
+      - '≈ 132 GB'
+    explanation: |
+      $16\times6.58\times10^9\approx105$ GB. 13 GB is the bf16 weights alone (inference). 79 GB counts only the 12 bytes of optimizer state (master, $m$, $v$). 132 GB uses the 20-byte layout with an extra fp32 gradient buffer.
+    source: Rajbhandari et al. 2020 §3.1; Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - id: q2
+    prompt: |
+      For the 6.6B config ($h=4096$, $a=32$, $b=1$), sequence length goes from 4096 to 8192. By what factor does activation memory grow with and without FlashAttention?
+    correct: '×2 with FlashAttention; about ×3.6 without'
+    wrong:
+      - '×2 in both cases, since activations are linear in $s$'
+      - '×4 in both cases, since attention is quadratic in $s$'
+      - '×1 with FlashAttention; ×4 without'
+    explanation: |
+      With FlashAttention a layer is about $34sbh$, linear in $s$, so it doubles. Without it, a layer is $sbh(34+5as/h)$ with $5as/h=160$ at 4096 and 320 at 8192. The ratio is $2\times354/194\approx3.65$: the quadratic term quadruples but the linear part only doubles. FlashAttention removes the $s^2$ terms, not the dependence on $s$.
+    source: Korthikanti et al. 2022 §4.1; numbers recomputed
+
+  - id: q3
+    prompt: |
+      Training completes step 1 but runs out of memory during the forward pass of step 2, with the same batch shape. What is the most likely cause?
+    correct: Adam's $m$ and $v$ are allocated in the first `step()`
+    wrong:
+      - Activations from step 1 are cached and reused by step 2
+      - The loss scale doubles after step 1, doubling the gradient memory
+      - The caching allocator frees step 1's activations only at the end of step 2
+    explanation: |
+      PyTorch optimizers create their state lazily on the first `step()`. Step 1's forward ran without the $8N$ bytes of fp32 $m$ and $v$, and every later forward carries them. Activations are freed during backward, not cached across steps. The loss scale changes gradient *values*, never tensor sizes.
+    source: Ultra-Scale Playbook "Memory usage in Transformers › Profiling the memory usage"
+
+  - id: q4
+    prompt: |
+      Which statement is **false**?
+    correct: Mixed-precision Adam halves the memory of model states
+    wrong:
+      - Activation memory is proportional to the micro-batch size
+      - Optimizer state is 12 of mixed-precision Adam's 16 bytes per parameter
+      - The logits for the loss are commonly kept in fp32
+    explanation: |
+      Mixed-precision Adam uses $2+2+4+4+4=16$ bytes per parameter, the same as fp32 Adam. It saves activation memory, not model states. ZeRO counts the fp32 master, $m$ and $v$ as optimizer state ($K=12$). Every activation tensor has a factor $b$. Korthikanti et al. count fp32 logits as $4sbV$.
+    source: Rajbhandari et al. 2020 §3.1; Korthikanti et al. 2022 §4.3
+
+  - id: q5
+    prompt: |
+      Using $sbh(34+5as/h)$ bytes per layer, what is the activation memory of **one** GPT-3 layer ($s=2048$, $b=1$, $h=12288$, $a=96$)?
+    correct: '≈ 2.9 GB'
+    wrong:
+      - '≈ 0.86 GB'
+      - '≈ 1.4 GB'
+      - '≈ 5.7 GB'
+    explanation: |
+      $5as/h=80$, so a layer is $sbh\times114=2.52\times10^7\times114\approx2.87$ GB. 0.86 GB drops the score term, as with FlashAttention. 1.4 GB halves the result, as if the formula counted elements rather than bytes. 5.7 GB doubles it, as if activations were fp32.
+    source: Korthikanti et al. 2022 §4.1
+
+  - id: q6
+    prompt: |
+      In Korthikanti et al.'s count, where does the coefficient 5 in the $5as^2b$ term come from?
+    correct: Softmax output (2) + dropout mask (1) + dropout output (2)
+    wrong:
+      - Q, K and V (2 each) minus a 1-byte saving from fusion
+      - Scores (2) in the forward plus their gradient (3) in the backward
+      - Five $s\times s$ matmuls per head, at 1 byte each
+    explanation: |
+      Three versions of the $a\times s\times s$ score matrix are kept per sequence. The softmax output (2 bytes per entry) is needed by its backward, the dropout mask (1 byte) to reapply the mask, and the dropout output (2 bytes) as the input of the $PV$ matmul. $Q$, $K$, $V$ are $s\times h$ tensors and sit in the $sbh$ terms. Gradients are not activations.
+    source: Korthikanti et al. 2022 §4.1
+
+  - id: q7
+    prompt: |
+      What is the size of the fp32 logits tensor alone (not its gradient) for $s=4096$, $b=2$, $V=128{,}000$?
+    correct: '≈ 4.2 GB'
+    wrong:
+      - '≈ 2.1 GB'
+      - '≈ 8.4 GB'
+      - '≈ 0.52 GB'
+    explanation: |
+      $4\,\text{bytes}\times4096\times2\times128000\approx4.19\times10^9$ bytes. 2.1 GB is the bf16 size, or the fp32 size at $b=1$. 8.4 GB adds the gradient, which the question excludes. 0.52 GB is what you get with a 32k vocabulary at $b=1$. Large vocabularies are why fused or chunked cross-entropy matters.
+    source: Korthikanti et al. 2022 §4.3
+
+  - id: q8
+    prompt: |
+      A 13B model ($s=4096$, $b=1$, FlashAttention, mixed-precision Adam) needs about 204 GB of model states and 28.5 GB of activations. Which single change is most likely to make it fit on 80 GB H100s?
+    correct: Shard model states across 8 GPUs with ZeRO-3/FSDP
+    wrong:
+      - Turn on full activation checkpointing
+      - Halve the micro-batch with gradient accumulation
+      - Store the gradients in bf16 instead of fp32
+    explanation: |
+      Model states are about 87% of the budget, so activation levers (checkpointing, a smaller micro-batch) cannot bring 204 GB under 80. Sharding gives $204/8\approx25.5$ GB per GPU, about 57 GB with activations. The budget already assumes bf16 gradients (16 bytes per parameter), so there is nothing to save there.
+    source: Rajbhandari et al. 2020 §3, §5; Korthikanti et al. 2022 §4
+
+  - id: q9
+    prompt: |
+      Use $N=Vh+L(12h^2+13h)+2h$ for $h=5120$, $L=40$, $V=32000$. Approximately how many parameters?
+    correct: '≈ 12.7B'
+    wrong:
+      - '≈ 8.6B'
+      - '≈ 25.3B'
+      - '≈ 6.6B'
+    explanation: |
+      $12Lh^2=12\times40\times5120^2\approx12.58\times10^9$, plus $Vh\approx0.16\times10^9$, gives about $12.7\times10^9$. 8.6B uses $8h^2$ per layer, as if the MLP were $2h$ wide. 25.3B doubles the per-layer count. 6.6B is the $h=4096$, $L=32$ model.
+    source: Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - id: q10
+    prompt: |
+      You switch from mixed-precision Adam to mixed-precision SGD with momentum (bf16 weights and gradients, fp32 master and momentum). How many bytes per parameter do model states save?
+    correct: '4'
+    wrong:
+      - '8'
+      - '12'
+      - '2'
+    explanation: |
+      Adam: $2+2+4+4+4=16$. SGD with momentum: $2+2+4+4=12$. Only the second moment $v$ disappears, saving 4 bytes. Saving 8 would require dropping the master copy too, but it is still needed for small updates.
+    source: EleutherAI Transformer Math 101 "Optimizer States"; Rajbhandari et al. 2020 §3.1
+
+  - id: q11
+    prompt: |
+      You serve a 13B model ($N\approx12.75\times10^9$) in bf16 with a short context, so the KV cache is small. Using EleutherAI's rule of thumb (total ≈ 1.2 × weight memory), roughly how much GPU memory do you need?
+    correct: '≈ 31 GB'
+    wrong:
+      - '≈ 26 GB'
+      - '≈ 61 GB'
+      - '≈ 204 GB'
+    explanation: |
+      The weights take $2\times12.75\times10^9\approx25.5$ GB, and $1.2\times25.5\approx30.6$ GB. 26 GB leaves out the forward-pass overhead. 61 GB assumes fp32 weights. 204 GB is the training model-state budget (16 bytes per parameter): inference keeps no gradients or optimizer state, and frees activations layer by layer.
+    source: EleutherAI Transformer Math 101 "Total Inference Memory"
+
+  - id: q12
+    prompt: |
+      PyTorch reports 79.1 GiB of total memory on your GPU. Your estimate for a training run is 76 GB ($10^9$ bytes) of tensors. What is the best prediction?
+    correct: It fits, with about 8 GiB left for context and buffers
+    wrong:
+      - 'Likely OOM: 76 is within 4% of 79.1'
+      - OOM, because 76 GB exceeds the 74.5 GiB an 80 GB card really has
+      - It fits only if the caching allocator compresses idle tensors
+    explanation: |
+      Convert first: $76\times10^9/2^{30}\approx70.8$ GiB, which leaves about 8.3 GiB. That covers a 1–2 GB CUDA context plus some buffers and fragmentation. Comparing 76 with 79.1 directly treats GB as GiB. An 80 GB H100 actually has about 80 GiB of HBM, not 74.5 GiB. The caching allocator never compresses anything.
+    source: Ultra-Scale Playbook "Memory usage in Transformers" (CUDA kernels 1–2 GB note); Rajbhandari et al. 2020 §3.2
+
+cards:
+  - id: f1
+    front: Bytes per parameter for model states under SGD, SGD+momentum, fp32 Adam, mixed Adam, and mixed Adam with an fp32 gradient buffer.
+    back: |
+      - SGD: 8
+      - SGD+momentum: 12
+      - fp32 Adam: 16
+      - mixed Adam: $2+2+4+4+4=16$
+      - with an fp32 gradient buffer: 20
+
+      ZeRO writes $(2+2+K)\Psi$ with $K=12$. For 7B: 112 GB, or 140 GB with the buffer.
+    source: Rajbhandari et al. 2020 §3.1; Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - id: f2
+    front: Parameter count of a GPT-style transformer from $h$, $L$, $V$, and where $12h^2$ comes from.
+    back: |
+      $$N=Vh+L(12h^2+13h)+2h$$
+
+      Attention has 4 $h\times h$ matrices ($4h^2$). The MLP has $h\times4h$ and $4h\times h$ ($8h^2$). The $13h$ is biases plus LayerNorm parameters. With tied embeddings the vocabulary adds $Vh$. Example: $h=4096$, $L=32$, $V=32000$ gives $6.58\times10^9$.
+    source: Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - id: f3
+    front: Per-layer activation memory of a GPT layer (Korthikanti), with the itemised terms.
+    back: |
+      $$sbh\Big(34+\frac{5as}{h}\Big)\text{ bytes}$$
+
+      That is attention $11sbh+5as^2b$, MLP $19sbh$ and LayerNorms $4sbh$, assuming 16-bit activations and 1-byte dropout masks. The $5as^2b$ term is the softmax output, mask and dropout output of the scores.
+    source: Korthikanti et al. 2022 §4.1
+
+  - id: f4
+    front: How do FlashAttention, removing dropout, and SwiGLU change per-layer activation memory?
+    back: |
+      - **FlashAttention**: the $5as^2b$ term disappears, leaving about $34sbh$, linear in $s$.
+      - **No dropout**: the two 1-byte masks go, leaving about $32sbh$.
+      - **SwiGLU** with $d_{ff}=\tfrac83h$: eager PyTorch saves the input plus four $d_{ff}$-wide tensors (including SiLU(gate)), about $23.3sbh$. A fused kernel that recomputes SiLU saves about $18sbh$, the same as a GeLU MLP without dropout.
+    source: Korthikanti et al. 2022 §4.1; Dao et al. 2022 §3.1
+
+  - id: f5
+    front: Memory of the output logits, and an example.
+    back: |
+      $4sbV$ bytes in fp32, the same again for their gradient. For $s=4096$, $b=1$, $V=128$k: about 2.1 GB each. Use fused or chunked cross-entropy to avoid materialising them.
+    source: Korthikanti et al. 2022 §4.3
+
+  - id: f6
+    front: Besides model states and activations, what else takes GPU memory during training?
+    back: |
+      - CUDA context and kernels: 1–2 GB.
+      - Temporary buffers: GEMM workspaces, flattened fp32 gradient buffers ($4N$, 6 GB for 1.5B parameters), communication buckets, all-gathered shards, optimizer temporaries.
+      - Fragmentation: ZeRO saw OOMs with over 30% of memory free in extreme cases.
+    source: Rajbhandari et al. 2020 §3.2; Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - id: f7
+    type: open
+    front: Derive the per-layer activation memory $sbh(34+5as/h)$ for a GPT layer, saying why each tensor must be kept.
+    back: |
+      Assume 2-byte activations and 1-byte dropout masks. An $s\times b\times h$ tensor costs $2sbh$ bytes.
+      - **Attention**
+        - QKV input $2sbh$ (weight gradients need $X$).
+        - $Q$ and $K$, $4sbh$ (backward of $QK^\top$).
+        - Softmax output $2as^2b$ (the softmax backward uses $p$).
+        - Dropout mask $as^2b$.
+        - Dropout output $2as^2b$ and $V$ $2sbh$ (backward of $PV$).
+        - Output-projection input $2sbh$.
+        - Output mask $sbh$.
+        - Total: $11sbh+5as^2b$.
+      - **MLP**: first-linear input $2sbh$, GeLU input $8sbh$, second-linear input $8sbh$, mask $sbh$. Total $19sbh$.
+      - **LayerNorms**: two inputs, $4sbh$. Their mean and variance are $O(sb)$, ignored.
+      - **Sum**: $34sbh+5as^2b=sbh(34+5as/h)$. Only the score terms are quadratic in $s$.
+      - **Recount for your setup**: FlashAttention removes them (about $34sbh$), and so on.
+    source: Korthikanti et al. 2022 §4.1
+
+  - id: f8
+    type: open
+    front: Estimate the per-GPU memory to train a 13B model (h=5120, L=40, a=40, V=32k) at 4k context, micro-batch 1, bf16 + Adam, FlashAttention, no sharding. What do you change first?
+    back: |
+      1. $N\approx Vh+12Lh^2\approx0.16+12.58\approx12.7\times10^9$.
+      2. **Model states**: $16N\approx204$ GB.
+      3. **Activations**: $34sbhL=34\times4096\times5120\times40\approx28.5$ GB.
+      4. **Logits** (fp32, $V=32$k): about 0.5 GB, and the same for their gradient.
+      5. **CUDA context**: 1–2 GB.
+      6. **Total**: about 235 GB, almost 3× an H100.
+      7. **Diagnosis**: model states are 87% of it, so activation checkpointing or smaller batches cannot help.
+      8. **First lever**: shard states with ZeRO-3/FSDP. Over 8 GPUs that is about 25.5 GB of states per GPU plus 28.5 GB of activations, about 57 GB, which fits. Alternatives: offload the optimizer state to CPU, or LoRA if fine-tuning.
+      9. **Then** tune activations: checkpointing, or tensor/sequence parallelism for longer context.
+    source: Korthikanti et al. 2022 §4; Rajbhandari et al. 2020 §3, §5; Ultra-Scale Playbook "Memory usage in Transformers"
+
+  - id: f9
+    type: open
+    front: Explain to an interviewer why a model that is 14 GB in bf16 cannot be trained on an 80 GB GPU, and what the memory looks like over one step.
+    back: |
+      - **Model states.** Training stores per parameter the bf16 weights (2), bf16 gradients (2), fp32 master weights (4), and Adam's $m$ and $v$ (4 + 4), for 16 bytes. That is 112 GB for 7B, before activations. Optimizer state (12 bytes) dominates.
+      - **Activations.** Every op saves what its backward needs (inputs of linears, nonlinearity inputs, softmax outputs, masks). That is about $34sbh$ per layer with FlashAttention, scaling with batch and sequence length.
+      - **Over a step.**
+        - In the forward, activations rise layer by layer to a peak at the forward/backward boundary.
+        - In the backward, activations are freed as gradients appear.
+        - At the optimizer step, gradients and state are live, and gradients are then freed.
+        - Adam's state is created in the first `step()`, so the second step's peak is $8N$ higher, which is the classic "OOM on step 2".
+      - **Overheads**: CUDA context (1–2 GB), temporary buffers, fragmentation.
+      - **Fixes**: shard states (ZeRO/FSDP), checkpoint activations, model parallelism, or LoRA for fine-tuning.
+    source: Rajbhandari et al. 2020 §3; Ultra-Scale Playbook "Memory usage in Transformers"; Korthikanti et al. 2022 §4.1
+
+  - id: f10
+    type: open
+    front: Map each memory-saving technique to the memory term it reduces, and say what it costs.
+    back: |
+      - **Smaller micro-batch + gradient accumulation** → activations (∝ $b$). Costs throughput (less parallel work per kernel).
+      - **Activation checkpointing** → activations, down to $2sbh$ per layer plus whatever is recomputed. Costs up to one extra forward pass.
+      - **FlashAttention** → the $5as^2b$ score terms. It is also faster.
+      - **Tensor / sequence parallelism** → activations and parameters inside layers, divided by $t$. Costs collectives inside every layer.
+      - **Pipeline parallelism** → parameters and states by stage. Costs a bubble, and the first stage still holds activations for in-flight micro-batches.
+      - **ZeRO-1/2/3 or FSDP** → optimizer state, then gradients, then parameters, divided by the data-parallel size. Costs extra all-gathers in ZeRO-3.
+      - **CPU offload** → optimizer state or parameters. Costs PCIe traffic.
+      - **8-bit or factored optimizers** → optimizer state. Costs possible stability issues.
+      - **LoRA/QLoRA** → gradients and optimizer state of the frozen base (and with QLoRA the weights themselves). Fine-tuning only.
+      - **Mixed precision** → activations and communication, *not* model states.
+    source: Korthikanti et al. 2022 §4–5; Rajbhandari et al. 2020 §5–6; EleutherAI Transformer Math 101 "Activations and Batch Size"
+
+reading:
+  - title: "Korthikanti et al. (2022), Reducing Activation Recomputation in Large Transformer Models, §4"
+    url: https://arxiv.org/abs/2205.05198
+    kind: paper
+    note: The itemised derivation of $sbh(34+5as/h)$ (§4.1), the logits and embedding terms (§4.3), and Table 2 for tensor/sequence parallelism and recomputation.
+  - title: "Rajbhandari et al. (2020), ZeRO, §3"
+    url: https://arxiv.org/abs/1910.02054
+    kind: paper
+    note: Model states $16\Psi$ with $K=12$ (§3.1), and residual states such as activations, temporary buffers and fragmentation (§3.2).
+  - title: "Ultra-Scale Playbook: Memory usage in Transformers"
+    url: https://huggingface.co/spaces/nanotron/ultrascale-playbook
+    kind: book
+    note: A memory profile of real training steps (first step vs later), the parameter formula, and the 16 vs 20 bytes-per-parameter table.
+  - title: "EleutherAI, Transformer Math 101: Memory Requirements"
+    url: https://blog.eleuther.ai/transformer-math/
+    kind: blog
+    note: Quick rules of thumb for inference (1.2× weights), optimizer variants (8-bit, SGD), and activation formulas with tensor parallelism.

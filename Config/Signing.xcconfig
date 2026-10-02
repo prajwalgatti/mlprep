@@ -1,0 +1,6 @@
+// Shared signing defaults. Don't put your own Team ID here: copy
+// Config/Local.xcconfig.example to Config/Local.xcconfig (git-ignored) instead.
+DEVELOPMENT_TEAM =
+BUNDLE_ID_PREFIX = io.github.prajwalgatti
+
+#include? "Local.xcconfig"

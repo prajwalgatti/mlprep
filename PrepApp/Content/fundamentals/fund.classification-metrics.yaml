@@ -1,0 +1,531 @@
+id: fund.classification-metrics
+area: fundamentals
+title: Precision, Recall, F1 & ROC/PR Curves
+summary: From a score and a threshold to the confusion matrix. Why precision depends on prevalence, how to pick a threshold, what AUC really measures, why PR curves can't be interpolated linearly, and how to average over classes.
+order: 190
+level: core
+tags: [evaluation, metrics, imbalance, roc, precision-recall]
+prereqs: [fund.bayes-theorem]
+
+explainer:
+  - title: "The problem: one score, many possible decisions"
+    body: |
+      Most classifiers output a **score** $s(x)$, such as a probability or a logit. A **threshold** $t$ turns it into a decision: predict positive if $s(x)\geq t$. Each threshold gives a different set of decisions, so "how good is this classifier?" has no single answer. We need to describe the decisions at one threshold, and then the whole family of thresholds.
+
+      **The confusion matrix** counts four outcomes at a given threshold:
+      - **TP**: positives predicted positive. **FN**: positives predicted negative.
+      - **FP**: negatives predicted positive. **TN**: negatives predicted negative.
+
+      There are $P=TP+FN$ actual positives and $N=FP+TN$ actual negatives. The **prevalence** is $\pi=P/(P+N)$.
+
+      **The core rates**, each with its conditional-probability meaning:
+      - **Recall** = TPR = sensitivity $=TP/P=\Pr(\hat y{=}1\mid y{=}1)$: the share of positives we catch.
+      - **FPR** $=FP/N=\Pr(\hat y{=}1\mid y{=}0)$: the false-alarm rate among negatives. **Specificity** $=TN/N=1-\text{FPR}$.
+      - **Precision** = PPV $=TP/(TP+FP)=\Pr(y{=}1\mid\hat y{=}1)$: the share of flagged items that are real.
+      - **Accuracy** $=(TP+TN)/(P+N)=\pi\,\text{TPR}+(1-\pi)(1-\text{FPR})$.
+
+      **The key distinction is what each rate conditions on.** TPR, FPR and specificity condition on the *true* class. They describe the score distributions within each class and don't change if the class mix changes. Precision conditions on the *prediction*, and accuracy mixes the two classes in proportion $\pi$, so both depend on prevalence. Most of this lesson follows from that one fact.
+    source: Murphy PML1 §5.1.3.1 (Tables 5.3–5.5); Goodfellow DL §11.1
+
+  - title: Precision depends on prevalence
+    body: |
+      **Derivation.** Precision is a posterior probability, so apply Bayes' rule:
+
+      $$\begin{aligned}\text{Prec}&=\Pr(y{=}1\mid\hat y{=}1)\\&=\frac{\text{TPR}\cdot\pi}{\text{TPR}\cdot\pi+\text{FPR}\cdot(1-\pi)}.\end{aligned}$$
+
+      The numerator is the rate of true alarms in the population. The denominator adds the false alarms, which come from the much larger negative class when $\pi$ is small.
+
+      **Worked example.** A detector with TPR $=0.9$ and FPR $=0.05$:
+      - At $\pi=50\%$: precision $=0.45/(0.45+0.025)=0.95$.
+      - At $\pi=1\%$: precision $=0.009/(0.009+0.0495)=0.15$. About 85% of alerts are false, with the same detector.
+
+      Murphy writes the same thing as $\text{Prec}=\text{TPR}/(\text{TPR}+\text{FPR}/r)$ with $r=\pi/(1-\pi)$. As positives get rarer, $r\to0$ and precision collapses unless FPR falls with it.
+
+      **Accuracy under imbalance.** "Always predict negative" scores accuracy $1-\pi$ (99% at $\pi=1\%$) with recall 0. Accuracy is dominated by the majority class.
+
+      **Report counts for rare classes.** On a class with 20 positives, "+0.05 sensitivity" is exactly one more example caught ($0.05\times20=1$). It is well within run-to-run noise. Report the counts alongside the rates.
+    source: Murphy PML1 §5.1.4.4 (eq. 5.28); Tuning Playbook §"Choosing a sample for periodic evaluation"
+
+  - title: F1 and Fβ
+    body: |
+      **Why combine P and R.** We often want one number per threshold. The arithmetic mean $(P+R)/2$ can be gamed. Flag everything at $\pi=2\%$: then $R=1$, $P=0.02$, and the mean is 0.51 for a useless classifier.
+
+      **F1 is the harmonic mean:**
+
+      $$\frac1{F_1}=\frac12\Big(\frac1P+\frac1R\Big)\;\Rightarrow\;F_1=\frac{2PR}{P+R}.$$
+
+      Substitute $1/P=(TP+FP)/TP$ and $1/R=(TP+FN)/TP$:
+
+      $$F_1=\frac{2TP}{2TP+FP+FN}=\frac{TP}{TP+\tfrac12(FP+FN)}.$$
+
+      Read: TP against the *average* of the two error counts. TN never appears, so F1 is unaffected by however many easy negatives there are. The harmonic mean is pulled toward the smaller of $P$ and $R$, so the flag-everything classifier gets $F_1=0.04$.
+
+      ![Iso-F1 curves hug the axes. Both P and R must be high for a high F1, while the arithmetic mean (dashed) rates "flag everything" at 0.5.](fund.classification-metrics/f1-contours)
+
+      **Fβ** weights recall $\beta$ times as much as precision:
+
+      $$\begin{aligned}F_\beta&=\frac{(1+\beta^2)PR}{\beta^2P+R}\\&=\frac{(1+\beta^2)TP}{(1+\beta^2)TP+\beta^2FN+FP}.\end{aligned}$$
+
+      Use $\beta=2$ when misses are costly (screening) and $\beta=0.5$ when false alarms are.
+
+      **Asymmetry.** F1 depends on which class you call positive. Swapping the labels replaces TP by TN in the formula. Accuracy and ROC don't have this asymmetry.
+
+      **Baseline.** A random classifier that predicts positive with probability $p$ has the highest F1 at $p=1$, i.e. always-positive: $F_1=2\pi/(1+\pi)$, which is about 0.02 at $\pi=1\%$.
+    source: Murphy PML1 §5.1.4.3 (eqs. 5.24–5.27); Flach & Kull 2015 §2.1, §3.1
+
+  - title: Choosing the threshold
+    body: |
+      **Costs give the threshold.** Suppose $p(x)=\Pr(y{=}1\mid x)$ is calibrated, a false positive costs $c_{FP}$, a false negative costs $c_{FN}$, and correct decisions cost nothing. Predicting positive has expected cost $c_{FP}(1-p)$; predicting negative has expected cost $c_{FN}\,p$. Predict positive when the second exceeds the first:
+
+      $$\begin{aligned}c_{FN}\,p&>c_{FP}(1-p)\\ \iff p&>t^*=\frac{c_{FP}}{c_{FP}+c_{FN}}.\end{aligned}$$
+
+      With equal costs $t^*=\tfrac12$. If a miss costs twice a false alarm, $t^*=1/3$. The threshold moves *down* as misses get more expensive.
+
+      **F1 has its own optimum.** For a perfectly calibrated classifier, the F1-optimal threshold equals **half the best achievable F1**. If the best F1 is 0.6, flag everything with $p>0.3$. Since $F_1\leq1$, this threshold never exceeds ½, so F1-optimal thresholds sit below the accuracy-optimal ½. "Threshold at 0.5" is optimal only for equal costs and calibrated scores.
+
+      **In practice.**
+      - Scores are often *not* calibrated, e.g. after class reweighting, focal loss or an over-confident network. Then choose $t$ on validation data to minimise estimated cost, or to meet a constraint such as "precision ≥ 0.9" or "recall ≥ 0.95". Never choose it on the test set.
+      - Threshold choice can matter more than the model. Two models with the same AUC can have very different costs at the operating point you deploy.
+      - Calibration is its own topic (fund.calibration). Ranking metrics like AUC can't detect miscalibration.
+    source: Murphy PML1 §5.1.2.2 (eqs. 5.9–5.10); Flach & Kull 2015 §2.1
+
+  - title: ROC curves
+    body: |
+      **Construction.** Sweep $t$ from $+\infty$ down to $-\infty$. At each threshold, plot $(\text{FPR}(t),\text{TPR}(t))$. The curve runs from $(0,0)$ (flag nothing) to $(1,1)$ (flag everything).
+
+      ![Synthetic binormal scorer: negatives ~ N(0,1), positives ~ N(1.5,1). The shaded tails at threshold t are TPR and FPR; that pair is one point on the ROC.](fund.classification-metrics/score-histograms)
+
+      **The diagonal is chance.** A classifier that flags each example with probability $p$, ignoring $x$, has TPR $=$ FPR $=p$. That is the point $(p,p)$. A curve *below* the diagonal is informative in reverse: flipping the decisions mirrors it above.
+
+      **Prior invariance.** Both axes condition on the true class. Changing the class mix, say by duplicating every negative 10 times, leaves the curve unchanged.
+
+      **The convex hull is achievable.** Take two operating points A and B. Use A with probability $\alpha$ and B otherwise. Expected TPR and FPR are then $\alpha\cdot$A $+(1-\alpha)\cdot$B, because the counts are linear in the mixing weight. So every point on the segment AB can be achieved, and the **ROC convex hull** is achievable. Points strictly below it are never optimal.
+
+      **Costs pick a point.** Expected cost is $c_{FN}\pi(1-\text{TPR})+c_{FP}(1-\pi)\text{FPR}$. Its level sets are lines in ROC space with slope
+
+      $$m=\frac{c_{FP}\,(1-\pi)}{c_{FN}\,\pi}.$$
+
+      The optimal operating point is where the highest such line touches the hull. With negatives outnumbering positives 10:1 and equal costs, $m=10$: a steep line that touches near the low-FPR corner. With balanced classes and misses 10× costlier, $m=0.1$: far right.
+    source: Fawcett 2006 §3, §3.1, §4.2, §6; Flach & Kull 2015 §2
+
+  - title: "AUC: the chance a positive outranks a negative"
+    body: |
+      **Derivation.** Let $S_+$ and $S_-$ be the scores of an independent random positive and random negative, with densities $f_+$ and $f_-$. Then $\text{TPR}(t)=\Pr(S_+>t)$ and $\text{FPR}(t)=\Pr(S_->t)$, so $d\,\text{FPR}=-f_-(t)\,dt$. Integrate along the curve (FPR from 0 to 1 means $t$ from $+\infty$ to $-\infty$):
+
+      $$\begin{aligned}\text{AUC}&=\int_0^1\text{TPR}\;d\,\text{FPR}\\&=\int_{-\infty}^{\infty}\Pr(S_+>t)\,f_-(t)\,dt\\&=\Pr(S_+>S_-).\end{aligned}$$
+
+      AUC is the probability that a random positive scores above a random negative. With discrete scores, ties count ½.
+
+      **From data.** Average over all positive–negative pairs:
+
+      $$\text{AUC}=\frac{1}{n_+n_-}\sum_{i\in+}\sum_{j\in-}\Big[\mathbb{1}(s_i>s_j)+\tfrac12\mathbb{1}(s_i=s_j)\Big].$$
+
+      This is the Mann–Whitney statistic divided by $n_+n_-$. Equivalently, rank all scores from lowest to highest (tied scores share the average rank) and let $R_+$ be the sum of the positives' ranks. Then $\text{AUC}=\big(R_+-\tfrac{n_+(n_++1)}2\big)/(n_+n_-)$.
+
+      **Worked example.** Positives score $\{0.9,0.6\}$ and negatives $\{0.7,0.2\}$. Of the 4 pairs, $0.9$ beats both negatives, and $0.6$ beats $0.2$ but loses to $0.7$. So AUC $=3/4$. By ranks: the order is $0.2,0.6,0.7,0.9$, so $R_+=2+4=6$ and $(6-3)/4=0.75$.
+
+      **Consequences.**
+      - AUC uses only the *ordering*, so any strictly increasing transform of the scores (sigmoid, log-odds, temperature) leaves it unchanged. It says nothing about calibration.
+      - AUC $<0.5$ means the ranking is reversed. Negate the score to get $1-$AUC.
+      - The Gini coefficient is $2\,\text{AUC}-1$.
+      - AUC averages over *all* thresholds. Two ROC curves can cross, so the higher-AUC model can be worse in the low-FPR region you actually deploy in.
+    source: Fawcett 2006 §7; Murphy PML1 §5.1.3.2
+
+  - title: PR curves, average precision and interpolation
+    body: |
+      **The PR curve** plots precision against recall as $t$ sweeps.
+      - **Baseline**: a random scorer has precision $\pi$ at every recall, so chance is a horizontal line at $\pi$, not the diagonal. PR values are only comparable between datasets with the same prevalence.
+      - **Not monotone**: lowering $t$ can admit a false positive (precision drops) and then several true positives (it rises again). Recall, in contrast, never decreases as $t$ falls.
+
+      **Average precision (AP)** summarises the curve by weighting the precision at each threshold by the recall it adds:
+
+      $$\text{AP}=\sum_k(R_k-R_{k-1})\,P_k.$$
+
+      This is a step-wise area. Two other summaries are in use. The *trapezoidal* area connects points with straight lines. *Interpolated* AP replaces each precision by the best precision at any higher recall. The three give different numbers, so say which one you report.
+
+      **Why straight lines are wrong** (Davis & Goadrich). Between two operating points A and B, intermediate classifiers trade positives for negatives at a fixed rate. Each extra TP comes with $(FP_B-FP_A)/(TP_B-TP_A)$ extra FPs, the *local skew*. Interpolating the counts gives
+
+      $$\text{Prec}(x)=\frac{TP_A+x}{TP_A+x+FP_A+\text{skew}\cdot x}.$$
+
+      Precision is a ratio, so this path is curved and sits *below* the straight line whenever precision falls from A to B:
+
+      ![Synthetic example with 100 positives. Interpolating counts (solid) gives the achievable curve; the straight line (dashed) overstates the area by the shaded region.](fund.classification-metrics/pr-interpolation)
+
+      In ROC space straight lines are fine, because TPR and FPR are each linear in the counts.
+    source: Davis & Goadrich 2006 §4; Murphy PML1 §5.1.4.2; Flach & Kull 2015 §2
+
+  - title: ROC vs PR when positives are rare
+    body: |
+      ![The same synthetic scorer evaluated at prevalence 50% and 1%. The ROC is identical; the PR curve collapses. Dotted lines are each PR baseline (= π).](fund.classification-metrics/roc-pr-pair)
+
+      **Why the PR curve collapses.** From the Bayes form, $\text{Prec}=\text{TPR}/\big(\text{TPR}+\text{FPR}\cdot\tfrac{1-\pi}{\pi}\big)$. At $\pi=1\%$ the factor $(1-\pi)/\pi$ is 99, so even an FPR of 1% adds 0.99 to the denominator, against a TPR of at most 1.
+
+      **In counts.** With 1M negatives and 1k positives, the operating point TPR $=0.9$ at FPR $=1\%$ gives 900 TPs and 10,000 FPs. That is a precision of 8%, from a point that sits near the ROC's top-left corner.
+
+      **They never disagree about dominance.** For a fixed set of positives and negatives, every ROC point maps to exactly one PR point. One curve dominates another in ROC space **if and only if** it dominates in PR space (Davis & Goadrich, Thm. 3.2). The two views disagree about *how big* differences look, and they can rank crossing curves differently by area.
+
+      **Which to use.**
+      - **ROC / AUC** when both classes matter, when you care about ranking quality as such, or when prevalence at deployment differs from your test set. The rates transfer across class mixes; precision doesn't.
+      - **PR / AP, or precision at a fixed recall** when positives are rare and each false alarm costs attention: fraud, retrieval, screening queues.
+      - "ROC is insensitive to imbalance" is true of the *curve*. It does not mean the operating points are useful under imbalance.
+    source: Davis & Goadrich 2006 §3 (Thms. 3.1–3.2); Murphy PML1 §5.1.3.3, §5.1.4.4
+
+  - title: Multiclass averaging and ranking metrics
+    body: |
+      **Per-class counts.** Treat each class $c$ as one-vs-rest to get $TP_c$, $FP_c$ and $FN_c$. Then:
+      - **Macro**: compute the metric per class and take the unweighted mean. Rare classes count as much as common ones.
+      - **Weighted**: the same, weighted by class support.
+      - **Micro**: pool the counts first, then compute.
+
+      **Micro-F1 = accuracy** in single-label multiclass. Each misclassified example counts once as an FP (for the predicted class) and once as an FN (for its true class). So $\sum_cFP_c=\sum_cFN_c=$ number of errors, which makes micro-P = micro-R $=\sum_cTP_c/n=$ accuracy.
+
+      **Averaging pitfalls.** F1 is not an average over examples. The mean of per-fold F1 scores differs from the F1 of pooled predictions, and taking arithmetic means of precision values is questionable in general. State which you report.
+
+      **Multiclass ROC.** Compute one-vs-rest AUC per class, then average: unweighted, or weighted by class prevalence (Provost & Domingos' version).
+
+      **Ranking and retrieval metrics** score a ranked list for each query.
+      - **P@k** = (relevant items in the top $k$)/$k$, and **R@k** = (relevant items in the top $k$)/(all relevant). Neither cares about order *within* the top $k$.
+      - **AP** per query is the formula from the PR card applied down the ranked list. **MAP** is the mean of AP over queries.
+      - **DCG** uses graded relevance $s_j$ at rank $j$ and discounts lower ranks:
+
+      $$\text{DCG@}k=\sum_{j=1}^{k}\frac{s_j}{\log_2(j+1)}$$
+
+      **NDCG@k** = DCG@k / IDCG@k, where IDCG is the DCG of the ideal ordering, so the score lies in $[0,1]$. It rewards putting the most relevant items first. A common variant uses $2^{s_j}-1$ as the gain.
+    source: Murphy PML1 §5.1.4.2; Flach & Kull 2015 §2.1, §3; Fawcett 2006 §9.2; CS229 notes §16.3 (retrieval evaluation, eqs. 16.1–16.3)
+
+  - title: Pitfalls and what interviewers probe
+    body: |
+      **Pitfalls**
+      - Quoting accuracy, precision or AP without the prevalence. None of them transfers to a different class mix.
+      - Thresholding at 0.5 by default. It's right only for calibrated scores with equal costs.
+      - Interpolating PR points linearly, or comparing AP from libraries with different conventions (step-wise, trapezoidal, interpolated).
+      - Averaging per-fold F1 and calling it "the F1".
+      - Treating AUC as calibration. AUC is unchanged by any monotone transform.
+      - Rebalancing the *test* set. Evaluate at the deployment prevalence. Rebalancing training data is a separate choice.
+      - Leaving precision undefined when nothing is flagged. Know your library's convention.
+
+      **Probe chain**
+      - *Precision vs recall, with an example where each matters?* Spam filtering needs precision, so real mail isn't lost. Cancer screening needs recall, so cases aren't missed.
+      - *Why the harmonic mean?* It is $TP/(TP+\frac12(FP+FN))$, so it can't be gamed by maxing one of P or R.
+      - *What does AUC mean?* $\Pr(S_+>S_-)$, derived from the ROC integral. It equals the Mann–Whitney statistic divided by $n_+n_-$.
+      - *Which metric survives duplicating every negative?* TPR, FPR, the ROC curve and ROC-AUC. Precision, AP, F1 and accuracy all change.
+      - *ROC or PR at 1:1000?* PR or precision at a target recall, because false-alarm *counts* dominate. Still report ROC-AUC for ranking.
+      - *How do you pick the threshold?* $t^*=c_{FP}/(c_{FP}+c_{FN})$ on calibrated probabilities, or a validation-set constraint.
+      - *Micro-F1 in single-label multiclass?* It equals accuracy, because every error is one FP and one FN.
+    source: Murphy PML1 §5.1.2–5.1.4; Fawcett 2006 §4.2, §7; Davis & Goadrich 2006 §4; Flach & Kull 2015 §2
+
+  - title: Key results
+    body: |
+      $$\text{Prec}=\frac{\text{TPR}\,\pi}{\text{TPR}\,\pi+\text{FPR}(1-\pi)}$$
+
+      - $F_1=\dfrac{2PR}{P+R}=\dfrac{2TP}{2TP+FP+FN}$; $F_\beta=\dfrac{(1+\beta^2)PR}{\beta^2P+R}$.
+      - Cost-optimal threshold on calibrated probabilities: $t^*=\dfrac{c_{FP}}{c_{FP}+c_{FN}}$. F1-optimal threshold (calibrated) $=F_1^*/2$.
+      - $\text{AUC}=\Pr(S_+>S_-)$, ties ½; equals $(R_+-n_+(n_++1)/2)/(n_+n_-)$.
+      - ROC: prevalence-invariant, chance is the diagonal, convex hull achievable, iso-cost slope $c_{FP}(1-\pi)/(c_{FN}\pi)$.
+      - PR: chance is $\pi$; interpolate counts with local skew $\Delta FP/\Delta TP$, never precision linearly.
+      - ROC dominance ⇔ PR dominance (fixed $P$, $N$).
+      - Micro-F1 = accuracy (single-label). $\text{DCG@}k=\sum_j s_j/\log_2(j+1)$.
+    source: Murphy PML1 §5.1.2–5.1.4; Fawcett 2006 §6–7; Davis & Goadrich 2006 §3–4; Flach & Kull 2015 §2.1
+
+quiz:
+  - id: q1
+    prompt: |
+      TP = 40, FP = 10, FN = 60, TN = 890. What is the F1 score?
+    correct: '$\approx 0.53$'
+    wrong:
+      - '$0.60$'
+      - '$0.93$'
+      - '$0.40$'
+    explanation: |
+      Precision $=40/50=0.8$ and recall $=40/100=0.4$, so $F_1=2(0.8)(0.4)/1.2\approx0.533$. Equivalently $2TP/(2TP+FP+FN)=80/150$. $0.60$ is the arithmetic mean, $0.93$ is the accuracy (inflated by 890 TNs, which F1 ignores), and $0.40$ is the recall.
+    source: Murphy PML1 §5.1.4.3 (eq. 5.27)
+
+  - id: q3
+    prompt: |
+      1% of examples are positive. For a scorer that outputs random scores, ROC-AUC and PR-AUC are approximately:
+    correct: ROC-AUC 0.5 and PR-AUC 0.01
+    wrong:
+      - ROC-AUC 0.5 and PR-AUC 0.5
+      - ROC-AUC 0.01 and PR-AUC 0.5
+      - ROC-AUC 0.99 and PR-AUC 0.01
+    explanation: |
+      A random ranking gives TPR = FPR at every threshold, so the ROC is the diagonal with area 0.5. Precision stays at the base rate at every recall, so PR-AUC equals the prevalence. That's why PR-AUC values can't be compared across datasets with different base rates.
+    source: Flach & Kull 2015 §2; Fawcett 2006 §3.1
+
+  - id: q5
+    prompt: |
+      Which statement is **false**?
+    correct: Applying a sigmoid to raw classifier scores changes the ROC-AUC
+    wrong:
+      - F1 does not depend on the number of true negatives
+      - AUC is the chance a random positive outscores a random negative
+      - The Gini coefficient of a scorer equals $2\cdot\text{AUC}-1$
+    explanation: |
+      ROC-AUC depends only on the order of the scores, and a sigmoid is strictly increasing, so the order and the AUC are unchanged. This is also why AUC says nothing about calibration. The other three are true: $F_1=2TP/(2TP+FP+FN)$ has no TN, AUC $=\Pr(S_+>S_-)$, and Gini $+1=2\,$AUC.
+    source: Fawcett 2006 §7; Flach & Kull 2015 §2.1
+
+  - id: q7
+    prompt: |
+      Raising a classifier's decision threshold always:
+    correct: Leaves recall the same or lowers it
+    wrong:
+      - Raises precision, whatever the scores
+      - Raises recall by flagging more items
+      - Lowers precision by adding false alarms
+    explanation: |
+      A higher threshold flags a subset of what was flagged before. TP can't grow while the number of actual positives is fixed, so recall is non-increasing. Precision usually rises but can fall, if the removed predictions were mostly TPs. That is why PR curves are not monotone.
+    source: Murphy PML1 §5.1.4.2
+
+  - id: q8
+    prompt: |
+      For single-label multiclass classification, micro-averaged F1 equals:
+    correct: Accuracy
+    wrong:
+      - Macro-averaged F1
+      - Balanced accuracy
+      - Support-weighted F1
+    explanation: |
+      Pooled over classes, each misclassification counts once as an FP (for the predicted class) and once as an FN (for the true class). So micro-P = micro-R = accuracy, and so micro-F1 is too. Macro-F1 and balanced accuracy give rare classes equal weight, so they differ under imbalance.
+    source: Murphy PML1 §5.1.4
+
+  - id: q9
+    prompt: |
+      Positives score $\{0.9,\,0.6,\,0.4\}$ and negatives score $\{0.7,\,0.4,\,0.2\}$. What is the ROC-AUC, with ties counting ½?
+    correct: '$6.5/9\approx0.72$'
+    wrong:
+      - '$6/9\approx0.67$'
+      - '$7/9\approx0.78$'
+      - '$4.5/9=0.50$'
+    explanation: |
+      Count the 9 pairs: 0.9 beats all three negatives (3); 0.6 beats 0.4 and 0.2 (2); 0.4 ties 0.4 (½) and beats 0.2 (1). Total 6.5. By ranks: the ascending order is 0.2, then 0.4 and 0.4 (both rank 2.5), 0.6, 0.7, 0.9, so $R_+=2.5+4+6=12.5$ and $(12.5-6)/9=0.72$. Ignoring the tie gives 6/9; counting it as a win gives 7/9.
+    source: Fawcett 2006 §7
+
+  - id: q10
+    prompt: |
+      A screening test has TPR $=0.8$ and FPR $=0.04$, and 2% of the screened population is positive. What fraction of positive results are true positives?
+    correct: '$\approx0.29$'
+    wrong:
+      - '$\approx0.80$'
+      - '$\approx0.96$'
+      - '$\approx0.71$'
+    explanation: |
+      By Bayes: $\frac{0.8\times0.02}{0.8\times0.02+0.04\times0.98}=\frac{0.016}{0.0552}\approx0.29$. 0.80 confuses precision with recall, 0.96 is the specificity, and 0.71 is the false-discovery rate ($1-$ precision). The 98% negatives produce more false alarms than the 2% positives produce hits.
+    source: Murphy PML1 §5.1.4.4 (eq. 5.28)
+
+  - id: q11
+    prompt: |
+      Your model outputs calibrated probabilities. A missed positive costs 9 times as much as a false alarm, and correct decisions cost nothing. Which probability threshold minimises expected cost?
+    correct: '$0.1$'
+    wrong:
+      - '$0.9$'
+      - '$0.5$'
+      - '$1/9\approx0.11$'
+    explanation: |
+      Predict positive when $c_{FN}p>c_{FP}(1-p)$, i.e. $p>c_{FP}/(c_{FP}+c_{FN})=1/(1+9)=0.1$. Expensive misses push the threshold *down*. 0.9 inverts the costs. $1/9$ is the cost ratio, not the threshold.
+    source: Murphy PML1 §5.1.2.2 (eq. 5.10)
+
+  - id: q12
+    prompt: |
+      You duplicate every negative example in your test set 10 times. Which quantity stays the same?
+    correct: ROC-AUC
+    wrong:
+      - Average precision
+      - Precision at a fixed threshold
+      - Accuracy at a fixed threshold
+    explanation: |
+      Duplication leaves TPR and FPR at every threshold unchanged, because both are fractions *within* a class. So the ROC curve and its area are unchanged. Precision and AP get 10× more false positives against the same TPs. Accuracy shifts toward the negative-class rate.
+    source: Fawcett 2006 §4.2; Murphy PML1 §5.1.3.3
+
+  - id: q13
+    prompt: |
+      A test set has 100 positives. Operating point A has TP = 20, FP = 0. Operating point B has TP = 60, FP = 60. What precision is actually achievable at recall 0.4 by interpolating between A and B?
+    correct: '$\approx0.57$'
+    wrong:
+      - '$0.75$'
+      - '$0.50$'
+      - '$\approx0.67$'
+    explanation: |
+      The local skew is $(60-0)/(60-20)=1.5$ FPs per extra TP. At TP $=40$ (recall 0.4), FP $=0+1.5\times20=30$, so precision $=40/70\approx0.57$. 0.75 is the straight line between precisions 1.0 and 0.5, which overstates performance. 0.50 is B's precision.
+    source: Davis & Goadrich 2006 §4
+
+  - id: q14
+    prompt: |
+      A classifier has precision 0.5 and recall 0.8. What is its $F_2$ score?
+    correct: '$\approx0.71$'
+    wrong:
+      - '$\approx0.62$'
+      - '$\approx0.54$'
+      - '$0.65$'
+    explanation: |
+      $F_2=\frac{5PR}{4P+R}=\frac{5\times0.4}{2+0.8}=\frac{2}{2.8}\approx0.71$. $F_2$ leans toward the higher recall. 0.62 is $F_1$, 0.54 is $F_{0.5}$ (which leans toward precision), and 0.65 is the arithmetic mean.
+    source: Murphy PML1 §5.1.4.3 (eq. 5.24)
+
+  - id: q15
+    prompt: |
+      Three classes have supports 90, 5 and 5. A classifier always predicts the first class. Counting undefined precision as 0, what are micro-F1 and macro-F1?
+    correct: Micro 0.90, macro 0.32
+    wrong:
+      - Micro 0.90, macro 0.90
+      - Micro 0.32, macro 0.90
+      - Micro 0.95, macro 0.32
+    explanation: |
+      Micro-F1 equals accuracy, which is 0.90. For macro, class 1 has $P=0.9$ and $R=1$, so $F_1=1.8/1.9\approx0.947$. Classes 2 and 3 score 0. The mean is $0.947/3\approx0.32$. Macro exposes the ignored minority classes; micro hides them. 0.95 is class 1's F1 alone.
+    source: Murphy PML1 §5.1.4.3; Flach & Kull 2015 §2.1
+
+  - id: q16
+    prompt: |
+      One classifier is evaluated on two test sets, A and B:
+
+      ![ROC and PR curves for one classifier on test sets A and B.](fund.classification-metrics/roc-pr-mystery)
+
+      What best explains the picture?
+    correct: B has a far smaller fraction of positives than A
+    wrong:
+      - The classifier ranks B's examples much worse than A's
+      - B has a lot more label noise among its positives
+      - B was scored at a higher decision threshold
+    explanation: |
+      Identical ROC curves mean the score distributions within each class are the same, so ranking quality hasn't changed. Worse ranking or label noise would move the ROC. Only precision moved, and precision depends on prevalence: with rarer positives, the same FPR produces relatively more false alarms. A single threshold can't explain different *curves*, which sweep all thresholds.
+    source: Davis & Goadrich 2006 §3; Murphy PML1 §5.1.4.4
+
+cards:
+  - id: f1
+    front: Define precision, recall, specificity and FPR in counts and as conditional probabilities.
+    back: |
+      - Precision $=TP/(TP+FP)=\Pr(y{=}1\mid\hat y{=}1)$
+      - Recall (TPR) $=TP/(TP+FN)=\Pr(\hat y{=}1\mid y{=}1)$
+      - Specificity $=TN/(TN+FP)=\Pr(\hat y{=}0\mid y{=}0)$
+      - FPR $=FP/(FP+TN)=1-$ specificity
+
+      Only precision conditions on the prediction, and that's why it depends on prevalence.
+    source: Murphy PML1 §5.1.3.1 (Tables 5.4–5.5)
+
+  - id: f2
+    front: Give the F1 formula three ways, and say why it uses the harmonic mean.
+    back: |
+      $$F_1=\frac{2PR}{P+R}=\frac{2TP}{2TP+FP+FN}=\frac{TP}{TP+\frac12(FP+FN)}$$
+
+      The harmonic mean is pulled toward the smaller of P and R, so "flag everything" ($R=1$, $P=\pi$) scores $\approx2\pi$ instead of $\approx0.5$. It compares TP with the average of the two error counts.
+    source: Murphy PML1 §5.1.4.3; Flach & Kull 2015 §2.1
+
+  - id: f7
+    front: Precision in terms of TPR, FPR and prevalence $\pi$.
+    back: |
+      $$\text{Prec}=\frac{\text{TPR}\,\pi}{\text{TPR}\,\pi+\text{FPR}\,(1-\pi)}$$
+
+      This is Bayes' rule. Example: TPR 0.9 and FPR 0.05 give 0.95 at $\pi=50\%$ but 0.15 at $\pi=1\%$.
+    source: Murphy PML1 §5.1.4.4 (eq. 5.28)
+
+  - id: f8
+    front: State the probabilistic meaning of ROC-AUC and its rank-sum formula.
+    back: |
+      $\text{AUC}=\Pr(S_+>S_-)$ for independent random positive and negative scores, with ties counting ½.
+
+      $$\text{AUC}=\frac{R_+-n_+(n_++1)/2}{n_+n_-}$$
+
+      $R_+$ is the sum of positive ranks (ascending, midranks for ties). This is the Mann–Whitney statistic divided by $n_+n_-$.
+    source: Fawcett 2006 §7
+
+  - id: f9
+    front: Cost-optimal decision threshold on calibrated probabilities, with its one-line derivation.
+    back: |
+      Predict positive iff the expected cost of saying negative exceeds that of saying positive: $c_{FN}\,p>c_{FP}(1-p)$, i.e.
+
+      $$p>t^*=\frac{c_{FP}}{c_{FP}+c_{FN}}.$$
+
+      Equal costs give ½. Costlier misses give a lower threshold.
+    source: Murphy PML1 §5.1.2.2 (eq. 5.10)
+
+  - id: f10
+    front: How do you interpolate correctly between two points on a PR curve?
+    back: |
+      Interpolate the *counts*. Each extra TP between A and B brings $\text{skew}=\frac{FP_B-FP_A}{TP_B-TP_A}$ FPs:
+
+      $$\text{Prec}(x)=\frac{TP_A+x}{TP_A+x+FP_A+\text{skew}\cdot x}$$
+
+      The path is curved, and a straight line in PR space overstates the area. In ROC space straight lines are correct.
+    source: Davis & Goadrich 2006 §4
+
+  - id: f11
+    front: Define P@k, DCG@k and NDCG@k.
+    back: |
+      - P@k = (relevant items among the top $k$)/$k$.
+      - $\text{DCG@}k=\sum_{j=1}^k s_j/\log_2(j+1)$, where $s_j$ is the graded relevance at rank $j$.
+      - NDCG@k = DCG@k / IDCG@k, with IDCG the DCG of the ideal ordering, so it lies in $[0,1]$.
+
+      Unlike R@k, NDCG rewards putting relevant items first.
+    source: CS229 notes §16.3 (eqs. 16.1–16.3)
+
+  - id: f14
+    front: Why is the ROC convex hull achievable, and how do costs pick an operating point on it?
+    back: |
+      Randomising between operating points A and B (use A with probability $\alpha$) gives expected TPR and FPR that are linear in $\alpha$. So every point on segment AB is achievable, and so is the hull.
+
+      Expected cost is constant along lines of slope
+
+      $$m=\frac{c_{FP}(1-\pi)}{c_{FN}\,\pi};$$
+
+      the optimum is where the highest such line touches the hull.
+    source: Fawcett 2006 §6; Flach & Kull 2015 §2
+
+  - id: f5
+    type: open
+    front: You're building a detector for a 1-in-1000 event. How do you evaluate it and pick an operating threshold?
+    back: |
+      - **Not accuracy**: "always negative" scores 99.9%.
+      - **Headline metric**: AP or the PR curve, plus the precision at the recall you need, or the recall at the precision your review team can handle. Report ROC-AUC as a secondary *ranking* metric, since it's prevalence-free but hides false-alarm volume.
+      - **Splits**: stratify, and keep the test set at the deployment prevalence even if you rebalance training data.
+      - **Threshold**: pick it on validation data. Minimise $c_{FP}FP+c_{FN}FN$, which gives $t^*=c_{FP}/(c_{FP}+c_{FN})$ if the probabilities are calibrated, or meet a capacity constraint. Never tune it on test.
+      - **Uncertainty**: with roughly 50 positives in the test set, each one is worth 2 points of recall. Report counts and confidence intervals, not just rates.
+      - **Calibration**: check it if anything downstream consumes the probabilities.
+    source: Murphy PML1 §5.1.2.2, §5.1.4; Tuning Playbook §"Choosing a sample for periodic evaluation"
+
+  - id: f6
+    type: open
+    front: Explain why ROC-AUC can look great on an imbalanced problem while the model is useless in practice.
+    back: |
+      ROC's axes are rates within each class: FPR $=FP/N$. With 1M negatives and 1k positives, the point TPR $=0.9$, FPR $=0.01$ looks excellent, near the top-left corner. Yet it means 10,000 false alarms against 900 hits, a precision of about 8%.
+
+      In formula form, $\text{Prec}=\text{TPR}/(\text{TPR}+\text{FPR}\cdot\frac{1-\pi}{\pi})$, and $(1-\pi)/\pi=999$ here. ROC is prevalence-invariant *by construction*, so it can't show this.
+
+      The PR curve shows it directly. Still, ROC and PR agree on dominance (Davis & Goadrich): if one model's ROC dominates, its PR dominates too. They disagree in how large the differences look and in area-based rankings when curves cross.
+    source: Murphy PML1 §5.1.3.3, §5.1.4.4; Davis & Goadrich 2006 §3
+
+  - id: f12
+    type: open
+    front: Derive that ROC-AUC equals the probability that a random positive outscores a random negative.
+    back: |
+      1. Let $S_+\sim f_+$ and $S_-\sim f_-$ be independent. At threshold $t$: $\text{TPR}(t)=\Pr(S_+>t)$ and $\text{FPR}(t)=\Pr(S_->t)$.
+      2. $\text{AUC}=\int_0^1\text{TPR}\,d\text{FPR}$. Change variables to $t$: $d\text{FPR}=-f_-(t)dt$, and FPR going from 0 to 1 means $t$ going from $+\infty$ to $-\infty$, which absorbs the minus sign.
+      3. $\text{AUC}=\int\Pr(S_+>t)f_-(t)\,dt=\mathbb{E}_{S_-}[\Pr(S_+>S_-\mid S_-)]=\Pr(S_+>S_-)$.
+      4. Empirically, replace the densities by the samples: average $\mathbb{1}(s_i>s_j)+\frac12\mathbb{1}(s_i=s_j)$ over all $n_+n_-$ pairs. That is the Mann–Whitney $U/(n_+n_-)$, computed in $O(n\log n)$ with the rank formula.
+      5. Consequences: AUC is invariant to monotone transforms, $1-$AUC belongs to the negated score, and AUC measures ranking, not calibration.
+    source: Fawcett 2006 §7; Murphy PML1 §5.1.3.2
+
+  - id: f13
+    type: open
+    front: How would you choose a classification threshold, and why is the F1-optimal threshold usually not 0.5?
+    back: |
+      - **Start from the decision.** With calibrated probabilities and costs $c_{FP}$, $c_{FN}$, the Bayes rule thresholds at $c_{FP}/(c_{FP}+c_{FN})$, and 0.5 only when the costs are equal.
+      - **If the goal is F1**: F1 isn't an average over examples. For a calibrated model, the optimal threshold is half the best achievable F1, $t=F_1^*/2\leq\frac12$ (Flach & Kull, citing earlier results). Flagging borderline cases helps because F1 ignores TNs. Each extra TP raises the numerator, and the cost of an FP is diluted.
+      - **If the scores aren't calibrated** (reweighted classes, focal loss, over-confident nets), either calibrate first or sweep thresholds on validation data and pick the one that optimises the target metric or meets a precision or recall constraint.
+      - **Report** the chosen operating point (P, R and counts), not just a threshold-free AUC, because the deployed system lives at one point.
+    source: Murphy PML1 §5.1.2.2; Flach & Kull 2015 §2.1
+
+reading:
+  - title: "Fawcett 2006, An Introduction to ROC Analysis"
+    url: https://people.inf.elte.hu/kiss/11dwhdm/roc.pdf
+    kind: paper
+    note: §3–4 ROC space and class skew, §6 the convex hull and iso-performance lines, §7 AUC as a ranking probability.
+  - title: "Davis & Goadrich 2006, The Relationship Between Precision-Recall and ROC Curves"
+    url: https://ftp.cs.wisc.edu/machine-learning/shavlik-group/davis.icml06.pdf
+    kind: paper
+    note: §3 the ROC ⇔ PR dominance theorem; §4 why linear interpolation in PR space is wrong, with the count-based fix.
+  - title: "Murphy, Probabilistic Machine Learning: An Introduction, §5.1.2–5.1.4"
+    url: https://probml.github.io/pml-book/book1.html
+    kind: book
+    note: Cost-sensitive thresholds, ROC and PR curves, F-scores, and the class-imbalance algebra in one place.
+  - title: "Flach & Kull 2015, Precision-Recall-Gain Curves: PR Analysis Done Right"
+    url: https://papers.nips.cc/paper_files/paper/2015/hash/33e8075e9970de0cfea955afd4644bb2-Abstract.html
+    kind: paper
+    note: §2 lists what goes wrong with PR curves and F-score averaging, plus the F1-optimal threshold result.

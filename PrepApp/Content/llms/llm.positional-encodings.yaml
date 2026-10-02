@@ -1,0 +1,523 @@
+id: llm.positional-encodings
+area: llms
+title: "Absolute Positional Encodings: Learned, Sinusoidal & NoPE"
+summary: Why attention is blind to order, learned and sinusoidal absolute encodings with the shift-as-rotation derivation, the four-term logit expansion that shows why adding positions is not truly relative, and how a causal decoder with no encoding (NoPE) can still recover position.
+order: 50
+level: core
+tags: [transformers, attention, positional-encoding]
+prereqs: [llm.self-attention]
+
+explainer:
+  - title: "The problem: attention cannot see order"
+    body: |
+      Feed a transformer "dog bites man" and "man bites dog". Without extra information, self-attention gives the token "dog" exactly the same output in both sentences. Here is why.
+
+      Stack the $n$ token embeddings as rows of $X\in\mathbb{R}^{n\times d}$. One head computes $Q=XW_Q$, $K=XW_K$, $V=XW_V$ and
+
+      $$\mathrm{Attn}(X)=\mathrm{softmax}\big(QK^\top/\sqrt{d_k}\big)V,$$
+
+      with the softmax applied to each row. Reorder the tokens with a permutation matrix $P$, so $X\to PX$. Then $Q\to PQ$, $K\to PK$, $V\to PV$, and the score matrix becomes $PSP^\top$, where $S=QK^\top/\sqrt{d_k}$. Reordering the rows and columns of $S$ just reorders the entries that each row-wise softmax sees, so $\mathrm{softmax}(PSP^\top)=P\,\mathrm{softmax}(S)P^\top$. Using $P^\top P=I$:
+
+      $$\begin{aligned} \mathrm{Attn}(PX) &= P\,\mathrm{softmax}(S)\,P^\top P V \\ &= P\,\mathrm{Attn}(X). \end{aligned}$$
+
+      This property is **permutation equivariance**: shuffle the inputs and the outputs shuffle the same way. The MLP and LayerNorm act on each token separately, so the whole stack is equivariant. Each token's output depends on its own content and on the *set* of other tokens, not on their order.
+
+      **What breaks the symmetry.** A causal mask is tied to the index, not to the content, so it does not move with $P$. A decoder therefore already leaks some order: token $t$ sees exactly $t$ tokens. We return to this with NoPE. A bidirectional encoder leaks nothing.
+
+      **The fix** is to give every position $p$ a vector $p_p$ (or some other position signal) that the network can use. This lesson covers absolute encodings added to the input. `llm.relative-position` and `llm.rope` cover schemes that act inside attention.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6); d2l §11.6.3; Kazemnejad et al. 2023 §5.1 (pdf p.5–6)
+
+  - title: Design axes, and learned absolute encodings
+    body: |
+      Every scheme answers four questions. Keep them as a map for this unit.
+      - **Absolute or relative?** Does the signal name the position $p$, or only the offset $i-j$ between a query at $i$ and a key at $j$?
+      - **Where is it injected?** Added to the input embeddings once, added as a bias to the attention logits, or applied to queries and keys in every layer.
+      - **Fixed or learned?** A formula, or trained parameters.
+      - **Extrapolation:** what happens at positions longer than any training sequence?
+
+      Absolute-add encodings (this lesson) form the layer-0 input as
+
+      $$h^{(0)}_p = x_p + p_p,$$
+
+      where $x_p$ is the token embedding and $p_p\in\mathbb{R}^d$ is the position vector.
+
+      **Learned absolute encodings** (BERT, GPT-2) keep a trainable table $P\in\mathbb{R}^{L_{\max}\times d}$, one row per position, trained by backprop like the token embeddings. GPT-2 uses $L_{\max}=1024$ and BERT uses 512.
+      - **Strength:** simple and flexible. Vaswani et al. found learned rows and sinusoids gave nearly identical translation quality (25.7 vs 25.8 BLEU).
+      - **Weakness 1: no row past $L_{\max}$.** Position $L_{\max}$ simply has no vector. Enlarging the table adds untrained random rows.
+      - **Weakness 2: each row needs data at that position.** A row only gets gradient from sequences long enough to reach it. BERT trained on length-128 sequences for 90% of its steps and on length 512 only for the last 10%, explicitly so that the later position rows got trained.
+      - **Weakness 3: nothing ties neighbours together.** Rows 300 and 301 are independent parameters, so any similarity between them has to be learned.
+    source: Vaswani et al. 2017 §3.5, §6.2 Table 3 row (E) (pdf p.6, 9); Devlin et al. 2018 App. A.2 (pdf p.13); Radford et al. 2019 §2.3 (pdf p.4)
+
+  - title: "Sinusoidal encoding: a multi-scale clock"
+    body: |
+      Vaswani et al. chose a fixed formula instead. Group the $d$ coordinates into $d/2$ pairs indexed by $i=0,\dots,d/2-1$, and give pair $i$ the angular frequency $\omega_i$:
+
+      $$\begin{aligned} PE_{p,2i} &= \sin(p\,\omega_i), \\ PE_{p,2i+1} &= \cos(p\,\omega_i), \\ \omega_i &= 10000^{-2i/d}. \end{aligned}$$
+
+      **Read it as a clock with $d/2$ hands.** Pair $i$ is a point $(\sin p\omega_i,\cos p\omega_i)$ on the unit circle that advances by $\omega_i$ radians per position. Its **wavelength**, the number of positions for one full turn, is
+
+      $$\lambda_i=\frac{2\pi}{\omega_i}=2\pi\cdot10000^{2i/d}.$$
+
+      ![Pair 0 turns a full radian per position and wraps after about 6 steps. A slow pair barely moves, so it separates far-apart positions.](llm.positional-encodings/clock)
+
+      The wavelengths form a geometric sequence. For $d=512$ they run from $\lambda_0=2\pi\approx6.28$ to $\lambda_{255}=2\pi\cdot10000^{510/512}\approx6.06\times10^4$. (The paper rounds the top end to $10000\cdot2\pi$.)
+      - **Fast pairs** distinguish neighbours but repeat every few positions.
+      - **Slow pairs** change little between neighbours but stay unique over long ranges.
+
+      Together they act like the bits of a binary counter, where the lowest bit flips every step and higher bits flip ever more slowly. The difference is that each "bit" here is a smooth rotation, so the code is continuous.
+
+      ![Rows are positions, columns are coordinates. The left columns oscillate quickly down the page and the right columns hardly change: one frequency per pair. Illustrative: $d=64$, $p<100$.](llm.positional-encodings/heatmap)
+
+      **Layout convention.** The paper interleaves sin and cos (even and odd coordinates). Some implementations instead put all sines in the first half and all cosines in the second. That is a fixed permutation of coordinates, which is harmless when training from scratch but matters when loading weights.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6); d2l §11.6.3, §11.6.3.1
+
+  - title: Deriving the shift property
+    body: |
+      Vaswani et al. claimed that for any fixed offset $\delta$, $PE_{p+\delta}$ is a linear function of $PE_p$. Here is the derivation.
+
+      **Refresher: angle addition.**
+
+      $$\begin{aligned} \sin(a+b) &= \sin a\cos b+\cos a\sin b, \\ \cos(a+b) &= \cos a\cos b-\sin a\sin b. \end{aligned}$$
+
+      Take pair $i$ and write $a=p\omega_i$, $b=\delta\omega_i$:
+
+      $$\begin{aligned} \sin((p+\delta)\omega_i) &= \cos b\,\sin a + \sin b\,\cos a, \\ \cos((p+\delta)\omega_i) &= -\sin b\,\sin a + \cos b\,\cos a. \end{aligned}$$
+
+      In matrix form, with $c=\cos\delta\omega_i$ and $s=\sin\delta\omega_i$, and writing $u_p=(PE_{p,2i},\,PE_{p,2i+1})^\top$ for pair $i$:
+
+      $$u_{p+\delta}=G_\delta\,u_p,\qquad G_\delta=\begin{bmatrix}c&s\\-s&c\end{bmatrix}.$$
+
+      The $2\times2$ matrix depends on $\delta$ and $\omega_i$ but **not on $p$**. It is a rotation matrix (orthogonal, determinant 1). Stacking one such block per pair gives a block-diagonal $M_\delta$ with
+
+      $$PE_{p+\delta}=M_\delta\,PE_p\quad\text{for every }p.$$
+
+      **Refresher: rotations.** Write $R(\alpha)=\begin{bmatrix}\cos\alpha&-\sin\alpha\\\sin\alpha&\cos\alpha\end{bmatrix}$. Then $R(\alpha)^\top=R(-\alpha)$ and $R(\alpha)R(\beta)=R(\alpha+\beta)$, so $R(\alpha)^\top R(\beta)=R(\beta-\alpha)$. Each block above is $R(-\delta\omega_i)$ in $(\sin,\cos)$ coordinates. `llm.rope` relies on the same identities.
+
+      **Why it matters.** A single fixed linear map turns "the encoding of position $p$" into "the encoding of position $p+\delta$". So a head whose $W_Q$ or $W_K$ contains $M_\delta$ could, in principle, line up a query at $p$ with the key at $p+\delta$ at every $p$. That was the stated motivation: it should be easy to learn to attend by relative position.
+
+      **What it does not say.** It does not make the attention score relative. The network still has to *learn* to use $M_\delta$, and the content terms interfere, as the four-term expansion will show.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6); d2l §11.6.3.2 eq. 11.6.3
+
+  - title: Dot products, norms, and adding instead of concatenating
+    body: |
+      **The dot product depends only on the offset.** Pair by pair, $\sin a\sin b+\cos a\cos b=\cos(a-b)$, so
+
+      $$\begin{aligned} PE_p\cdot PE_{p+\delta} &= \sum_{i=0}^{d/2-1}\cos(\delta\,\omega_i). \end{aligned}$$
+
+      Three consequences:
+      - **Norm.** At $\delta=0$ every term is 1, so $\|PE_p\|^2=d/2$. For $d=512$, $\|PE_p\|=16$ at every position.
+      - **Symmetric in $\delta$.** Cosine is even, so offsets $+\delta$ and $-\delta$ give the same similarity. The raw dot product cannot tell "before" from "after".
+      - **Decays, noisily.** At $\delta=0$ all cosines agree. As $|\delta|$ grows the fast terms dephase and average to about 0, while only the slow ones stay near 1. So the similarity falls with distance, with ripples.
+
+      Small example with $d=4$, where $\omega_0=1$ and $\omega_1=10000^{-1/2}=0.01$:
+      - $\delta=1$: $\cos1+\cos0.01=0.540+1.000=1.540$.
+      - $\delta=3$: $\cos3+\cos0.03=-0.990+1.000=0.010$.
+
+      ![Normalized similarity of two sinusoidal encodings vs their offset, $d=128$. It peaks at 1, is mirror-symmetric, and falls with ripples. Computed from the formula.](llm.positional-encodings/dot-offset)
+
+      **Why add rather than concatenate?** Concatenating $[x_p;\,p_p]$ keeps content and position in separate coordinates, but it costs width in every layer. Adding is free, and it works because high-dimensional space has room. Two random directions in $\mathbb{R}^d$ have cosine of order $1/\sqrt d$, so the model can learn to keep token information and the position signal in nearly orthogonal subspaces. $W_Q$ and $W_K$ can then read either one.
+
+      **A scale detail.** Vaswani et al. multiply the token-embedding weights by $\sqrt{d_{\text{model}}}$ before adding the encodings. One reading is that this puts the token signal on a scale comparable to $\|PE_p\|=\sqrt{d/2}$, so that position does not swamp content. The paper states the scaling but not the reason.
+    source: d2l §11.6.3.2; Vaswani et al. 2017 §3.4–3.5 (pdf p.5–6)
+
+  - title: "The four-term expansion: why adding position is not relative"
+    body: |
+      Use row vectors. With additive encodings, the query at $i$ and the key at $j$ are $q_i=(x_i+p_i)W_Q$ and $k_j=(x_j+p_j)W_K$. Write $A=W_QW_K^\top\in\mathbb{R}^{d\times d}$. The logit (before the $1/\sqrt{d_k}$ scale) expands into four terms:
+
+      $$\begin{aligned} q_ik_j^\top &= \underbrace{x_iAx_j^\top}_{\text{(a) content–content}} + \underbrace{x_iAp_j^\top}_{\text{(b) content–position}} \\ &\ + \underbrace{p_iAx_j^\top}_{\text{(c) position–content}} + \underbrace{p_iAp_j^\top}_{\text{(d) position–position}}. \end{aligned}$$
+
+      - (b) asks "does this token like keys at **absolute** position $j$?" It depends on $j$ alone, not on $i-j$.
+      - (c) similarly depends on the absolute $i$.
+      - (d) is the only term that involves both positions. **Is it a function of $i-j$?** Only for special $A$.
+
+      Take one frequency $\omega$ and a $2\times2$ diagonal block $\begin{bmatrix}\alpha&\beta\\\gamma&\varepsilon\end{bmatrix}$ of $A$. Write $u=i\omega$ and $v=j\omega$. Product-to-sum identities give
+
+      $$\begin{aligned} &\tfrac{\alpha+\varepsilon}{2}\cos(u-v)+\tfrac{\beta-\gamma}{2}\sin(u-v) \\ +\ &\tfrac{\varepsilon-\alpha}{2}\cos(u+v)+\tfrac{\beta+\gamma}{2}\sin(u+v). \end{aligned}$$
+
+      The $u+v$ terms depend on $i+j$. They vanish only if $\alpha=\varepsilon$ and $\gamma=-\beta$, i.e. if the block is a scaled rotation. Off-diagonal blocks that mix frequencies $\omega_a\neq\omega_b$ produce $\cos(i\omega_a-j\omega_b)$, which is not a function of $i-j$ either. So (d) is relative only if $A$ is block-diagonal by frequency with blocks of the form $\begin{bmatrix}a&b\\-b&a\end{bmatrix}$. Nothing in training forces that, and (b) and (c) stay absolute regardless.
+
+      ![Term (d) for 48 positions. With rotation-shaped blocks, every diagonal is constant (a Toeplitz matrix: a function of $i-j$ only). A generic $A$ gives no such structure. Random $A$, $d=16$.](llm.positional-encodings/toeplitz)
+
+      **Where this leads.** Transformer-XL rewrote these four terms with relative quantities (`llm.relative-position`). RoPE builds the rotation structure into $q$ and $k$ directly, so the score is relative by construction (`llm.rope`).
+    source: Dai et al. 2019 §3.3 (pdf p.4–5); Su et al. 2021 §2.3 eq. 6 (pdf p.3)
+
+  - title: "NoPE: position from the causal mask alone"
+    body: |
+      A decoder-only model with **no** positional encoding (NoPE) can still recover absolute position. The reason is the causal mask.
+
+      **Construction** (Kazemnejad et al., Theorem 1). The input starts with a `<bos>` token, and positions are counted from 1, so `<bos>` is at position 1. One first-layer head does the work:
+      1. The embedding sets coordinate 1 to 1 for every token, and coordinate 2 to 1 only for `<bos>`.
+      2. $W_K$ reads coordinate 1, so **all keys are identical**. Every logit in a row is then equal, and the softmax over the $t$ visible tokens is uniform: weight $1/t$ each.
+      3. $W_V$ reads coordinate 2, so only `<bos>` has value 1. Everything else has value 0.
+      4. The head's output at position $t$ is therefore $\tfrac1t\cdot1=1/t$.
+      5. A ReLU MLP of sufficient width maps $1/t$ to $t$, or to any feature of $t$.
+
+      Without the causal mask, every token sees all $n$ tokens and gets $1/n$, the same everywhere, so this trick fails in an encoder. Theorem 2 then shows that later layers, given absolute positions, can implement scores of the form $f_{\text{content}}+f_{\text{rel}}(i-j)$.
+
+      **Resolution caveat** (a consequence of this construction, not a claim from the paper): $\tfrac1t-\tfrac1{t+1}=\tfrac1{t(t+1)}$. That is about $10^{-6}$ at $t=1000$, so neighbouring far positions are hard to tell apart.
+
+      **Evidence and its scope.**
+      - With about 107M-parameter decoders trained from scratch on algorithmic and reasoning tasks, NoPE length-generalized at least as well as every explicit scheme tested. Sinusoidal absolute PE and RoPE generalized poorly.
+      - In 1B models trained on code with a 1024-token context, NoPE and ALiBi kept their perplexity to roughly twice the training length, while RoPE's perplexity exploded.
+      - These are small-scale results, not a consensus about frontier LLMs.
+
+      **In practice.** Production models use NoPE only in some layers: SmolLM3 drops RoPE in every 4th layer, and Kimi Linear and Arcee Trinity use NoPE in their global-attention layers. The other layers still supply position (RoPE, local attention, or recurrence).
+    source: Kazemnejad et al. 2023 §4, §5.1 Thm 1–2, App. C.1, §6 (pdf p.5–6, 9, 19–21); Raschka, Big LLM Architecture Comparison §7.1, §14, §20
+
+  - title: KV cache, pitfalls and failure modes
+    body: |
+      **KV-cache compatibility.** In decoding we cache each past token's key and value so that a new token only computes its own (`llm.self-attention`). With absolute-add encodings, $p_t$ enters once at the input. Under a causal mask, token $t$'s keys and values in every layer depend only on tokens $\le t$ and their fixed positions. Generating token $t+1$ changes none of that, so the cache stays valid.
+
+      Contrast this with any scheme where an old token's position label can **change**:
+      - **Re-indexed windows.** If a sliding window renumbers its contents from 0 each step, every cached key would need re-encoding.
+      - **Segment reuse.** Transformer-XL reuses the previous segment's hidden states. With absolute encodings, both segments would carry positions $1..L$, so the model could not tell token $j$ of the old segment from token $j$ of the new one. That is why it needed relative encodings.
+
+      **Pitfalls.**
+      - **Past $L_{\max}$.** A learned table has no row; an index error is the honest outcome. An enlarged table has random rows.
+      - **Sinusoids are defined, not trained.** Positions past the training length produce new combinations of phases the network never saw. Vaswani et al. hoped sinusoids would extrapolate, but controlled studies find absolute sinusoidal PE generalizes poorly in length.
+      - **Padding.** With left-padded batches, compute position ids from the attention mask, so that the first real token gets position 0 in every row. Otherwise each row's positions are shifted by its padding length.
+      - **Packed documents.** When several documents share one training sequence, positions keep counting across document boundaries unless the code resets them. Decide which behaviour you want.
+      - **Symmetric similarity.** $PE_p\cdot PE_{p+\delta}$ is even in $\delta$. Telling direction apart needs a learned $A$ with antisymmetric parts, or the causal mask.
+    source: Dai et al. 2019 §3.3 (pdf p.4); Vaswani et al. 2017 §3.5 (pdf p.6); Kazemnejad et al. 2023 §4 (pdf p.5)
+
+  - title: What interviewers probe
+    body: |
+      - *Why does a transformer need positional information?* $\mathrm{Attn}(PX)=P\,\mathrm{Attn}(X)$: shuffle the input and the output shuffles with it. Prove it via $\mathrm{softmax}(PSP^\top)=P\,\mathrm{softmax}(S)P^\top$.
+      - *Does a decoder need it?* Less: the causal mask leaks position. The NoPE construction uses uniform attention to a `<bos>` anchor, giving $1/t$. An encoder has no such leak.
+      - *Why sinusoids?* A multi-scale clock with no parameters, defined for every $p$. $PE_{p+\delta}=M_\delta PE_p$ with a $p$-independent rotation, which you should be able to derive from angle addition.
+      - *Is additive sinusoidal PE relative?* No. Expand the logit into four terms. The cross terms depend on absolute positions, and the position–position term depends only on $i-j$ just when $W_QW_K^\top$ has scaled-rotation blocks.
+      - *Learned vs sinusoidal?* Similar quality in Vaswani's ablation. Learned tables stop at $L_{\max}$ and need data at every position (BERT's 128→512 schedule). Neither extrapolates well in practice.
+      - *What is $\|PE_p\|$?* $\sqrt{d/2}$, independent of $p$. Similarity is $\sum_i\cos(\delta\omega_i)$: even in $\delta$ and decaying with ripples.
+      - *Add or concatenate?* Adding saves width. High dimension lets content and position share the space almost orthogonally.
+      - *Does absolute PE work with a KV cache?* Yes: positions are fixed at the input, so cached keys never change.
+      - *Follow-up: what do modern LLMs use?* Mostly RoPE (`llm.rope`), sometimes with interleaved NoPE layers.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6); d2l §11.6.3; Kazemnejad et al. 2023 §5.1 (pdf p.5–6); Dai et al. 2019 §3.3 (pdf p.4–5)
+
+  - title: Key results
+    body: |
+      - Permutation equivariance: $\mathrm{Attn}(PX)=P\,\mathrm{Attn}(X)$ without positions or masks.
+      - Absolute-add input: $h^{(0)}_p=x_p+p_p$.
+      - Sinusoids: $PE_{p,2i}=\sin(p\omega_i)$, $PE_{p,2i+1}=\cos(p\omega_i)$, $\omega_i=10000^{-2i/d}$.
+      - Wavelengths $\lambda_i=2\pi\cdot10000^{2i/d}$, from $2\pi$ to about $2\pi\cdot10^4$. For $d=512$ the slowest is $6.06\times10^4$.
+      - Shift as rotation: $PE_{p+\delta}=M_\delta PE_p$, with blocks $\begin{bmatrix}\cos\delta\omega_i&\sin\delta\omega_i\\-\sin\delta\omega_i&\cos\delta\omega_i\end{bmatrix}$.
+      - Similarity: $PE_p\cdot PE_{p+\delta}=\sum_i\cos(\delta\omega_i)$, and $\|PE_p\|^2=d/2$.
+      - Four terms: $x_iAx_j^\top+x_iAp_j^\top+p_iAx_j^\top+p_iAp_j^\top$ with $A=W_QW_K^\top$. The last is a function of $i-j$ only for blocks $\begin{bmatrix}a&b\\-b&a\end{bmatrix}$.
+      - NoPE: uniform causal attention to `<bos>` outputs $1/t$, so a causal decoder can recover position. Results come from small-scale studies.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6); d2l §11.6.3.2; Dai et al. 2019 §3.3 (pdf p.4–5); Kazemnejad et al. 2023 §5.1 (pdf p.5–6)
+
+quiz:
+  - id: q1
+    rev: 2
+    prompt: |
+      A bidirectional encoder with no causal mask and no positional encoding reads "dog bites man" and then "man bites dog". Compare the final-layer output vector at the token "dog" in the two sentences.
+    correct: They are identical, because each output depends on the set of tokens, not their order
+    wrong:
+      - They differ, because "dog" attends to different neighbouring words in each of the two sentences
+      - They differ in any head whose attention weights are not exactly uniform
+      - They are identical only when the encoder has a single attention layer
+    explanation: |
+      Without positions or a mask, $\mathrm{Attn}(PX)=P\,\mathrm{Attn}(X)$, and the per-token MLP and norms keep this property through every layer. In both sentences "dog" sees the same set {dog, bites, man}, so its output is the same. The tempting "different neighbours" is wrong: adjacency doesn't exist for the model until position is injected. Non-uniform weights don't help, because they are computed from content alone.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6); d2l §11.6.3
+
+  - id: q6
+    prompt: |
+      Which statement is **false**?
+    correct: Learned absolute position embeddings can natively encode positions beyond the maximum length seen in training
+    wrong:
+      - Sinusoidal encodings are defined for every integer position, including positions never reached during training
+      - Vaswani et al. found learned and sinusoidal encodings gave nearly identical translation quality
+      - With additive absolute encodings, the position signal enters the network only once, at the input
+    explanation: |
+      A learned table has exactly $L_{\max}$ rows, so there is no vector for position $L_{\max}$ or beyond. Enlarging the table adds untrained rows. Sinusoids are *defined* everywhere, though being defined is not the same as generalizing well. Table 3 row (E) of Vaswani et al. gives 25.7 vs 25.8 BLEU.
+    source: Vaswani et al. 2017 §3.5, Table 3 (pdf p.6, 9); Devlin et al. 2018 App. A.2 (pdf p.13)
+
+  - id: q9
+    prompt: |
+      Sinusoidal PE with $d=512$, pairs $i=0,\dots,255$ and $\omega_i=10000^{-2i/d}$. What is the wavelength, in positions, of the slowest pair, to three significant figures?
+    correct: $6.06\times10^4$
+    wrong:
+      - $6.28\times10^4$
+      - $9.65\times10^3$
+      - $1.00\times10^4$
+    explanation: |
+      $\lambda_{255}=2\pi/\omega_{255}=2\pi\cdot10000^{510/512}\approx6.06\times10^4$. The value $6.28\times10^4=2\pi\cdot10^4$ is the paper's rounded endpoint, which would need $i=d/2$, one pair beyond the last. $9.65\times10^3$ is $10000^{510/512}$ with the $2\pi$ forgotten, i.e. confusing angular frequency with cycles per position.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6)
+
+  - id: q10
+    prompt: |
+      Which matrix maps $(\sin p\omega,\ \cos p\omega)^\top$ to $(\sin (p+\delta)\omega,\ \cos (p+\delta)\omega)^\top$ for every $p$?
+    correct: $\begin{bmatrix}\cos\delta\omega&\sin\delta\omega\\-\sin\delta\omega&\cos\delta\omega\end{bmatrix}$
+    wrong:
+      - $\begin{bmatrix}\cos\delta\omega&-\sin\delta\omega\\\sin\delta\omega&\cos\delta\omega\end{bmatrix}$
+      - $\begin{bmatrix}\cos p\omega&\sin p\omega\\-\sin p\omega&\cos p\omega\end{bmatrix}$
+      - $\begin{bmatrix}\cos\delta\omega&0\\0&\cos\delta\omega\end{bmatrix}$
+    explanation: |
+      From $\sin(a+b)=\cos b\sin a+\sin b\cos a$ the first row is $(\cos b,\sin b)$. From $\cos(a+b)=-\sin b\sin a+\cos b\cos a$ the second row is $(-\sin b,\cos b)$, with $b=\delta\omega$. The tempting transpose gives $\sin(a-b)$ and $\cos(a-b)$: it shifts by $-\delta$. A matrix containing $p$ would not be one fixed linear map, which is the whole point of the property.
+    source: d2l §11.6.3.2 eq. 11.6.3
+
+  - id: q11
+    prompt: |
+      Which statement about additive sinusoidal encodings is **false**?
+    correct: The attention logit between positions $i$ and $j$ depends on position only through $i-j$
+    wrong:
+      - $PE_{p+\delta}$ is a linear function of $PE_p$, using the same map for every $p$
+      - The dot product $PE_p\cdot PE_{p+\delta}$ depends on $\delta$ but not on $p$
+      - The term $x_iW_QW_K^\top p_j^\top$ depends on the key's absolute position
+    explanation: |
+      Expanding $(x_i+p_i)A(x_j+p_j)^\top$ with $A=W_QW_K^\top$ gives content–position cross terms that depend on absolute $j$ and absolute $i$. The position–position term is a function of $i-j$ only for scaled-rotation blocks of $A$. The other three statements are true: the rotation $M_\delta$, the similarity $\sum_i\cos(\delta\omega_i)$, and the absolute cross term.
+    source: Dai et al. 2019 §3.3 (pdf p.4–5); d2l §11.6.3.2
+
+  - id: q12
+    prompt: |
+      In an encoder, a head uses only the position–position term, and $W_QW_K^\top=I$. Can this term score the token 3 positions *before* the query higher than the token 3 positions *after* it?
+    correct: No, $p_i\cdot p_j=\sum_k\cos((i-j)\omega_k)$ is the same at $j=i-3$ and $j=i+3$
+    wrong:
+      - Yes, because the sine coordinates make the dot product odd in the offset
+      - Yes, provided $d$ is large enough for some pair to resolve an offset of 3
+      - No, because the dot product of two encodings is the same for every offset
+    explanation: |
+      Pair by pair, $\sin a\sin b+\cos a\cos b=\cos(a-b)$, and cosine is even, so $+\delta$ and $-\delta$ score the same. The sines cancel into cosines rather than leaving an odd part. The similarity does vary with $|\delta|$, so it is not constant over offsets. Breaking the symmetry needs an antisymmetric part in $A$, i.e. blocks $\begin{bmatrix}a&b\\-b&a\end{bmatrix}$ with $b\neq0$, which contribute $b\sin((i-j)\omega)$. In a decoder, the causal mask removes the "after" side anyway.
+    source: d2l §11.6.3.2
+
+  - id: q13
+    prompt: |
+      Neither model has a positional encoding. Which can still recover each token's absolute position?
+    correct: "A causal decoder: uniform attention to a `<bos>` anchor yields $1/t$ at position $t$"
+    wrong:
+      - A bidirectional encoder, since the softmax normalizer depends on the sequence length
+      - Neither, since without encodings every transformer layer is permutation-equivariant
+      - Both, since residual connections carry each token's original index forward
+    explanation: |
+      The causal mask is tied to the index, so token $t$ attends to exactly $t$ tokens. With identical keys and a value that is 1 only at `<bos>`, the head outputs $1/t$, and an MLP can decode $t$ (Kazemnejad Thm 1). In an encoder every token sees all $n$ tokens, so any length signal is the same at every position. The "neither" option forgets that the mask breaks equivariance.
+    source: Kazemnejad et al. 2023 §5.1 Thm 1, App. C.1 (pdf p.5–6, 19–21)
+
+  - id: q14
+    prompt: |
+      In the NoPE construction, the head outputs $1/t$ at position $t$. How far apart are its outputs at $t=1000$ and $t=1001$?
+    correct: About $1.0\times10^{-6}$
+    wrong:
+      - About $1.0\times10^{-3}$
+      - About $5.0\times10^{-4}$
+      - About $1.0\times10^{-4}$
+    explanation: |
+      $\tfrac1{1000}-\tfrac1{1001}=\tfrac1{1000\cdot1001}\approx9.99\times10^{-7}$. The value $10^{-3}$ is $1/t$ itself, not the gap. The gap shrinks like $1/t^2$, so this mechanism resolves early positions well and far positions poorly. The paper doesn't make this point; it follows directly from the construction.
+    source: Kazemnejad et al. 2023 App. C.1 (pdf p.19–21)
+
+  - id: q15
+    prompt: |
+      A decoder with additive absolute encodings and a KV cache generates the token at position $t$. Which cached quantities for earlier tokens must be recomputed?
+    correct: "None: earlier keys and values depend only on earlier tokens and positions"
+    wrong:
+      - All cached keys, since the softmax normalizer now contains one more term
+      - The position vectors of earlier tokens, re-indexed relative to the newest one
+      - Only the cached keys, since cached values carry no positional information
+    explanation: |
+      Under a causal mask, layer-$l$ keys and values at position $s<t$ are functions of tokens $\le s$ and their fixed positions, so a new token cannot change them. The softmax normalizer belongs to the new query's row and is recomputed as part of that row anyway; it is not cached. Values do carry position (it was added at the input), but that doesn't matter here, because nothing about them changes.
+    source: Dai et al. 2019 §3.3 (pdf p.4); Vaswani et al. 2017 §3.5 (pdf p.6)
+
+  - id: q16
+    prompt: |
+      Every position in a sequence is shifted by the same $s$ (prepend $s$ dummy tokens that are masked out). For a generic $A=W_QW_K^\top$, which of the four logit terms is guaranteed unchanged?
+    correct: Only the content–content term
+    wrong:
+      - The content–content and position–position terms
+      - All four, because $PE_{p+s}=M_s\,PE_p$ for every position
+      - Only the position–position term
+    explanation: |
+      Term (a), $x_iAx_j^\top$, contains no positions. Term (d) becomes $p_iM_s^\top AM_sp_j^\top$, which equals the original only if $A$ commutes with the rotations, i.e. for scaled-rotation blocks, and a generic $A$ doesn't. The shift identity relates encodings to each other but doesn't cancel inside $A$. The cross terms change because they depend on the absolute $i$ or $j$.
+    source: Dai et al. 2019 §3.3 (pdf p.4–5); d2l §11.6.3.2
+
+  - id: q17
+    prompt: |
+      For which $A$ is the position–position term $p_iAp_j^\top$ (sinusoidal $p$) a function of $i-j$ alone, for all $i,j$?
+    correct: Block-diagonal by frequency, with each block $\begin{bmatrix}a&b\\-b&a\end{bmatrix}$
+    wrong:
+      - Any symmetric positive semi-definite matrix, for example $A=WW^\top$ for some $W$
+      - Any diagonal $A$, whatever values its individual diagonal entries happen to take
+      - Any $A$ at all, because every encoding $p_i$ is just a rotation of $p_0$
+    explanation: |
+      A block $\begin{bmatrix}\alpha&\beta\\\gamma&\varepsilon\end{bmatrix}$ contributes $\tfrac{\varepsilon-\alpha}{2}\cos((i+j)\omega)+\tfrac{\beta+\gamma}{2}\sin((i+j)\omega)$ on top of the relative part. These terms vanish only when $\alpha=\varepsilon$ and $\gamma=-\beta$. A diagonal block with $\alpha\neq\varepsilon$ leaves a $\cos((i+j)\omega)$ term, and cross-frequency blocks give $\cos(i\omega_a-j\omega_b)$. "Any $A$" fails because $A$ sits between the two rotations.
+    source: Dai et al. 2019 §3.3 (pdf p.4–5); d2l §11.6.3.2
+
+  - id: q18
+    prompt: |
+      Vaswani et al. scale token embeddings by $\sqrt{d_{\text{model}}}$ before adding sinusoidal encodings. With $d=512$, what is $\|PE_p\|_2$?
+    correct: "16"
+    wrong:
+      - "22.6"
+      - "1"
+      - "256"
+    explanation: |
+      Each pair contributes $\sin^2+\cos^2=1$, so $\|PE_p\|^2=d/2=256$ and the norm is 16 at every position. 22.6 is $\sqrt{512}$, which counts every coordinate as 1. 256 is the squared norm. 1 would hold only if the vector were normalized, which it isn't.
+    source: Vaswani et al. 2017 §3.4–3.5 (pdf p.5–6)
+
+  - id: q19
+    prompt: |
+      The plot shows one coordinate $PE_{p,2i}=\sin(p\,\omega_i)$ of a sinusoidal encoding with $d=128$ and $\omega_i=10000^{-2i/d}$. Which pair index $i$ is it?
+
+      ![One sinusoidal PE coordinate over positions 0–200.](llm.positional-encodings/period-q)
+    correct: $i=16$
+    wrong:
+      - $i=29$
+      - $i=32$
+      - $i=11$
+    explanation: |
+      Successive peaks are about 63 positions apart, so $\lambda=2\pi\cdot10000^{2i/128}\approx62.8$. That gives $10000^{2i/128}=10$, so $2i/128=1/4$ and $i=16$. Dropping the $2\pi$ (solving $10000^{2i/128}=63$) gives $i\approx29$. Using exponent $i/d$ instead of $2i/d$ gives 32. Reading the half-period of about 31 as the full period gives about 11.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6)
+
+cards:
+  - id: f1
+    front: Write the sinusoidal positional encoding and its range of wavelengths.
+    back: |
+      $$\begin{aligned} PE_{p,2i}&=\sin(p\,\omega_i),\\ PE_{p,2i+1}&=\cos(p\,\omega_i),\\ \omega_i&=10000^{-2i/d}. \end{aligned}$$
+
+      Here $i=0,\dots,d/2-1$. Wavelengths $\lambda_i=2\pi\cdot10000^{2i/d}$ are geometric, from $2\pi$ up to about $2\pi\cdot10^4$; exactly $6.06\times10^4$ for $d=512$. The paper interleaves sin and cos; some code uses a half-split layout instead.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6)
+
+  - id: f7
+    front: What matrix maps $PE_p$ to $PE_{p+\delta}$, and what is special about it?
+    back: |
+      A block-diagonal $M_\delta$ with one block per pair:
+
+      $$\begin{bmatrix}\cos\delta\omega_i&\sin\delta\omega_i\\-\sin\delta\omega_i&\cos\delta\omega_i\end{bmatrix}$$
+
+      It follows from the angle-addition identities. It is a rotation (orthogonal, $\det=1$) and does **not** depend on $p$, so one fixed linear map shifts every position by $\delta$.
+    source: d2l §11.6.3.2 eq. 11.6.3
+
+  - id: f8
+    front: Give $PE_p\cdot PE_{p+\delta}$ and $\|PE_p\|$ for sinusoidal encodings, and two properties of the similarity.
+    back: |
+      $$PE_p\cdot PE_{p+\delta}=\sum_{i=0}^{d/2-1}\cos(\delta\,\omega_i),\qquad \|PE_p\|^2=\tfrac d2.$$
+
+      - It depends only on $\delta$ and is **even** in $\delta$, so it cannot tell before from after.
+      - It decays with $|\delta|$, with ripples, as the fast terms dephase.
+    source: d2l §11.6.3.2
+
+  - id: f9
+    front: Write the four-term expansion of the attention logit with additive absolute encodings, and say which terms carry position.
+    back: |
+      With $A=W_QW_K^\top$ and row vectors:
+
+      $$\begin{aligned} &x_iAx_j^\top+x_iAp_j^\top\\ +\ &p_iAx_j^\top+p_iAp_j^\top. \end{aligned}$$
+
+      These are content–content, content–position (absolute $j$), position–content (absolute $i$) and position–position. Only the last involves both positions, and it is a function of $i-j$ only if $A$ has scaled-rotation blocks.
+    source: Dai et al. 2019 §3.3 (pdf p.4–5)
+
+  - id: f10
+    front: How does a causal decoder with no positional encoding (NoPE) recover absolute position?
+    back: |
+      Make all keys identical (read a coordinate that is 1 for every token). Causal attention is then uniform over the $t$ visible tokens. Let the value be 1 only for `<bos>`. The head outputs $1/t$, and a ReLU MLP decodes $t$ (Kazemnejad et al., Thm 1).
+
+      This needs the causal mask and an anchor token. An encoder gets $1/n$ everywhere, which carries no position.
+    source: Kazemnejad et al. 2023 §5.1 Thm 1, App. C.1 (pdf p.5–6, 19–21)
+
+  - id: f11
+    front: Where did BERT's sequence-length schedule come from, and what does it reveal about learned position embeddings?
+    back: |
+      BERT trained 90% of its steps on length 128 and the last 10% on length 512, explicitly to train the later position rows. This was a cost saving, since attention is quadratic in length.
+
+      Each learned row gets gradient only from sequences that reach it. Rows are independent parameters, and there is no row past $L_{\max}$.
+    source: Devlin et al. 2018 App. A.2 (pdf p.13)
+
+  - id: f12
+    type: open
+    front: Derive the shift property of sinusoidal encodings, and explain what it does and doesn't buy you.
+    back: |
+      **Setup.** Pair $i$ is $(\sin p\omega_i,\cos p\omega_i)$ with $\omega_i=10000^{-2i/d}$.
+
+      **Derivation.** Angle addition with $a=p\omega_i$, $b=\delta\omega_i$:
+      - $\sin(a+b)=\cos b\sin a+\sin b\cos a$
+      - $\cos(a+b)=-\sin b\sin a+\cos b\cos a$
+
+      So the shifted pair is $\begin{bmatrix}\cos b&\sin b\\-\sin b&\cos b\end{bmatrix}$ times the original pair, a rotation independent of $p$. Stacking the blocks gives $PE_{p+\delta}=M_\delta PE_p$.
+
+      **Corollary.** $PE_p\cdot PE_{p+\delta}=\sum_i\cos(\delta\omega_i)$, a function of $\delta$ only, even in $\delta$, decaying noisily. $\|PE_p\|=\sqrt{d/2}$.
+
+      **What it buys.** A fixed linear map can relate any position to its $\delta$-neighbour, which is Vaswani's argument that relative attention is easy to learn.
+
+      **What it doesn't.** It doesn't make the logit relative. In $(x_i+p_i)A(x_j+p_j)^\top$, the cross terms depend on absolute positions, and $p_iAp_j^\top$ is relative only for scaled-rotation blocks of $A$. In practice sinusoids also don't extrapolate well. This gap motivates relative biases and RoPE.
+    source: Vaswani et al. 2017 §3.5 (pdf p.6); d2l §11.6.3.2; Dai et al. 2019 §3.3 (pdf p.4–5)
+
+  - id: f13
+    type: open
+    front: Expand the attention logit with additive absolute PE, and show exactly when the position–position term is relative.
+    back: |
+      **Expansion.** With $A=W_QW_K^\top$:
+
+      $q_ik_j^\top=x_iAx_j^\top+x_iAp_j^\top+p_iAx_j^\top+p_iAp_j^\top$.
+
+      The middle two depend on absolute $j$ and absolute $i$.
+
+      **Position–position term.** Take one frequency, $u=i\omega$, $v=j\omega$, and a diagonal block $\begin{bmatrix}\alpha&\beta\\\gamma&\varepsilon\end{bmatrix}$. Product-to-sum gives
+
+      - relative part: $\tfrac{\alpha+\varepsilon}2\cos(u-v)+\tfrac{\beta-\gamma}2\sin(u-v)$
+      - absolute part: $\tfrac{\varepsilon-\alpha}2\cos(u+v)+\tfrac{\beta+\gamma}2\sin(u+v)$
+
+      The absolute part vanishes iff $\alpha=\varepsilon$ and $\gamma=-\beta$, i.e. the block is a scaled rotation $\begin{bmatrix}a&b\\-b&a\end{bmatrix}$. Cross-frequency blocks must also be zero, since they give $\cos(i\omega_a-j\omega_b)$. The resulting matrix of scores is then Toeplitz.
+
+      **Takeaway.** Additive PE is relative only by luck of training. RoPE builds exactly this rotation structure into $q$ and $k$, so the score is $q^\top R_{n-m}k$ by construction. Transformer-XL instead rewrites the four terms with relative encodings.
+    source: Dai et al. 2019 §3.3 (pdf p.4–5); Su et al. 2021 §3.2.2 (pdf p.5)
+
+  - id: f14
+    type: open
+    front: "An interviewer asks: 'Can a decoder-only transformer work with no positional encoding at all?' Give a complete answer."
+    back: |
+      **Yes, in principle, because of the causal mask.** Without a mask, attention is permutation-equivariant ($\mathrm{Attn}(PX)=P\,\mathrm{Attn}(X)$), so an encoder can't see order. The causal mask is tied to the index: token $t$ sees exactly $t$ tokens.
+
+      **Construction (Kazemnejad Thm 1).** Use identical keys, so attention over the $t$ visible tokens is uniform. Set the value to 1 only at `<bos>`. The output is $1/t$, and an MLP maps it to $t$. Thm 2: later layers can then implement $f_{\text{content}}+f_{\text{rel}}(i-j)$.
+
+      **Caveats.**
+      - The signal's resolution falls like $1/t^2$: $\tfrac1t-\tfrac1{t+1}\approx10^{-6}$ at $t=1000$.
+      - It needs an anchor token.
+
+      **Evidence.** About 107M-parameter models on algorithmic tasks: NoPE length-generalized best of the schemes tested. 1B code models: NoPE and ALiBi held perplexity to about 2× the training length, while RoPE exploded. These are small-scale results.
+
+      **Practice.** Hybrids, not pure NoPE: SmolLM3 drops RoPE in every 4th layer, and Kimi Linear and Trinity use NoPE in global layers, with other layers supplying position.
+    source: Kazemnejad et al. 2023 §4–6, App. C (pdf p.5–9, 19–22); Raschka, Big LLM Architecture Comparison §7.1, §14, §20
+
+  - id: f15
+    type: open
+    front: Compare learned and sinusoidal absolute encodings for an interviewer, including what modern LLMs do instead.
+    back: |
+      **Common ground.** Both add $p_p$ to the token embedding once, at the input. That is cache-friendly, since positions are fixed, and it costs nothing at inference.
+
+      **Learned table** (GPT-2 with 1024 rows, BERT with 512):
+      - flexible, one free vector per position;
+      - no vector past $L_{\max}$;
+      - each row needs training data at that position (BERT's 128→512 schedule);
+      - neighbouring rows aren't tied.
+
+      **Sinusoidal:**
+      - no parameters and defined for all $p$;
+      - multi-scale wavelengths $2\pi\cdot10000^{2i/d}$;
+      - built-in structure: $PE_{p+\delta}=M_\delta PE_p$ and similarity $\sum_i\cos(\delta\omega_i)$;
+      - in practice it still extrapolates poorly, because unseen phase combinations are out of distribution.
+
+      **Quality.** Nearly identical in Vaswani's ablation (25.7 vs 25.8 BLEU).
+
+      **Shared weakness.** The logit isn't relative: the four-term expansion has absolute cross terms.
+
+      **Modern LLMs** mostly use RoPE, which is relative inside the dot product and parameter-free, sometimes with NoPE layers interleaved.
+    source: Vaswani et al. 2017 §3.5, Table 3 (pdf p.6, 9); Devlin et al. 2018 App. A.2 (pdf p.13); Radford et al. 2019 §2.3 (pdf p.4)
+
+reading:
+  - title: "Attention Is All You Need (Vaswani et al., 2017), §3.5 Positional Encoding"
+    url: https://arxiv.org/abs/1706.03762
+    kind: paper
+    note: The original sinusoidal definition and the learned-vs-fixed ablation (Table 3 row E). Half a page.
+  - title: "Dive into Deep Learning §11.6.3: Positional Encoding"
+    url: https://d2l.ai/chapter_attention-mechanisms-and-transformers/self-attention-and-positional-encoding.html
+    kind: book
+    note: The binary-counter analogy and the explicit 2×2 shift matrix, with runnable code for the heatmap.
+  - title: "The Impact of Positional Encoding on Length Generalization in Transformers (Kazemnejad et al., 2023), §5 and App. C.1"
+    url: https://arxiv.org/abs/2305.19466
+    kind: paper
+    note: The NoPE theorems with the full 1/t construction, and controlled length-generalization comparisons of APE, T5, ALiBi, RoPE and NoPE.
+  - title: "Transformer-XL (Dai et al., 2019), §3.3 Relative Positional Encodings"
+    url: https://arxiv.org/abs/1901.02860
+    kind: paper
+    note: The four-term expansion of the absolute-PE logit, and why segment reuse breaks absolute positions. Leads into llm.relative-position.
+  - title: "Sebastian Raschka, The Big LLM Architecture Comparison, §7.1 NoPE"
+    url: https://magazine.sebastianraschka.com/p/the-big-llm-architecture-comparison
+    kind: blog
+    note: How NoPE shows up in production (SmolLM3 drops RoPE in every 4th layer), with the scale caveat.
