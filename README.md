@@ -2,6 +2,7 @@
 
 An offline iOS app for ML/AI interview prep. It has explainers, quizzes,
 flashcards with spaced repetition (FSRS), and mock exams. No account or server needed.
+Used Opus 5.5 to generate this, took around ~6 hours of work. No the flashiest, but it was good enough for me.
 
 ## 1. Download
 You need a Mac with Xcode 16+ and an iPhone on iOS 17+.
